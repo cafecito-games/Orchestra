@@ -86,7 +86,7 @@ func TestStdioBridgeInitializeToolsCallArtifactUploadAndDoorbell(t *testing.T) {
 		}
 	}
 
-	sendLine(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	sendLine(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bridge-test","version":"1.0.0"}}}`)
 	initializeResponse := readResponseByID(1)
 	initializeJSON, _ := json.Marshal(initializeResponse)
 	require.Contains(t, string(initializeJSON), "claude/channel")

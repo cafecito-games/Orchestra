@@ -63,6 +63,8 @@ func (client *hubMCPClient) invokeRPC(operationContext context.Context, method s
 	}
 	request.Header.Set("Authorization", "Bearer "+client.token)
 	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("MCP-Protocol-Version", "2025-06-18")
 
 	response, err := client.httpClient.Do(request)
 	if err != nil {

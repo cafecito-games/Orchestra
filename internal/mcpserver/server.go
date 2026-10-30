@@ -20,14 +20,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/safepath"
 )
 
-const (
-	protocolVersion     = "2025-06-18"
-	maximumArtifactSize = protocol.MaximumArtifactSizeBytes
-)
+const maximumArtifactSize = protocol.MaximumArtifactSizeBytes
 
 type Caller func(operationContext context.Context, runID string, method string, arguments json.RawMessage) (json.RawMessage, error)
 
@@ -84,14 +83,30 @@ type Server struct {
 	caller   Caller
 	uploader Uploader
 
-	mutex  sync.RWMutex
-	grants []grant
-	url    string
-	server *http.Server
+	mutex   sync.RWMutex
+	grants  []grant
+	url     string
+	server  *http.Server
+	handler http.Handler
 }
 
 func New(caller Caller, uploader Uploader) *Server {
-	return &Server{caller: caller, uploader: uploader}
+	server := &Server{caller: caller, uploader: uploader}
+	server.handler = mcp.NewStreamableHTTPHandler(
+		func(request *http.Request) *mcp.Server {
+			activeGrant, ok := server.requestGrant(request)
+			if !ok {
+				return nil
+			}
+			return server.newProtocolServer(activeGrant)
+		},
+		&mcp.StreamableHTTPOptions{
+			Stateless:           true,
+			JSONResponse:        true,
+			MaxRequestBodyBytes: 1 << 20,
+		},
+	)
+	return server
 }
 
 func (server *Server) Start(operationContext context.Context) error {
@@ -161,81 +176,28 @@ func (server *Server) lookupGrant(token string) (grant, bool) {
 	return matched, found
 }
 
-type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params,omitempty"`
-}
-
-type callParameters struct {
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
-}
-
-type rpcResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Result  any             `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
 func (server *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	if request.URL.Path != "/mcp" {
 		http.NotFound(writer, request)
-		return
-	}
-	if request.Method != http.MethodPost {
-		writer.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	if !validOrigin(request.Header.Get("Origin")) {
 		http.Error(writer, "invalid origin", http.StatusForbidden)
 		return
 	}
+	if _, ok := server.requestGrant(request); !ok {
+		http.Error(writer, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	server.handler.ServeHTTP(writer, request)
+}
+
+func (server *Server) requestGrant(request *http.Request) (grant, bool) {
 	header := request.Header.Get("Authorization")
 	if !strings.HasPrefix(header, "Bearer ") {
-		http.Error(writer, "unauthorized", http.StatusUnauthorized)
-		return
+		return grant{}, false
 	}
-	token := strings.TrimPrefix(header, "Bearer ")
-	activeGrant, ok := server.lookupGrant(token)
-	if !ok {
-		http.Error(writer, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	request.Body = http.MaxBytesReader(writer, request.Body, 1<<20)
-	var message rpcRequest
-	if err := json.NewDecoder(request.Body).Decode(&message); err != nil || message.JSONRPC != "2.0" || message.Method == "" {
-		writeRPC(writer, rpcResponse{JSONRPC: "2.0", ID: message.ID, Error: &rpcError{Code: -32600, Message: "Invalid request"}})
-		return
-	}
-	if len(message.ID) == 0 {
-		writer.WriteHeader(http.StatusAccepted)
-		return
-	}
-
-	switch message.Method {
-	case "initialize":
-		writeRPC(writer, rpcResponse{JSONRPC: "2.0", ID: message.ID, Result: map[string]any{
-			"protocolVersion": protocolVersion,
-			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]string{"name": "orchestra_hub", "version": protocol.ProtocolVersion},
-			"instructions":    instructions,
-		}})
-	case "tools/list":
-		writeRPC(writer, rpcResponse{JSONRPC: "2.0", ID: message.ID, Result: map[string]any{"tools": tools(activeGrant.canDelegate)}})
-		activeGrant.connection.mark()
-	case "tools/call":
-		server.callTool(writer, request, message, activeGrant)
-	default:
-		writeRPC(writer, rpcResponse{JSONRPC: "2.0", ID: message.ID, Error: &rpcError{Code: -32601, Message: "Method not found"}})
-	}
+	return server.lookupGrant(strings.TrimPrefix(header, "Bearer "))
 }
 
 func validOrigin(raw string) bool {
@@ -250,52 +212,78 @@ func validOrigin(raw string) bool {
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
-func (server *Server) callTool(writer http.ResponseWriter, request *http.Request, message rpcRequest, activeGrant grant) {
-	var parameters callParameters
-	if err := json.Unmarshal(message.Params, &parameters); err != nil || parameters.Name == "" {
-		writeRPC(writer, rpcResponse{JSONRPC: "2.0", ID: message.ID, Error: &rpcError{Code: -32602, Message: "Invalid tool arguments"}})
-		return
+func (server *Server) newProtocolServer(activeGrant grant) *mcp.Server {
+	protocolServer := mcp.NewServer(
+		&mcp.Implementation{Name: "orchestra_hub", Version: protocol.ProtocolVersion},
+		&mcp.ServerOptions{
+			Instructions: instructions,
+			Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}},
+		},
+	)
+	protocolServer.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(operationContext context.Context, method string, request mcp.Request) (mcp.Result, error) {
+			if method == "tools/call" && !activeGrant.canDelegate {
+				callRequest, ok := request.(*mcp.CallToolRequest)
+				if ok && callRequest.Params != nil && protocol.IsDelegationHubToolName(callRequest.Params.Name) {
+					return toolErrorResult(&ToolError{Code: "forbidden", Message: "This run is not allowed to delegate tasks"}), nil
+				}
+			}
+			result, err := next(operationContext, method, request)
+			if method == "tools/list" && err == nil {
+				activeGrant.connection.mark()
+			}
+			return result, err
+		}
+	})
+	for _, name := range ToolNames(activeGrant.canDelegate) {
+		definition := definitions[name]
+		destructive := false
+		protocolServer.AddTool(&mcp.Tool{
+			Name:         name,
+			Title:        definition.title,
+			Description:  definition.description,
+			InputSchema:  definition.input,
+			OutputSchema: definition.output,
+			Annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint:    definition.readOnly,
+				DestructiveHint: &destructive,
+				IdempotentHint:  true,
+			},
+		}, func(operationContext context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return server.callTool(operationContext, activeGrant, name, request.Params.Arguments), nil
+		})
 	}
-	if !protocol.IsHubToolName(parameters.Name) {
-		writeRPC(writer, rpcResponse{JSONRPC: "2.0", ID: message.ID, Error: &rpcError{Code: -32602, Message: "Unknown tool"}})
-		return
-	}
-	if protocol.IsDelegationHubToolName(parameters.Name) && !activeGrant.canDelegate {
-		writeToolError(writer, message.ID, &ToolError{Code: "forbidden", Message: "This run is not allowed to delegate tasks"})
-		return
-	}
-	arguments := parameters.Arguments
+	return protocolServer
+}
+
+func (server *Server) callTool(operationContext context.Context, activeGrant grant, name string, arguments json.RawMessage) *mcp.CallToolResult {
 	if len(arguments) == 0 || string(arguments) == "null" {
 		arguments = json.RawMessage(`{}`)
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(arguments, &object); err != nil || object == nil {
-		writeToolError(writer, message.ID, &ToolError{Code: "invalid_arguments", Message: "Tool arguments must be a JSON object"})
-		return
+		return toolErrorResult(&ToolError{Code: "invalid_arguments", Message: "Tool arguments must be a JSON object"})
 	}
 	var (
 		result json.RawMessage
 		err    error
 	)
-	if parameters.Name == "post_artifact" {
-		result, err = server.postArtifact(request.Context(), activeGrant, arguments)
+	if name == "post_artifact" {
+		result, err = server.postArtifact(operationContext, activeGrant, arguments)
 	} else {
-		result, err = server.caller(request.Context(), activeGrant.runID, parameters.Name, arguments)
+		result, err = server.caller(operationContext, activeGrant.runID, name, arguments)
 	}
 	if err != nil {
-		writeToolError(writer, message.ID, asToolError(err))
-		return
+		return toolErrorResult(asToolError(err))
 	}
 	var structured map[string]any
 	if err := json.Unmarshal(result, &structured); err != nil || structured == nil {
-		writeToolError(writer, message.ID, &ToolError{Code: "invalid_result", Message: "Master returned an invalid tool result", Retryable: true})
-		return
+		return toolErrorResult(&ToolError{Code: "invalid_result", Message: "Master returned an invalid tool result", Retryable: true})
 	}
-	writeRPC(writer, rpcResponse{JSONRPC: "2.0", ID: message.ID, Result: map[string]any{
-		"content":           []map[string]string{{"type": "text", "text": string(result)}},
-		"structuredContent": structured,
-		"isError":           false,
-	}})
+	return &mcp.CallToolResult{
+		Content:           []mcp.Content{&mcp.TextContent{Text: string(result)}},
+		StructuredContent: structured,
+	}
 }
 
 type postArtifactArguments struct {
@@ -416,11 +404,6 @@ func openArtifact(workspace, requested string) (*os.File, string, int64, string,
 	return file, filepath.ToSlash(relative), information.Size(), hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func writeRPC(writer http.ResponseWriter, response rpcResponse) {
-	writer.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(writer).Encode(response)
-}
-
 func asToolError(err error) *ToolError {
 	var typed *ToolError
 	if errors.As(err, &typed) {
@@ -429,10 +412,10 @@ func asToolError(err error) *ToolError {
 	return &ToolError{Code: "tool_failed", Message: err.Error()}
 }
 
-func writeToolError(writer http.ResponseWriter, id json.RawMessage, failure *ToolError) {
+func toolErrorResult(failure *ToolError) *mcp.CallToolResult {
 	text, _ := json.Marshal(map[string]*ToolError{"error": failure})
-	writeRPC(writer, rpcResponse{JSONRPC: "2.0", ID: id, Result: map[string]any{
-		"content": []map[string]string{{"type": "text", "text": string(text)}},
-		"isError": true,
-	}})
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: string(text)}},
+		IsError: true,
+	}
 }

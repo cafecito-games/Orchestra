@@ -288,6 +288,8 @@ echo '{"type":"result","result":"completed cleanly"}'
 	require.NoError(t, err)
 	httpRequest.Header.Set("Authorization", "Bearer "+mcpGrant.Token)
 	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Accept", "application/json, text/event-stream")
+	httpRequest.Header.Set("MCP-Protocol-Version", "2025-06-18")
 	httpResponse, err := http.DefaultClient.Do(httpRequest)
 	require.NoError(t, err)
 	bodyBytes, err := io.ReadAll(httpResponse.Body)
