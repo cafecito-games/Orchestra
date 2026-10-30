@@ -290,8 +290,9 @@ func (ledger ActivationLedger) Save(dataRoot string) error {
 type ComponentProbe func(operationContext context.Context, installed InstalledComponent) error
 
 var HarnessVersionProbeAllowlist = map[string]AuthProbeSpecification{
-	"claude-cli": {Arguments: []string{"--version"}, SuccessExitCode: 0},
-	"codex-cli":  {Arguments: []string{"--version"}, SuccessExitCode: 0},
+	protocol.HarnessClaudeCLI:   {Arguments: []string{"--version"}, SuccessExitCode: 0},
+	protocol.HarnessCodexCLI:    {Arguments: []string{"--version"}, SuccessExitCode: 0},
+	protocol.HarnessOpenCodeCLI: {Arguments: []string{"--version"}, SuccessExitCode: 0},
 }
 
 const (

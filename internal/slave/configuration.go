@@ -377,6 +377,21 @@ func BuildRuntime(operationContext context.Context, configuration Configuration)
 		}
 		adapters[harnessID] = adapter
 	}
+	if _, overridden := adapters[protocol.HarnessOpenCodeCLI]; !overridden {
+		for _, resolution := range resolutions {
+			if resolution.HarnessID != protocol.HarnessOpenCodeCLI {
+				continue
+			}
+			var managed *harness.ManagedHarness
+			if entry, present := verifiedManaged[resolution.HarnessID]; present {
+				managed = &entry
+			}
+			if adapter, available := harness.BuiltInOpenCodeACPAdapter(resolution.Profile, managed); available {
+				adapters[resolution.HarnessID] = adapter
+			}
+			break
+		}
+	}
 
 	var acpDriver *harness.ACPDriver
 	if len(adapters) > 0 {

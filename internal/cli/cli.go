@@ -236,7 +236,7 @@ func runSlave(
 		}
 	}
 	if len(availableLabels) == 0 {
-		fmt.Fprintln(standardError, "orchestra slave: no available harnesses discovered; install and authenticate Claude Code or Codex")
+		fmt.Fprintln(standardError, "orchestra slave: no available harnesses discovered; install and authenticate Claude Code, Codex, or OpenCode")
 		return 1
 	}
 	fmt.Fprintf(

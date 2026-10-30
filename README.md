@@ -15,7 +15,7 @@ Main Machine                                       Remote Worker Machines (over 
 │ orchestra mcp                            │       │  │   exclusive-existing + flock)         │
 │    │ HTTP + SSE Doorbell                 │       │  ├─ Ephemeral 127.0.0.1 Run MCP Server   │
 │    ▼                                     │  ws/  │  │   (orchestra_hub worker tools)        │
-│ orchestra master                         │◄─────►│  └─ Harnesses (Claude Code & Codex CLI   │
+│ orchestra master                         │◄─────►│  └─ Harnesses (Claude, Codex & OpenCode   │
 │  ├─ Pure-Go SQLite (WAL, event journal)  │  wss  │      via acp-v1 stdio & native-cli)      │
 │  ├─ Capability & Readiness Scheduler     │       └──────────────────────────────────────────┘
 │  ├─ Resident Agent Instances & Sessions  │
@@ -129,7 +129,7 @@ You can supply a JSON file mapping logical `projectId` values to readiness capab
 
 ## Setting Up & Running `orchestra slave`
 
-Copy the cross-compiled `orchestra` binary to each worker machine where Claude Code (`claude`) and/or Codex (`codex`) are installed and authenticated locally.
+Copy the cross-compiled `orchestra` binary to each worker machine where Claude Code (`claude`), Codex (`codex`), and/or OpenCode (`opencode`) are installed and authenticated locally.
 
 ### 1. Provision Managed ACP Adapters (`orchestra setup` & `orchestra doctor`)
 ```bash
@@ -171,8 +171,33 @@ orchestra slave \
   --instance-capacity 6 \
   --approval-policy claude-cli=manual \
   --approval-policy codex-cli=manual \
+  --approval-policy opencode-cli=manual \
   --claude-acp-auth-mode local-subscription
 ```
+
+### OpenCode with GLM and DeepSeek
+
+An installed `opencode` binary is discovered as the `opencode-cli` harness. Orchestra uses OpenCode's built-in ACP server by default, including model discovery and resumable resident sessions, and retains `native-cli` as a fallback transport. The selected model is passed through unchanged using OpenCode's `provider/model` syntax, so one slave can run GLM and DeepSeek agents concurrently when `--concurrency` and `--instance-capacity` are at least `2`.
+
+Use the exact model IDs shown by `opencode models`. For example, two task or instance requirements can target the same node and harness while selecting different models:
+
+```json
+{
+  "harnessIds": ["opencode-cli"],
+  "models": ["zai-coding-plan/glm-5.3"],
+  "transports": ["acp-v1"]
+}
+```
+
+```json
+{
+  "harnessIds": ["opencode-cli"],
+  "models": ["deepseek/deepseek-v4-pro"],
+  "transports": ["acp-v1"]
+}
+```
+
+ACP runs receive the run-scoped `orchestra_hub` connection directly in the session request. Native runs use OpenCode's standalone headless mode and an in-memory MCP configuration override. Orchestra does not rewrite the user's global or project OpenCode configuration, and provider credentials remain on the slave machine.
 
 ---
 

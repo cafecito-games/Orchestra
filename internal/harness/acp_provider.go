@@ -8,6 +8,7 @@ import (
 type ACPProvider struct {
 	Environment          func(approvalPolicy string) []string
 	Configuration        func(run protocol.Run, approvalPolicy string) []acp.ConfigurationSelection
+	Permission           func(approvalPolicy string, fallback PermissionHandler) PermissionHandler
 	RequireMCPConnection bool
 	NativeBinaryVariable string
 	ModelOption          string
@@ -15,7 +16,8 @@ type ACPProvider struct {
 
 func DefaultACPProviders() map[string]ACPProvider {
 	return map[string]ACPProvider{
-		"claude-cli": claudeACPProvider(),
-		"codex-cli":  codexACPProvider(),
+		protocol.HarnessClaudeCLI:   claudeACPProvider(),
+		protocol.HarnessCodexCLI:    codexACPProvider(),
+		protocol.HarnessOpenCodeCLI: opencodeACPProvider(),
 	}
 }

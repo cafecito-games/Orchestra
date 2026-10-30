@@ -51,6 +51,13 @@ func (driver nativeDriver) Execute(operationContext context.Context, invocation 
 	configureProcessCancellation(command)
 	command.Dir = invocation.Workspace
 	command.Env = adapterEnvironment(os.Environ(), nil)
+	if run.HarnessID == protocol.HarnessOpenCodeCLI && mcpConfiguration.URL != "" {
+		configuration, configurationErr := opencodeInlineConfiguration(environmentValue(command.Env, opencodeConfigEnvironment), mcpConfiguration)
+		if configurationErr != nil {
+			return "", configurationErr
+		}
+		command.Env = replaceEnvironmentValue(command.Env, opencodeConfigEnvironment, configuration)
+	}
 	if mcpConfiguration.URL != "" {
 		command.Env = append(command.Env, "ORCHESTRA_MCP_TOKEN="+mcpConfiguration.Token)
 	}
@@ -129,7 +136,7 @@ func nativeCodexSandboxArguments(approvalPolicy string) []string {
 func harnessArguments(run protocol.Run, systemPrompt string, mcpConfiguration mcpserver.Configuration, approvalPolicy string) ([]string, error) {
 	prompt := composePrompt(run, systemPrompt)
 	switch run.HarnessID {
-	case "claude-cli":
+	case protocol.HarnessClaudeCLI:
 		arguments := []string{"-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", nativeClaudePermissionMode(approvalPolicy), "--permission-prompts", "none"}
 		if run.Model != "" && run.Model != "default" {
 			arguments = append(arguments, "--model", run.Model)
@@ -154,7 +161,7 @@ func harnessArguments(run protocol.Run, systemPrompt string, mcpConfiguration mc
 			arguments = append(arguments, "--mcp-config", string(configuration), "--allowedTools", strings.Join(allowed, ","))
 		}
 		return arguments, nil
-	case "codex-cli":
+	case protocol.HarnessCodexCLI:
 		arguments := append([]string{"exec", "--json"}, nativeCodexSandboxArguments(approvalPolicy)...)
 		if run.Model != "" && run.Model != "default" {
 			arguments = append(arguments, "--model", run.Model)
@@ -168,6 +175,18 @@ func harnessArguments(run protocol.Run, systemPrompt string, mcpConfiguration mc
 			)
 		}
 		return append(arguments, prompt), nil
+	case protocol.HarnessOpenCodeCLI:
+		// A private server makes each Orchestra run consume the model, MCP, and
+		// permission configuration supplied to this process instead of inheriting
+		// configuration from an already-running OpenCode background service.
+		arguments := []string{"--standalone", "run", "--format", "json"}
+		if approvalPolicy == protocol.ApprovalPolicyAuto || approvalPolicy == protocol.ApprovalPolicyBypass {
+			arguments = append(arguments, "--auto")
+		}
+		if run.Model != "" && run.Model != "default" {
+			arguments = append(arguments, "--model", run.Model)
+		}
+		return append(arguments, prompt), nil
 	default:
 		return nil, fmt.Errorf("harness %s is not executable by Orchestra", run.HarnessID)
 	}
@@ -178,6 +197,7 @@ func readEvents(reader io.Reader, harnessID string, output func(string), session
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	final := ""
 	sessionReported := false
+	var eventErr error
 	for scanner.Scan() {
 		if !sessionReported && session != nil {
 			if identity := providerSessionIdentity(harnessID, scanner.Bytes()); identity != "" {
@@ -187,33 +207,42 @@ func readEvents(reader io.Reader, harnessID string, output func(string), session
 		}
 		readable := readableEvent(harnessID, scanner.Bytes())
 		if readable == "" {
+			if eventErr == nil {
+				eventErr = harnessEventError(harnessID, scanner.Bytes())
+			}
 			continue
 		}
 		final = readable
 		output(readable)
 	}
-	return final, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return final, err
+	}
+	return final, eventErr
 }
 
 var providerSessionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 func providerSessionIdentity(harnessID string, line []byte) string {
 	var event struct {
-		Type      string `json:"type"`
-		SessionID string `json:"session_id"`
-		ThreadID  string `json:"thread_id"`
+		Type              string `json:"type"`
+		SessionID         string `json:"session_id"`
+		OpenCodeSessionID string `json:"sessionID"`
+		ThreadID          string `json:"thread_id"`
 	}
 	if json.Unmarshal(line, &event) != nil {
 		return ""
 	}
 	identity := ""
 	switch harnessID {
-	case "claude-cli":
+	case protocol.HarnessClaudeCLI:
 		identity = event.SessionID
-	case "codex-cli":
+	case protocol.HarnessCodexCLI:
 		if event.Type == "thread.started" {
 			identity = event.ThreadID
 		}
+	case protocol.HarnessOpenCodeCLI:
+		identity = event.OpenCodeSessionID
 	}
 	if !providerSessionPattern.MatchString(identity) {
 		return ""
@@ -226,7 +255,7 @@ func readableEvent(harnessID string, line []byte) string {
 	if json.Unmarshal(line, &event) != nil {
 		return ""
 	}
-	if harnessID == "claude-cli" {
+	if harnessID == protocol.HarnessClaudeCLI {
 		if event["type"] == "result" {
 			result, _ := event["result"].(string)
 			return result
@@ -245,7 +274,7 @@ func readableEvent(harnessID string, line []byte) string {
 			return text.String()
 		}
 	}
-	if harnessID == "codex-cli" && event["type"] == "item.completed" {
+	if harnessID == protocol.HarnessCodexCLI && event["type"] == "item.completed" {
 		item, _ := event["item"].(map[string]any)
 		switch item["type"] {
 		case "agent_message":
@@ -259,5 +288,28 @@ func readableEvent(harnessID string, line []byte) string {
 			return "Ran " + command + "\n"
 		}
 	}
+	if harnessID == protocol.HarnessOpenCodeCLI && event["type"] == "text" {
+		part, _ := event["part"].(map[string]any)
+		text, _ := part["text"].(string)
+		return text
+	}
 	return ""
+}
+
+func harnessEventError(harnessID string, line []byte) error {
+	if harnessID != protocol.HarnessOpenCodeCLI {
+		return nil
+	}
+	var event struct {
+		Type  string `json:"type"`
+		Error struct {
+			Data struct {
+				Message string `json:"message"`
+			} `json:"data"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(line, &event) != nil || event.Type != "error" || strings.TrimSpace(event.Error.Data.Message) == "" {
+		return nil
+	}
+	return errors.New(strings.TrimSpace(event.Error.Data.Message))
 }
