@@ -38,6 +38,14 @@ func Load(options Options) (Result, error) {
 	}
 	for index, override := range options.Overrides {
 		candidates := entries[override.HarnessID]
+		if len(candidates) == 0 && override.HarnessID == protocol.HarnessAntigravityCLI {
+			adapter, err := verifiedStandaloneOverride(override)
+			if err != nil {
+				return Result{}, fmt.Errorf("acp adapter at index %d: %w", index, err)
+			}
+			result.Adapters[override.HarnessID] = adapter
+			continue
+		}
 		if len(candidates) != 1 {
 			return Result{}, fmt.Errorf("acp adapter at index %d names a harness without exactly one manifest ACP adapter", index)
 		}
@@ -121,6 +129,18 @@ func verifiedOverride(entry setup.ComponentManifestEntry, override Override) (ha
 		Version:     entry.Version,
 		Source:      protocol.ACPAdapterSourceAdministrator,
 		Verify:      verify,
+	}, nil
+}
+
+func verifiedStandaloneOverride(override Override) (harness.ACPAdapter, error) {
+	verify := func() error { return verifyPinnedExecutable(override.Path, override.SHA256) }
+	if err := verify(); err != nil {
+		return harness.ACPAdapter{}, err
+	}
+	return harness.ACPAdapter{
+		Binary: override.Path,
+		Source: protocol.ACPAdapterSourceAdministrator,
+		Verify: verify,
 	}, nil
 }
 

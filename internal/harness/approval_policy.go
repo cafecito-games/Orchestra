@@ -4,7 +4,12 @@ import "github.com/cafecito-games/Orchestra/internal/protocol"
 
 type ApprovalPolicies map[string]string
 
-var ApprovalPolicyHarnessIDs = []string{protocol.HarnessClaudeCLI, protocol.HarnessCodexCLI, protocol.HarnessOpenCodeCLI}
+var ApprovalPolicyHarnessIDs = []string{
+	protocol.HarnessClaudeCLI,
+	protocol.HarnessCodexCLI,
+	protocol.HarnessOpenCodeCLI,
+	protocol.HarnessAntigravityCLI,
+}
 
 func (policies ApprovalPolicies) For(harnessID string) string {
 	switch policy := policies[harnessID]; policy {

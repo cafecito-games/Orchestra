@@ -61,6 +61,8 @@ func Run(
 		return runSlave(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "mcp":
 		return runMCPBridge(operationContext, remaining, standardInput, standardOutput, standardError, lookupEnvironment)
+	case "acp-bridge":
+		return runACPBridge(operationContext, remaining, standardInput, standardOutput, standardError, lookupEnvironment)
 	case "status":
 		return runStatus(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "nodes":
@@ -95,6 +97,7 @@ Runtime Modes:
   master      Start the Orchestra control-plane server (HTTP, WebSocket, SQLite, Streamable HTTP MCP)
   slave       Start an Orchestra remote worker daemon connecting to a master
   mcp         Run the stdio Model Context Protocol bridge for local coding agents
+  acp-bridge  Run a built-in stdio Agent Client Protocol bridge (antigravity)
 
 Operator Commands:
   status      Inspect orchestrator health, connected nodes, and active workloads
@@ -236,7 +239,7 @@ func runSlave(
 		}
 	}
 	if len(availableLabels) == 0 {
-		fmt.Fprintln(standardError, "orchestra slave: no available harnesses discovered; install and authenticate Claude Code, Codex, or OpenCode")
+		fmt.Fprintln(standardError, "orchestra slave: no available harnesses discovered; install and authenticate Claude Code, Codex, OpenCode, or Antigravity")
 		return 1
 	}
 	fmt.Fprintf(

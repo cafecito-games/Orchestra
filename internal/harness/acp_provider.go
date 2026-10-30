@@ -16,8 +16,9 @@ type ACPProvider struct {
 
 func DefaultACPProviders() map[string]ACPProvider {
 	return map[string]ACPProvider{
-		protocol.HarnessClaudeCLI:   claudeACPProvider(),
-		protocol.HarnessCodexCLI:    codexACPProvider(),
-		protocol.HarnessOpenCodeCLI: opencodeACPProvider(),
+		protocol.HarnessClaudeCLI:      claudeACPProvider(),
+		protocol.HarnessCodexCLI:       codexACPProvider(),
+		protocol.HarnessOpenCodeCLI:    opencodeACPProvider(),
+		protocol.HarnessAntigravityCLI: antigravityACPProvider(),
 	}
 }

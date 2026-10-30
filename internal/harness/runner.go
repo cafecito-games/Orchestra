@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cafecito-games/Orchestra/internal/antigravityacp"
 	"github.com/cafecito-games/Orchestra/internal/mcpserver"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 )
@@ -43,10 +44,11 @@ func (driver nativeDriver) Execute(operationContext context.Context, invocation 
 	}
 	releaseExecutable := driver.runner.holdExecutable(binary)
 	defer releaseExecutable()
-	arguments, err := harnessArguments(run, invocation.SystemPrompt, mcpConfiguration, invocation.approvalPolicy)
+	arguments, cleanupInvocation, err := prepareNativeArguments(invocation)
 	if err != nil {
 		return "", err
 	}
+	defer cleanupInvocation()
 	command := exec.CommandContext(operationContext, binary, arguments...)
 	configureProcessCancellation(command)
 	command.Dir = invocation.Workspace
@@ -58,7 +60,7 @@ func (driver nativeDriver) Execute(operationContext context.Context, invocation 
 		}
 		command.Env = replaceEnvironmentValue(command.Env, opencodeConfigEnvironment, configuration)
 	}
-	if mcpConfiguration.URL != "" {
+	if mcpConfiguration.URL != "" && run.HarnessID != protocol.HarnessAntigravityCLI {
 		command.Env = append(command.Env, "ORCHESTRA_MCP_TOKEN="+mcpConfiguration.Token)
 	}
 	stdout, err := command.StdoutPipe()
@@ -75,11 +77,11 @@ func (driver nativeDriver) Execute(operationContext context.Context, invocation 
 	final, readErr := readEvents(stdout, run.HarnessID, output, invocation.ProviderSession)
 	waitErr := command.Wait()
 	if readErr != nil {
-		return "", readErr
+		return "", redactHarnessDiagnostic(readErr, mcpConfiguration.Token)
 	}
 	if waitErr != nil {
 		if message := strings.TrimSpace(stderr.String()); message != "" {
-			return "", errors.New(message)
+			return "", redactHarnessDiagnostic(errors.New(message), mcpConfiguration.Token)
 		}
 		return "", waitErr
 	}
@@ -87,6 +89,17 @@ func (driver nativeDriver) Execute(operationContext context.Context, invocation 
 		return emptyResponse, nil
 	}
 	return strings.TrimSpace(final), nil
+}
+
+func redactHarnessDiagnostic(err error, mcpToken string) error {
+	if err == nil {
+		return nil
+	}
+	redacted := protocol.RedactText(err.Error())
+	if strings.TrimSpace(mcpToken) != "" {
+		redacted = strings.ReplaceAll(redacted, mcpToken, "[REDACTED]")
+	}
+	return errors.New(redacted)
 }
 
 func (runner *Runner) profile(id string) (protocol.HarnessProfile, bool) {
@@ -131,6 +144,51 @@ func nativeCodexSandboxArguments(approvalPolicy string) []string {
 		return []string{"--dangerously-bypass-approvals-and-sandbox"}
 	}
 	return []string{"--sandbox", "workspace-write"}
+}
+
+func prepareNativeArguments(invocation Invocation) ([]string, func(), error) {
+	noopCleanup := func() {}
+	effectiveRun := invocation.Run
+	conversationID := ""
+	if invocation.Resume != nil {
+		conversationID = invocation.Resume.ProviderSessionID
+		if invocation.Resume.Prompt != "" {
+			effectiveRun.Prompt = invocation.Resume.Prompt
+		}
+	}
+	if effectiveRun.HarnessID == protocol.HarnessAntigravityCLI {
+		prompt := composePrompt(effectiveRun, invocation.SystemPrompt)
+		var preparedMCP antigravityacp.PreparedMCPDirectory
+		if invocation.MCP.URL != "" {
+			var err error
+			preparedMCP, err = antigravityacp.PrepareMCPDirectory(
+				[]antigravityacp.MCPHTTPServer{{
+					Name:    mcpServerName,
+					URL:     invocation.MCP.URL,
+					Headers: map[string]string{"Authorization": "Bearer " + invocation.MCP.Token},
+				}},
+				map[string][]string{
+					mcpServerName: mcpserver.ToolNames(invocation.MCP.CanDelegate),
+				},
+			)
+			if err != nil {
+				return nil, noopCleanup, err
+			}
+		} else {
+			preparedMCP = antigravityacp.PreparedMCPDirectory{Cleanup: noopCleanup}
+		}
+		arguments := antigravityacp.BuildCLIArguments(
+			invocation.Workspace,
+			preparedMCP,
+			conversationID,
+			effectiveRun.Model,
+			antigravityModeForApprovalPolicy(invocation.approvalPolicy),
+			prompt,
+		)
+		return arguments, preparedMCP.Cleanup, nil
+	}
+	arguments, err := harnessArguments(effectiveRun, invocation.SystemPrompt, invocation.MCP, invocation.approvalPolicy)
+	return arguments, noopCleanup, err
 }
 
 func harnessArguments(run protocol.Run, systemPrompt string, mcpConfiguration mcpserver.Configuration, approvalPolicy string) ([]string, error) {
@@ -196,16 +254,35 @@ func readEvents(reader io.Reader, harnessID string, output func(string), session
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	final := ""
+	var antigravityAccumulator strings.Builder
+	var antigravityErr error
 	sessionReported := false
 	var eventErr error
 	for scanner.Scan() {
+		lineBytes := scanner.Bytes()
 		if !sessionReported && session != nil {
-			if identity := providerSessionIdentity(harnessID, scanner.Bytes()); identity != "" {
+			if identity := providerSessionIdentity(harnessID, lineBytes); identity != "" {
 				sessionReported = true
 				session(identity)
 			}
 		}
-		readable := readableEvent(harnessID, scanner.Bytes())
+		if harnessID == protocol.HarnessAntigravityCLI {
+			delta, fallbackResponse, eventErr := parseAntigravityNativeEvent(lineBytes, antigravityAccumulator.Len() > 0)
+			if delta != "" {
+				antigravityAccumulator.WriteString(delta)
+				final = antigravityAccumulator.String()
+				output(delta)
+			} else if fallbackResponse != "" {
+				antigravityAccumulator.WriteString(fallbackResponse)
+				final = antigravityAccumulator.String()
+				output(fallbackResponse)
+			}
+			if eventErr != nil {
+				antigravityErr = eventErr
+			}
+			continue
+		}
+		readable := readableEvent(harnessID, lineBytes)
 		if readable == "" {
 			if eventErr == nil {
 				eventErr = harnessEventError(harnessID, scanner.Bytes())
@@ -215,8 +292,11 @@ func readEvents(reader io.Reader, harnessID string, output func(string), session
 		final = readable
 		output(readable)
 	}
-	if err := scanner.Err(); err != nil {
-		return final, err
+	if scanErr := scanner.Err(); scanErr != nil {
+		return final, scanErr
+	}
+	if antigravityErr != nil {
+		return final, antigravityErr
 	}
 	return final, eventErr
 }
@@ -226,9 +306,14 @@ var providerSessionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,1
 func providerSessionIdentity(harnessID string, line []byte) string {
 	var event struct {
 		Type              string `json:"type"`
+		Event             string `json:"event"`
 		SessionID         string `json:"session_id"`
 		OpenCodeSessionID string `json:"sessionID"`
 		ThreadID          string `json:"thread_id"`
+		ConversationID    string `json:"conversation_id"`
+		Result            *struct {
+			ConversationID string `json:"conversation_id"`
+		} `json:"result"`
 	}
 	if json.Unmarshal(line, &event) != nil {
 		return ""
@@ -243,11 +328,70 @@ func providerSessionIdentity(harnessID string, line []byte) string {
 		}
 	case protocol.HarnessOpenCodeCLI:
 		identity = event.OpenCodeSessionID
+	case protocol.HarnessAntigravityCLI:
+		identity = event.ConversationID
+		if identity == "" && event.Result != nil {
+			identity = event.Result.ConversationID
+		}
 	}
 	if !providerSessionPattern.MatchString(identity) {
 		return ""
 	}
 	return identity
+}
+
+func parseAntigravityNativeEvent(line []byte, alreadyStreamed bool) (string, string, error) {
+	var envelope struct {
+		Event      string `json:"event"`
+		StepUpdate *struct {
+			StepType  string `json:"step_type"`
+			TextDelta string `json:"text_delta"`
+		} `json:"step_update"`
+		Result *struct {
+			Status        string `json:"status"`
+			Response      string `json:"response"`
+			Error         string `json:"error"`
+			DeniedActions []struct {
+				Action      string `json:"action"`
+				DisplayName string `json:"display_name"`
+			} `json:"denied_actions"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(line, &envelope) != nil {
+		return "", "", nil
+	}
+	switch envelope.Event {
+	case "step_update":
+		if envelope.StepUpdate == nil || envelope.StepUpdate.TextDelta == "" {
+			return "", "", nil
+		}
+		lowerType := strings.ToLower(envelope.StepUpdate.StepType)
+		if strings.Contains(lowerType, "thought") || strings.Contains(lowerType, "think") {
+			return "", "", nil
+		}
+		return envelope.StepUpdate.TextDelta, "", nil
+	case "result":
+		if envelope.Result == nil {
+			return "", "", nil
+		}
+		fallback := ""
+		if !alreadyStreamed && envelope.Result.Response != "" {
+			fallback = envelope.Result.Response
+		}
+		if envelope.Result.Status != "" && !strings.EqualFold(envelope.Result.Status, "SUCCESS") {
+			message := strings.TrimSpace(envelope.Result.Error)
+			if message == "" {
+				message = "agy turn finished with status " + envelope.Result.Status
+			}
+			return "", fallback, errors.New(message)
+		}
+		if len(envelope.Result.DeniedActions) > 0 && !alreadyStreamed && strings.TrimSpace(fallback) == "" {
+			return "", "", errors.New("agy denied a required tool action in headless mode")
+		}
+		return "", fallback, nil
+	default:
+		return "", "", nil
+	}
 }
 
 func readableEvent(harnessID string, line []byte) string {

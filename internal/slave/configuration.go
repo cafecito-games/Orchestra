@@ -36,27 +36,28 @@ const (
 var nonSlugCharacters = regexp.MustCompile(`[^a-z0-9-]+`)
 
 type Configuration struct {
-	ControlEndpoint   string
-	NodeID            string
-	Name              string
-	Kind              string
-	WorkspaceRoots    []string
-	ProjectAllowlist  []string
-	Labels            []string
-	Accelerators      []string
-	Toolchains        []readiness.Toolchain
-	MemoryMegabytes   int
-	Concurrency       int
-	InstanceCapacity  int
-	Token             string
-	DataRoot          string
-	AdapterManifest   string
-	ACPAdapters       []acpadapter.Override
-	ACPNativeFallback []string
-	ClaudeACPAuthMode string
-	ApprovalPolicies  harness.ApprovalPolicies
-	HTTPClient        *http.Client
-	Version           string
+	ControlEndpoint      string
+	NodeID               string
+	Name                 string
+	Kind                 string
+	WorkspaceRoots       []string
+	ProjectAllowlist     []string
+	Labels               []string
+	Accelerators         []string
+	Toolchains           []readiness.Toolchain
+	MemoryMegabytes      int
+	Concurrency          int
+	InstanceCapacity     int
+	Token                string
+	DataRoot             string
+	AdapterManifest      string
+	ACPAdapters          []acpadapter.Override
+	ACPNativeFallback    []string
+	ClaudeACPAuthMode    string
+	ApprovalPolicies     harness.ApprovalPolicies
+	BuiltInACPExecutable string
+	HTTPClient           *http.Client
+	Version              string
 }
 
 type Runtime struct {
@@ -390,6 +391,11 @@ func BuildRuntime(operationContext context.Context, configuration Configuration)
 				adapters[resolution.HarnessID] = adapter
 			}
 			break
+		}
+	}
+	if _, overridden := adapters[protocol.HarnessAntigravityCLI]; !overridden && nativeBinaries[protocol.HarnessAntigravityCLI] != "" {
+		if builtInAdapter, available := harness.BuiltInAntigravityACPAdapter(configuration.BuiltInACPExecutable, configuration.DataRoot, configuration.Version); available {
+			adapters[protocol.HarnessAntigravityCLI] = builtInAdapter
 		}
 	}
 

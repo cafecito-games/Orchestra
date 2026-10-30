@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -15,19 +16,40 @@ import (
 var (
 	codexNativeVersion  = "codex-cli 0.46.0"
 	claudeNativeVersion = "2.0.14 (Claude Code)"
+	agyNativeVersion    = "1.4.11"
+)
+
+const (
+	FakeAntigravityDefaultModel = "gemini-4-argon-medium"
+	FakeAntigravityAltModel     = "gemini-3.8-flash-medium"
 )
 
 func nativeVersionForRole(role string) string {
-	if role == "codex" {
+	switch role {
+	case "codex":
 		return codexNativeVersion
+	case "agy":
+		return agyNativeVersion
+	default:
+		return claudeNativeVersion
 	}
-	return claudeNativeVersion
 }
 
 type nativeExecutionHost struct {
-	role          string
-	lastOutput    string
-	cancelChannel chan struct{}
+	role           string
+	conversationID string
+	stepIndex      int
+	lastOutput     string
+	cancelChannel  chan struct{}
+}
+
+type parsedNativeArguments struct {
+	prompt         string
+	mcpEndpoint    string
+	mcpBearerToken string
+	conversationID string
+	modelID        string
+	sandbox        bool
 }
 
 func runNative(recorder *eventRecorder, role string, arguments []string) int {
@@ -37,16 +59,24 @@ func runNative(recorder *eventRecorder, role string, arguments []string) int {
 		fmt.Println(version)
 		return 0
 	}
+	if role == "agy" && len(arguments) == 1 && arguments[0] == "models" {
+		fmt.Printf("Fetching available models...\n%s\tGemini 4 Argon (Medium)\n%s\tGemini 3.8 Flash (Medium)\n", FakeAntigravityDefaultModel, FakeAntigravityAltModel)
+		return 0
+	}
 
-	prompt, mcpEndpoint, err := parseNativeInvocation(role, arguments)
+	parsed, err := parseNativeInvocation(role, arguments)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fakeharness: %v\n", err)
 		return 64
 	}
 
 	var mcpClient *hubMCPClient
-	if mcpEndpoint != "" {
-		mcpClient, err = newHubMCPClient(mcpEndpoint, os.Getenv("ORCHESTRA_MCP_TOKEN"))
+	if parsed.mcpEndpoint != "" {
+		bearerToken := parsed.mcpBearerToken
+		if bearerToken == "" {
+			bearerToken = os.Getenv("ORCHESTRA_MCP_TOKEN")
+		}
+		mcpClient, err = newHubMCPClient(parsed.mcpEndpoint, bearerToken)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "fakeharness: %v\n", err)
 			return 64
@@ -57,9 +87,35 @@ func runNative(recorder *eventRecorder, role string, arguments []string) int {
 		}
 	}
 
-	recorder.write(map[string]any{"event": "native-run", "mcp": mcpClient != nil, "version": nativeVersionForRole(role)})
+	conversationID := parsed.conversationID
+	resumedConversation := false
+	if role == "agy" {
+		sessionDirectory := os.Getenv(sessionDirectoryVariable)
+		if conversationID != "" {
+			if sessionDirectory != "" {
+				if _, statErr := os.Stat(filepath.Join(sessionDirectory, "agy-"+conversationID+".json")); statErr == nil {
+					resumedConversation = true
+				}
+			}
+		} else {
+			conversationID = "agy-conv-" + strconv.Itoa(os.Getpid())
+			if sessionDirectory != "" {
+				_ = os.WriteFile(filepath.Join(sessionDirectory, "agy-"+conversationID+".json"), []byte(`{"active":true}`), 0o600)
+			}
+		}
+	}
 
-	script, err := extractScript(prompt)
+	recorder.write(map[string]any{
+		"event":          "native-run",
+		"mcp":            mcpClient != nil,
+		"version":        nativeVersionForRole(role),
+		"conversationId": conversationID,
+		"resumed":        resumedConversation,
+		"model":          parsed.modelID,
+		"sandbox":        parsed.sandbox,
+	})
+
+	script, err := extractScript(parsed.prompt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fakeharness: %v\n", err)
 		return 65
@@ -74,14 +130,21 @@ func runNative(recorder *eventRecorder, role string, arguments []string) int {
 	}()
 
 	workingDirectory, _ := os.Getwd()
-	host := &nativeExecutionHost{role: role, cancelChannel: cancelChannel}
-	if role == "codex" {
+	host := &nativeExecutionHost{
+		role:           role,
+		conversationID: conversationID,
+		cancelChannel:  cancelChannel,
+	}
+	switch role {
+	case "codex":
 		host.emit(map[string]any{"type": "thread.started", "thread_id": "native-codex-" + strconv.Itoa(os.Getpid())})
-	} else {
+	case "agy":
+		host.emit(map[string]any{"event": "init", "conversation_id": conversationID})
+	default:
 		host.emit(map[string]any{"type": "system", "session_id": "native-claude-" + strconv.Itoa(os.Getpid())})
 	}
 
-	runErr := newScriptEngine(host, mcpClient, prompt, workingDirectory, "").run(context.Background(), script)
+	runErr := newScriptEngine(host, mcpClient, parsed.prompt, workingDirectory, conversationID).run(context.Background(), script)
 	var crashResult scriptedCrash
 	if errors.As(runErr, &crashResult) {
 		return crashResult.code
@@ -93,21 +156,36 @@ func runNative(recorder *eventRecorder, role string, arguments []string) int {
 		fmt.Fprintf(os.Stderr, "fakeharness: %v\n", runErr)
 		return 70
 	}
-	if role == "claude" {
+	switch role {
+	case "claude":
 		host.emit(map[string]any{"type": "result", "subtype": "success", "result": host.lastOutput})
+	case "agy":
+		host.emit(map[string]any{
+			"event": "result",
+			"result": map[string]any{
+				"conversation_id": conversationID,
+				"status":          "SUCCESS",
+				"response":        host.lastOutput,
+				"usage": map[string]any{
+					"input_tokens":      84,
+					"output_tokens":     12,
+					"cache_read_tokens": 20,
+					"total_tokens":      96,
+				},
+			},
+		})
 	}
 	return 0
 }
 
-func parseNativeInvocation(role string, arguments []string) (string, string, error) {
-	var prompt string
-	var endpoint string
+func parseNativeInvocation(role string, arguments []string) (parsedNativeArguments, error) {
+	var parsed parsedNativeArguments
 
 	if role == "codex" {
 		if len(arguments) < 2 || arguments[0] != "exec" {
-			return "", "", errors.New("expected codex exec")
+			return parsed, errors.New("expected codex exec")
 		}
-		prompt = arguments[len(arguments)-1]
+		parsed.prompt = arguments[len(arguments)-1]
 		for index := 0; index+1 < len(arguments)-1; index++ {
 			if arguments[index] != "-c" {
 				continue
@@ -116,18 +194,61 @@ func parseNativeInvocation(role string, arguments []string) (string, string, err
 			if found && key == "mcp_servers.orchestra_hub.url" {
 				unquoted, unquoteErr := strconv.Unquote(value)
 				if unquoteErr != nil {
-					return "", "", errors.New("MCP URL configuration is not quoted")
+					return parsed, errors.New("MCP URL configuration is not quoted")
 				}
-				endpoint = unquoted
+				parsed.mcpEndpoint = unquoted
 			}
 		}
-		return prompt, endpoint, nil
+		return parsed, nil
+	}
+
+	if role == "agy" {
+		for index := 0; index < len(arguments); index++ {
+			argument := arguments[index]
+			switch {
+			case strings.HasPrefix(argument, "-p="):
+				parsed.prompt = strings.TrimPrefix(argument, "-p=")
+			case argument == "-p" && index+1 < len(arguments):
+				parsed.prompt = arguments[index+1]
+				index++
+			case argument == "--conversation" && index+1 < len(arguments):
+				parsed.conversationID = arguments[index+1]
+				index++
+			case argument == "--model" && index+1 < len(arguments):
+				parsed.modelID = arguments[index+1]
+				index++
+			case argument == "--sandbox":
+				parsed.sandbox = true
+			case argument == "--add-dir" && index+1 < len(arguments):
+				addedDirectory := arguments[index+1]
+				index++
+				mcpConfigPath := filepath.Join(addedDirectory, ".agents", "mcp_config.json")
+				if rawBytes, readErr := os.ReadFile(mcpConfigPath); readErr == nil {
+					var document struct {
+						MCPServers map[string]struct {
+							ServerURL string            `json:"serverUrl"`
+							Headers   map[string]string `json:"headers"`
+						} `json:"mcpServers"`
+					}
+					if json.Unmarshal(rawBytes, &document) == nil {
+						if hub, found := document.MCPServers["orchestra_hub"]; found {
+							parsed.mcpEndpoint = hub.ServerURL
+							parsed.mcpBearerToken = strings.TrimPrefix(hub.Headers["Authorization"], "Bearer ")
+						}
+					}
+				}
+			}
+		}
+		if parsed.prompt == "" {
+			return parsed, errors.New("expected agy -p=<prompt>")
+		}
+		return parsed, nil
 	}
 
 	for index := 0; index+1 < len(arguments); index++ {
 		switch arguments[index] {
 		case "-p":
-			prompt = arguments[index+1]
+			parsed.prompt = arguments[index+1]
 		case "--mcp-config":
 			var configuration struct {
 				MCPServers map[string]struct {
@@ -135,15 +256,15 @@ func parseNativeInvocation(role string, arguments []string) (string, string, err
 				} `json:"mcpServers"`
 			}
 			if err := json.Unmarshal([]byte(arguments[index+1]), &configuration); err != nil {
-				return "", "", errors.New("MCP configuration flag is not valid JSON")
+				return parsed, errors.New("MCP configuration flag is not valid JSON")
 			}
-			endpoint = configuration.MCPServers["orchestra_hub"].URL
+			parsed.mcpEndpoint = configuration.MCPServers["orchestra_hub"].URL
 		}
 	}
-	if prompt == "" {
-		return "", "", errors.New("expected claude -p <prompt>")
+	if parsed.prompt == "" {
+		return parsed, errors.New("expected claude -p <prompt>")
 	}
-	return prompt, endpoint, nil
+	return parsed, nil
 }
 
 func (host *nativeExecutionHost) emit(event map[string]any) {
@@ -153,12 +274,25 @@ func (host *nativeExecutionHost) emit(event map[string]any) {
 
 func (host *nativeExecutionHost) message(text string) error {
 	host.lastOutput = text
-	if host.role == "codex" {
+	switch host.role {
+	case "codex":
 		host.emit(map[string]any{
 			"type": "item.completed",
 			"item": map[string]any{"type": "agent_message", "text": text},
 		})
-	} else {
+	case "agy":
+		host.stepIndex++
+		host.emit(map[string]any{
+			"event": "step_update",
+			"step_update": map[string]any{
+				"conversation_id": host.conversationID,
+				"step_index":      host.stepIndex,
+				"state":           "DONE",
+				"step_type":       "agent_response",
+				"text_delta":      text,
+			},
+		})
+	default:
 		host.emit(map[string]any{
 			"type": "assistant",
 			"message": map[string]any{
@@ -169,7 +303,22 @@ func (host *nativeExecutionHost) message(text string) error {
 	return nil
 }
 
-func (host *nativeExecutionHost) thought(string) error { return nil }
+func (host *nativeExecutionHost) thought(text string) error {
+	if host.role == "agy" {
+		host.stepIndex++
+		host.emit(map[string]any{
+			"event": "step_update",
+			"step_update": map[string]any{
+				"conversation_id": host.conversationID,
+				"step_index":      host.stepIndex,
+				"state":           "DONE",
+				"step_type":       "thought",
+				"text_delta":      text,
+			},
+		})
+	}
+	return nil
+}
 
 func (host *nativeExecutionHost) update(json.RawMessage) error { return nil }
 

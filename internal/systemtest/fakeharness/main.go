@@ -26,6 +26,8 @@ var observedEnvironmentVariables = []string{
 	"INITIAL_AGENT_MODE",
 	"CODEX_PATH",
 	"CLAUDE_CODE_EXECUTABLE",
+	"AGY_EXECUTABLE",
+	"ORCHESTRA_ANTIGRAVITY_INITIAL_MODE",
 }
 
 func main() {
@@ -37,7 +39,7 @@ func main() {
 		exitCode = runACP(eventRecorder, codexFlavor)
 	case "claude-agent-acp":
 		exitCode = runACP(eventRecorder, claudeFlavor)
-	case "codex", "claude":
+	case "codex", "claude", "agy":
 		exitCode = runNative(eventRecorder, role, os.Args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "fakeharness: unknown executable role %q\n", role)
