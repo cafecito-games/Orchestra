@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -164,6 +165,17 @@ func installFakeHarnesses(t *testing.T, sourceBinary string) fakeHarnessInstalla
 func (installation fakeHarnessInstallation) openGate(t *testing.T, gateName string) {
 	t.Helper()
 	require.NoError(t, os.WriteFile(filepath.Join(installation.gateDirectory, gateName), []byte("open\n"), 0o600))
+}
+
+func (installation fakeHarnessInstallation) installAntigravity(t *testing.T, sourceBinary string) {
+	t.Helper()
+	binaryBytes, err := os.ReadFile(sourceBinary)
+	require.NoError(t, err)
+	extension := ""
+	if runtime.GOOS == "windows" {
+		extension = ".exe"
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(installation.binDirectory, "agy"+extension), binaryBytes, 0o755))
 }
 
 func (installation fakeHarnessInstallation) readRecords(t *testing.T) []map[string]any {
@@ -1538,4 +1550,276 @@ func TestTLSEndToEndWithEmbeddedLocalWorker(t *testing.T) {
 		}
 		return completedCount == 2
 	}, 15*time.Second, 100*time.Millisecond)
+}
+
+func TestAntigravityBuiltInACPAndNativeEndToEnd(t *testing.T) {
+	binaries := ensureCompiledBinaries(t)
+	fakeHarnesses := installFakeHarnesses(t, binaries.fakeHarnessPath)
+	fakeHarnesses.installAntigravity(t, binaries.fakeHarnessPath)
+
+	const bearerToken = "agy-system-test-token-778899"
+	listenAddress := allocateFreeLoopbackAddress(t)
+	masterBaseURL := "http://" + listenAddress
+	masterDataDirectory := filepath.Join(t.TempDir(), "agy-master-sqlite")
+
+	rawWorkspaceRoot := filepath.Join(t.TempDir(), "agy-workspace-root")
+	require.NoError(t, os.MkdirAll(rawWorkspaceRoot, 0o755))
+	canonicalRoots, err := slave.CanonicalizeWorkspaceRoots([]string{rawWorkspaceRoot})
+	require.NoError(t, err)
+	canonicalRepositoryPath := filepath.Join(canonicalRoots[0], "repo")
+	initializeGitRepository(t, canonicalRepositoryPath)
+
+	workerDataRoot := filepath.Join(t.TempDir(), "agy-worker-data")
+	workerEnvironment := buildWorkerEnvironment(fakeHarnesses, "ORCHESTRA_DATA_ROOT="+workerDataRoot)
+
+	masterProcess := startManagedProcess(t, "agy-master", binaries.orchestraPath, []string{
+		"master",
+		"--listen", listenAddress,
+		"--token", bearerToken,
+		"--data-dir", masterDataDirectory,
+	}, workerEnvironment)
+	waitForMasterReady(t, masterBaseURL, masterProcess)
+
+	doctorJSONOutput, _ := invokeOrchestraCLI(
+		t,
+		binaries.orchestraPath,
+		append(slices.Clone(workerEnvironment), "ORCHESTRA_ENDPOINT="+masterBaseURL, "ORCHESTRA_TOKEN="+bearerToken),
+		"doctor",
+		"--data-root", workerDataRoot,
+		"--endpoint", masterBaseURL,
+		"--json",
+	)
+	require.Contains(t, doctorJSONOutput, `"antigravity-cli"`)
+	require.Contains(t, doctorJSONOutput, `"acpLaunchReady": true`)
+
+	workerProcess := startManagedProcess(t, "agy-slave", binaries.orchestraPath, []string{
+		"slave",
+		"--endpoint", masterBaseURL,
+		"--token", bearerToken,
+		"--id", "worker-agy",
+		"--name", "Antigravity Worker",
+		"--workspace-root", canonicalRoots[0],
+		"--data-root", workerDataRoot,
+	}, workerEnvironment)
+
+	mcpSession := startMCPStdioSession(t, binaries.orchestraPath, masterBaseURL, bearerToken, "agy-orchestrator")
+
+	var antigravityProfile protocol.HarnessProfile
+	if !assert.Eventually(t, func() bool {
+		var inventory struct {
+			Nodes []protocol.NodeDetail `json:"nodes"`
+		}
+		mcpSession.callTool(t, "get_execution_inventory", map[string]any{}, &inventory)
+		for _, detail := range inventory.Nodes {
+			if detail.Node.ID != "worker-agy" || !detail.Connected || !detail.Synced {
+				continue
+			}
+			for _, profile := range detail.Node.Harnesses {
+				if profile.ID == protocol.HarnessAntigravityCLI && profile.Available {
+					antigravityProfile = profile
+					return true
+				}
+			}
+		}
+		return false
+	}, 12*time.Second, 100*time.Millisecond) {
+		t.Fatalf("antigravity worker failed to register;\nmaster:\n%s\nworker:\n%s", masterProcess.logs(), workerProcess.logs())
+	}
+
+	require.Contains(t, antigravityProfile.Transports, protocol.TransportACP)
+	require.Contains(t, antigravityProfile.Transports, protocol.TransportNativeCLI)
+	require.NotNil(t, antigravityProfile.ACP)
+	require.True(t, antigravityProfile.ACP.ResumeSession)
+	require.True(t, antigravityProfile.ACP.Mcp.HTTP)
+	require.Contains(t, antigravityProfile.Models, "gemini-4-argon-medium")
+	require.Contains(t, antigravityProfile.Models, "gemini-3.8-flash-medium")
+
+	var createdThread struct {
+		Thread protocol.Thread `json:"thread"`
+	}
+	mcpSession.callTool(t, "create_thread", map[string]any{
+		"title": "Antigravity Built-In ACP Continuity & Native Verification",
+	}, &createdThread)
+	threadID := createdThread.Thread.ID
+
+	var spawnedInstance protocol.InstanceLifecycleResult
+	mcpSession.callTool(t, "spawn_instance", map[string]any{
+		"threadId":       threadID,
+		"idempotencyKey": "spawn-agy-resident-1",
+		"purpose": map[string]any{
+			"name":    "agy-specialist",
+			"summary": "Resident Antigravity session over built-in ACP bridge",
+		},
+		"requirements": map[string]any{
+			"harnessIds": []string{protocol.HarnessAntigravityCLI},
+			"models":     []string{"gemini-3.8-flash-medium"},
+			"transports": []string{protocol.TransportACP},
+			"workspace": map[string]any{
+				"path":     canonicalRepositoryPath,
+				"writable": true,
+			},
+		},
+		"idleTimeoutSeconds": 300,
+	}, &spawnedInstance)
+	residentInstanceID := spawnedInstance.Instance.ID
+
+	require.Eventually(t, func() bool {
+		var instanceState struct {
+			Instance protocol.AgentInstance `json:"instance"`
+		}
+		mcpSession.callTool(t, "get_instance", map[string]any{"instanceId": residentInstanceID}, &instanceState)
+		return instanceState.Instance.Status == "ready" || instanceState.Instance.Status == "idle"
+	}, 10*time.Second, 100*time.Millisecond)
+
+	turnOneScript := formatFakeScript(t,
+		map[string]any{"call": "get_task_context", "as": "context"},
+		map[string]any{"thought": "inspecting thread context in turn 1"},
+		map[string]any{"message": "agy-turn1 conv={{session}} task={{context.task.id}}"},
+	)
+	var firstSubmitted struct {
+		Tasks []protocol.Task `json:"tasks"`
+	}
+	mcpSession.callTool(t, "submit_tasks", map[string]any{
+		"threadId":       threadID,
+		"idempotencyKey": "agy-turn-1",
+		"tasks": []map[string]any{{
+			"clientTaskId": "agy-t1",
+			"title":        "Antigravity ACP Turn 1",
+			"instructions": "Run first Antigravity turn\n" + turnOneScript,
+			"instanceId":   residentInstanceID,
+			"requirements": map[string]any{
+				"harnessIds": []string{protocol.HarnessAntigravityCLI},
+				"models":     []string{"gemini-3.8-flash-medium"},
+				"transports": []string{protocol.TransportACP},
+				"workspace":  map[string]any{"path": canonicalRepositoryPath, "writable": true},
+			},
+		}},
+	}, &firstSubmitted)
+	firstTaskID := firstSubmitted.Tasks[0].ID
+
+	var firstRun protocol.Run
+	require.Eventually(t, func() bool {
+		var contextSnapshot struct {
+			Tasks []protocol.Task `json:"tasks"`
+			Runs  []protocol.Run  `json:"runs"`
+		}
+		mcpSession.callTool(t, "get_thread_context", map[string]any{"threadId": threadID}, &contextSnapshot)
+		for _, candidate := range contextSnapshot.Tasks {
+			if candidate.ID == firstTaskID && candidate.Status == "completed" && candidate.Assignment != nil {
+				for _, runCandidate := range contextSnapshot.Runs {
+					if runCandidate.ID == candidate.Assignment.RunID {
+						firstRun = runCandidate
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}, 15*time.Second, 100*time.Millisecond)
+
+	require.NotNil(t, firstRun.TransportSelection)
+	require.Equal(t, protocol.TransportACP, firstRun.TransportSelection.SelectedTransport)
+	require.NotNil(t, firstRun.TransportSelection.Adapter)
+	require.Equal(t, "antigravity-acp", firstRun.TransportSelection.Adapter.ID)
+	require.Equal(t, protocol.ACPAdapterSourceBuiltIn, firstRun.TransportSelection.Adapter.Source)
+	require.Contains(t, firstRun.Output, "agy-turn1 conv=agy-conv-")
+
+	turnTwoScript := formatFakeScript(t,
+		map[string]any{"call": "get_task_context", "as": "context"},
+		map[string]any{"message": "agy-turn2 conv={{session}} task={{context.task.id}}"},
+	)
+	var secondSubmitted struct {
+		Tasks []protocol.Task `json:"tasks"`
+	}
+	mcpSession.callTool(t, "submit_tasks", map[string]any{
+		"threadId":       threadID,
+		"idempotencyKey": "agy-turn-2",
+		"tasks": []map[string]any{
+			{
+				"clientTaskId": "agy-t2",
+				"title":        "Antigravity ACP Turn 2 (Resumed)",
+				"instructions": "Run resumed Antigravity turn\n" + turnTwoScript,
+				"instanceId":   residentInstanceID,
+				"requirements": map[string]any{
+					"harnessIds": []string{protocol.HarnessAntigravityCLI},
+					"models":     []string{"gemini-3.8-flash-medium"},
+					"transports": []string{protocol.TransportACP},
+					"workspace":  map[string]any{"path": canonicalRepositoryPath, "writable": true},
+				},
+			},
+			{
+				"clientTaskId": "agy-native",
+				"title":        "Antigravity Native CLI Turn",
+				"instructions": "Run native Antigravity CLI turn\n" + formatFakeScript(t,
+					map[string]any{"call": "get_task_context", "as": "context"},
+					map[string]any{"message": "agy-native task={{context.task.id}}"},
+				),
+				"requirements": map[string]any{
+					"harnessIds": []string{protocol.HarnessAntigravityCLI},
+					"transports": []string{protocol.TransportNativeCLI},
+					"workspace":  map[string]any{"path": canonicalRepositoryPath, "writable": true},
+				},
+			},
+		},
+	}, &secondSubmitted)
+	require.Len(t, secondSubmitted.Tasks, 2)
+	secondTaskID := secondSubmitted.Tasks[0].ID
+	nativeTaskID := secondSubmitted.Tasks[1].ID
+
+	var secondRun protocol.Run
+	var nativeRun protocol.Run
+	require.Eventually(t, func() bool {
+		var contextSnapshot struct {
+			Tasks []protocol.Task `json:"tasks"`
+			Runs  []protocol.Run  `json:"runs"`
+		}
+		mcpSession.callTool(t, "get_thread_context", map[string]any{"threadId": threadID}, &contextSnapshot)
+		foundSecond := false
+		foundNative := false
+		for _, candidate := range contextSnapshot.Tasks {
+			if candidate.Status != "completed" || candidate.Assignment == nil {
+				continue
+			}
+			for _, runCandidate := range contextSnapshot.Runs {
+				if runCandidate.ID != candidate.Assignment.RunID {
+					continue
+				}
+				if candidate.ID == secondTaskID {
+					secondRun = runCandidate
+					foundSecond = true
+				}
+				if candidate.ID == nativeTaskID {
+					nativeRun = runCandidate
+					foundNative = true
+				}
+			}
+		}
+		return foundSecond && foundNative
+	}, 15*time.Second, 100*time.Millisecond)
+
+	require.NotNil(t, firstRun.ProviderSessionID)
+	require.NotNil(t, secondRun.ProviderSessionID)
+	require.Equal(t, *firstRun.ProviderSessionID, *secondRun.ProviderSessionID)
+	require.NotNil(t, secondRun.SessionBindingID)
+	require.Contains(t, secondRun.Output, "agy-turn2 conv=")
+	firstConversationToken, _, _ := strings.Cut(strings.TrimPrefix(firstRun.Output, "agy-turn1 conv="), " ")
+	secondConversationToken, _, _ := strings.Cut(strings.TrimPrefix(secondRun.Output, "agy-turn2 conv="), " ")
+	require.NotEmpty(t, firstConversationToken)
+	require.Equal(t, firstConversationToken, secondConversationToken)
+
+	require.NotNil(t, nativeRun.TransportSelection)
+	require.Equal(t, protocol.TransportNativeCLI, nativeRun.TransportSelection.SelectedTransport)
+	require.Contains(t, nativeRun.Output, "agy-native task="+nativeTaskID)
+
+	records := fakeHarnesses.readRecords(t)
+	sawResumedAgyRun := false
+	for _, record := range records {
+		if record["role"] == "agy" && record["event"] == "native-run" && record["resumed"] == true {
+			sawResumedAgyRun = true
+			require.Equal(t, firstConversationToken, record["conversationId"])
+			require.Equal(t, true, record["mcp"])
+			require.Equal(t, "gemini-3.8-flash-medium", record["model"])
+		}
+	}
+	require.True(t, sawResumedAgyRun)
 }

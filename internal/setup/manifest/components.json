@@ -88,6 +88,22 @@
       },
       "launch": {},
       "authDocsUrl": "https://developers.openai.com/codex"
+    },
+    {
+      "id": "antigravity-cli",
+      "kind": "harness",
+      "harnessId": "antigravity-cli",
+      "provider": "google",
+      "label": "Antigravity CLI (agy)",
+      "version": "1.4.11",
+      "platforms": {
+        "darwin-amd64": { "kind": "manual", "executablePath": "bin/agy" },
+        "darwin-arm64": { "kind": "manual", "executablePath": "bin/agy" },
+        "linux-amd64": { "kind": "manual", "executablePath": "bin/agy" },
+        "linux-arm64": { "kind": "manual", "executablePath": "bin/agy" }
+      },
+      "launch": {},
+      "authDocsUrl": "https://antigravity.google/docs/cli/reference"
     }
   ]
 }

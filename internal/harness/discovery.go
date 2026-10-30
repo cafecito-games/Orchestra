@@ -25,6 +25,7 @@ var providers = []provider{
 	{id: protocol.HarnessClaudeCLI, label: "Claude Code", binary: "claude", authMode: "local-subscription", models: []string{"sonnet", "opus", "haiku"}},
 	{id: protocol.HarnessCodexCLI, label: "Codex", binary: "codex", authMode: "local-account", models: []string{}},
 	{id: protocol.HarnessOpenCodeCLI, label: "OpenCode", binary: "opencode", authMode: "local-account", models: []string{}},
+	{id: protocol.HarnessAntigravityCLI, label: "Antigravity", binary: "agy", authMode: "local-account", models: []string{}},
 }
 
 type HarnessProvenance string

@@ -111,7 +111,11 @@ func AssessComponents(operationContext context.Context, manifest Manifest, ledge
 		if specification, allowed := AuthProbeAllowlist[entry.HarnessID]; allowed && assessment.HarnessInstalled {
 			assessment.AuthReadiness = RunAuthProbe(operationContext, profile.Binary, specification.Arguments, specification.SuccessExitCode)
 		}
-		assessment.ACPLaunchReady = entry.Kind == ComponentKindACPAdapter && assessment.HarnessInstalled && activeErr == nil && assessment.AuthReadiness == AuthReadinessReady
+		assessment.ACPLaunchReady = (entry.Kind == ComponentKindACPAdapter && assessment.HarnessInstalled && activeErr == nil && assessment.AuthReadiness == AuthReadinessReady) ||
+			(entry.Kind == ComponentKindHarness && entry.HarnessID == protocol.HarnessAntigravityCLI && assessment.HarnessInstalled && assessment.AuthReadiness == AuthReadinessReady && (!options.ACPStartupEvidenceKnown || slices.Contains(profile.Transports, protocol.TransportACP)))
+		if entry.Kind == ComponentKindHarness && entry.HarnessID == protocol.HarnessAntigravityCLI && assessment.HarnessInstalled {
+			assessment.Notes = append(assessment.Notes, "built-in ACP bridge available via `orchestra acp-bridge antigravity`")
+		}
 		if activeErr == nil && activeInstalled.Reference().Version != entry.Version {
 			assessment.Notes = append(assessment.Notes, "the active version is retained from an earlier manifest and is no longer declared by this one")
 		}

@@ -17,9 +17,10 @@ const (
 )
 
 const (
-	HarnessClaudeCLI   = "claude-cli"
-	HarnessCodexCLI    = "codex-cli"
-	HarnessOpenCodeCLI = "opencode-cli"
+	HarnessClaudeCLI      = "claude-cli"
+	HarnessCodexCLI       = "codex-cli"
+	HarnessOpenCodeCLI    = "opencode-cli"
+	HarnessAntigravityCLI = "antigravity-cli"
 )
 
 const (
@@ -32,6 +33,7 @@ const (
 const (
 	ACPAdapterSourceSetupLedger   = "setup-ledger"
 	ACPAdapterSourceAdministrator = "administrator-override"
+	ACPAdapterSourceBuiltIn       = "built-in"
 )
 
 const (
@@ -47,9 +49,9 @@ const (
 
 var (
 	HarnessTransports        = []string{TransportNativeCLI, TransportACP}
-	HarnessIDs               = []string{HarnessClaudeCLI, HarnessCodexCLI, HarnessOpenCodeCLI}
+	HarnessIDs               = []string{HarnessClaudeCLI, HarnessCodexCLI, HarnessOpenCodeCLI, HarnessAntigravityCLI}
 	TransportFallbackReasons = []string{FallbackACPAdapterUnavailable, FallbackACPProtocolIncompatible, FallbackACPCapabilityMissing, FallbackACPMCPUnavailable}
-	ACPAdapterSources        = []string{ACPAdapterSourceSetupLedger, ACPAdapterSourceAdministrator}
+	ACPAdapterSources        = []string{ACPAdapterSourceSetupLedger, ACPAdapterSourceAdministrator, ACPAdapterSourceBuiltIn}
 	ApprovalPolicies         = []string{ApprovalPolicyManual, ApprovalPolicyAuto, ApprovalPolicyBypass}
 	NodeKinds                = []string{"local", "home-server", "cloud"}
 	NodeStatuses             = []string{"online", "offline", "busy"}

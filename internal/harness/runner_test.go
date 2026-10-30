@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -196,4 +197,93 @@ func TestOpenCodeArgumentsAndRuntimeMCPConfiguration(t *testing.T) {
 func TestOpenCodeStreamErrorIsReturned(t *testing.T) {
 	_, err := readEvents(strings.NewReader("{\"type\":\"error\",\"error\":{\"data\":{\"message\":\"provider credentials are missing\"}}}\n"), protocol.HarnessOpenCodeCLI, func(string) {}, nil)
 	require.EqualError(t, err, "provider credentials are missing")
+}
+
+func TestAntigravityNativeExecutionAccumulatesStreamAndCleansEphemeralMCP(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stub uses POSIX sh")
+	}
+
+	temporaryDirectory := t.TempDir()
+	capturedMCPPathFile := filepath.Join(temporaryDirectory, "mcp-dir.txt")
+	capturedArgsFile := filepath.Join(temporaryDirectory, "args.txt")
+	fakeAgy := filepath.Join(temporaryDirectory, "agy")
+	script := `#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "` + capturedArgsFile + `"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--add-dir" ] && [ -f "$2/.agents/mcp_config.json" ]; then
+    printf '%s' "$2" > "` + capturedMCPPathFile + `"
+  fi
+  shift
+done
+printf '%s\n' '{"event":"init","conversation_id":"agy-conv-777"}'
+printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-conv-777","step_index":1,"state":"ACTIVE","step_type":"thought","text_delta":"Internal reasoning"}}'
+printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-conv-777","step_index":2,"state":"ACTIVE","step_type":"agent_response","text_delta":"Part one"}}'
+printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"agy-conv-777","step_index":2,"state":"DONE","step_type":"agent_response","text_delta":" and part two\n"}}'
+printf '%s\n' '{"event":"result","result":{"conversation_id":"agy-conv-777","status":"SUCCESS","response":"Part one and part two\n"}}'
+`
+	require.NoError(t, os.WriteFile(fakeAgy, []byte(script), 0o755))
+
+	workspaceDirectory := t.TempDir()
+	authorized, err := AuthorizeWorkspace(workspaceDirectory, []string{workspaceDirectory})
+	require.NoError(t, err)
+
+	profiles := []protocol.HarnessProfile{{
+		ID:          protocol.HarnessAntigravityCLI,
+		Label:       "Antigravity",
+		Description: "1.4.11",
+		Binary:      fakeAgy,
+		Available:   true,
+		Models:      []string{},
+		Transports:  []string{TransportNative},
+	}}
+	runner := NewRunner(profiles)
+
+	var streamed strings.Builder
+	var providerSession string
+	result, err := runner.Execute(context.Background(), Invocation{
+		Run: protocol.Run{
+			ID:        "run-agy-1",
+			HarnessID: protocol.HarnessAntigravityCLI,
+			Model:     "gemini-4-argon-medium",
+			Workspace: authorized,
+			Prompt:    "Verify Antigravity native runner",
+			Transport: TransportNative,
+		},
+		Workspace: authorized,
+		MCP: mcpserver.Configuration{
+			URL:         "http://127.0.0.1:8787/mcp",
+			Token:       "ephemeral-mcp-secret",
+			CanDelegate: false,
+		},
+		Resume: &SessionResume{
+			ProviderSessionID: "agy-conv-prev",
+		},
+		Output: func(chunk string) {
+			streamed.WriteString(chunk)
+		},
+		ProviderSession: func(identity string) {
+			providerSession = identity
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "Part one and part two", result)
+	require.Equal(t, "Part one and part two\n", streamed.String())
+	require.Equal(t, "agy-conv-777", providerSession)
+
+	recordedMCPDirectoryBytes, err := os.ReadFile(capturedMCPPathFile)
+	require.NoError(t, err)
+	recordedMCPDirectory := string(recordedMCPDirectoryBytes)
+	require.NotEmpty(t, recordedMCPDirectory)
+	_, statErr := os.Stat(recordedMCPDirectory)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+
+	recordedArgsBytes, err := os.ReadFile(capturedArgsFile)
+	require.NoError(t, err)
+	recordedArgs := string(recordedArgsBytes)
+	require.Contains(t, recordedArgs, "--conversation\nagy-conv-prev")
+	require.Contains(t, recordedArgs, "--model\ngemini-4-argon-medium")
+	require.Contains(t, recordedArgs, "--sandbox")
+	require.NotContains(t, recordedArgs, "ephemeral-mcp-secret")
 }

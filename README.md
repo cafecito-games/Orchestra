@@ -15,8 +15,8 @@ Main Machine                                       Remote Worker Machines (over 
 │ orchestra mcp                            │       │  │   exclusive-existing + flock)         │
 │    │ HTTP + SSE Doorbell                 │       │  ├─ Ephemeral 127.0.0.1 Run MCP Server   │
 │    ▼                                     │  ws/  │  │   (orchestra_hub worker tools)        │
-│ orchestra master                         │◄─────►│  └─ Harnesses (Claude, Codex & OpenCode   │
-│  ├─ Pure-Go SQLite (WAL, event journal)  │  wss  │      via acp-v1 stdio & native-cli)      │
+│ orchestra master                         │◄─────►│  └─ Harnesses (Claude, Codex, OpenCode & │
+│  ├─ Pure-Go SQLite (WAL, event journal)  │  wss  │      Antigravity via acp-v1 & native-cli)│
 │  ├─ Capability & Readiness Scheduler     │       └──────────────────────────────────────────┘
 │  ├─ Resident Agent Instances & Sessions  │
 │  ├─ Task DAGs, Mailboxes & Approvals     │
@@ -129,7 +129,9 @@ You can supply a JSON file mapping logical `projectId` values to readiness capab
 
 ## Setting Up & Running `orchestra slave`
 
-Copy the cross-compiled `orchestra` binary to each worker machine where Claude Code (`claude`), Codex (`codex`), and/or OpenCode (`opencode`) are installed and authenticated locally.
+Copy the cross-compiled `orchestra` binary to each worker machine where Claude Code (`claude`), Codex (`codex`), OpenCode (`opencode`), and/or Antigravity (`agy`) are installed and authenticated locally.
+
+Antigravity (`antigravity-cli`, executable `agy`) uses Orchestra's built-in pure-Go ACP v1 stdio bridge (`orchestra acp-bridge antigravity`) automatically whenever `agy` is installed on `PATH`, requiring no external adapter download, while also supporting `native-cli` execution and optional pinned `--acp-adapter antigravity-cli=sha256:<hex>:/absolute/path/to/adapter` overrides.
 
 ### 1. Provision Managed ACP Adapters (`orchestra setup` & `orchestra doctor`)
 ```bash
@@ -172,6 +174,7 @@ orchestra slave \
   --approval-policy claude-cli=manual \
   --approval-policy codex-cli=manual \
   --approval-policy opencode-cli=manual \
+  --approval-policy antigravity-cli=manual \
   --claude-acp-auth-mode local-subscription
 ```
 
@@ -282,8 +285,9 @@ orchestra reject <approval-id> --reason "Do not modify production config"
 # Cancel a running or queued task or run
 orchestra cancel <run-id|task-id>
 
-# Manage local slave components & run diagnostics
+# Manage local slave components, built-in ACP bridges & diagnostics
 orchestra setup <plan|apply|activate|rollback|prune|uninstall> [flags]
+orchestra acp-bridge antigravity [--agy-binary agy] [--state-dir <path>]
 orchestra doctor
 orchestra version
 ```

@@ -30,6 +30,7 @@ func TestLoadVerifiesPinnedOverride(t *testing.T) {
 		Activation: setup.LoadActivationState(t.TempDir()),
 		Overrides: []Override{
 			{HarnessID: "codex-cli", SHA256: digest, Path: binaryPath},
+			{HarnessID: protocol.HarnessAntigravityCLI, SHA256: digest, Path: binaryPath},
 		},
 	})
 	require.NoError(t, err)
@@ -37,6 +38,11 @@ func TestLoadVerifiesPinnedOverride(t *testing.T) {
 	require.True(t, present)
 	require.Equal(t, protocol.ACPAdapterSourceAdministrator, adapter.Source)
 	require.NoError(t, adapter.Verify())
+
+	antigravityAdapter, antigravityPresent := result.Adapters[protocol.HarnessAntigravityCLI]
+	require.True(t, antigravityPresent)
+	require.Equal(t, protocol.ACPAdapterSourceAdministrator, antigravityAdapter.Source)
+	require.NoError(t, antigravityAdapter.Verify())
 
 	_, err = Load(Options{
 		DataRoot:   t.TempDir(),
