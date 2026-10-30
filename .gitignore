@@ -10,3 +10,4 @@ dist/
 *.db-wal
 .env
 .DS_Store
+.worktrees/
