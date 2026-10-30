@@ -1,0 +1,117 @@
+version: "3"
+
+dotenv: [".env"]
+
+vars:
+  ORCHESTRA_BASE_VERSION: 0.1.0
+  ORCHESTRA_VERSION:
+    sh: |
+      revision="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+      echo "{{.ORCHESTRA_BASE_VERSION}}+${revision}"
+  LDFLAGS: -s -w -X github.com/cafecito-games/Orchestra/internal/protocol.BuildVersion={{.ORCHESTRA_VERSION}}
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the portable CGo-free orchestra binary for the current platform
+    cmds:
+      - mkdir -p bin
+      - CGO_ENABLED=0 go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/orchestra ./cmd/orchestra
+
+  build:all:
+    desc: Cross-compile CGo-free orchestra release binaries across darwin and linux (amd64/arm64)
+    cmds:
+      - mkdir -p dist
+      - CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/orchestra-darwin-arm64 ./cmd/orchestra
+      - CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/orchestra-darwin-amd64 ./cmd/orchestra
+      - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/orchestra-linux-arm64 ./cmd/orchestra
+      - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/orchestra-linux-amd64 ./cmd/orchestra
+
+  install:
+    desc: Build orchestra and atomically install it to ORCHESTRA_INSTALL_DIR (default ~/.local/bin)
+    platforms: [linux, darwin]
+    vars:
+      INSTALL_DIR:
+        sh: echo "${ORCHESTRA_INSTALL_DIR:-$HOME/.local/bin}"
+    cmds:
+      - task: build
+      - mkdir -p "{{.INSTALL_DIR}}"
+      - cp bin/orchestra "{{.INSTALL_DIR}}/.orchestra.new"
+      - chmod 0755 "{{.INSTALL_DIR}}/.orchestra.new"
+      - mv -f "{{.INSTALL_DIR}}/.orchestra.new" "{{.INSTALL_DIR}}/orchestra"
+      - echo "installed Orchestra {{.ORCHESTRA_VERSION}} to {{.INSTALL_DIR}}/orchestra"
+
+  run:master:
+    desc: Run orchestra master from source; append flags after --
+    cmds:
+      - CGO_ENABLED=0 go run ./cmd/orchestra master {{.CLI_ARGS}}
+
+  run:slave:
+    desc: Run orchestra slave from source; append flags after --
+    cmds:
+      - CGO_ENABLED=0 go run ./cmd/orchestra slave {{.CLI_ARGS}}
+
+  fmt:
+    desc: Format Go source files
+    cmds:
+      - gofmt -w .
+
+  fmt:check:
+    desc: Verify Go source formatting
+    cmds:
+      - |
+        unformatted="$(gofmt -l .)"
+        if [ -n "$unformatted" ]; then
+          echo "Unformatted files:"
+          echo "$unformatted"
+          exit 1
+        fi
+    silent: true
+
+  vet:
+    desc: Run go vet across unit and system-tagged packages
+    cmds:
+      - go vet ./...
+      - go vet -tags system ./...
+
+  lint:
+    desc: Run static checks across the repository
+    cmds:
+      - task: fmt:check
+      - task: vet
+      - git diff --check
+
+  unit:test:
+    desc: Run unit tests across all packages with the race detector
+    cmds:
+      - go test -race -count=1 ./...
+
+  system:test:
+    desc: Run real-process multi-node end-to-end system tests (orchestra master, multiple orchestra slave nodes, orchestra mcp, fake harnesses)
+    cmds:
+      - go test -tags system -race -count=1 -timeout 10m ./internal/systemtest/...
+
+  test:
+    desc: Run unit and multi-process system test suites
+    cmds:
+      - task: unit:test
+      - task: system:test
+
+  ci:
+    desc: Run the full local verification pipeline (formatting, vet, unit + system tests with -race, and cross-platform builds)
+    cmds:
+      - task: fmt:check
+      - task: vet
+      - task: unit:test
+      - task: system:test
+      - task: build
+      - task: build:all
+
+  clean:
+    desc: Remove build artifacts in bin/ and dist/
+    cmds:
+      - rm -rf bin dist

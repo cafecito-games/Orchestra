@@ -1,0 +1,12 @@
+bin/
+dist/
+.orchestra/
+.task/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+.env
+.DS_Store
