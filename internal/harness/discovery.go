@@ -22,8 +22,9 @@ type provider struct {
 }
 
 var providers = []provider{
-	{id: "claude-cli", label: "Claude Code", binary: "claude", authMode: "local-subscription", models: []string{"sonnet", "opus", "haiku"}},
-	{id: "codex-cli", label: "Codex", binary: "codex", authMode: "local-account", models: []string{}},
+	{id: protocol.HarnessClaudeCLI, label: "Claude Code", binary: "claude", authMode: "local-subscription", models: []string{"sonnet", "opus", "haiku"}},
+	{id: protocol.HarnessCodexCLI, label: "Codex", binary: "codex", authMode: "local-account", models: []string{}},
+	{id: protocol.HarnessOpenCodeCLI, label: "OpenCode", binary: "opencode", authMode: "local-account", models: []string{}},
 }
 
 type HarnessProvenance string

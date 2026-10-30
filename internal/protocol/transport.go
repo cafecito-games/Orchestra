@@ -17,8 +17,9 @@ const (
 )
 
 const (
-	HarnessClaudeCLI = "claude-cli"
-	HarnessCodexCLI  = "codex-cli"
+	HarnessClaudeCLI   = "claude-cli"
+	HarnessCodexCLI    = "codex-cli"
+	HarnessOpenCodeCLI = "opencode-cli"
 )
 
 const (
@@ -46,7 +47,7 @@ const (
 
 var (
 	HarnessTransports        = []string{TransportNativeCLI, TransportACP}
-	HarnessIDs               = []string{HarnessClaudeCLI, HarnessCodexCLI}
+	HarnessIDs               = []string{HarnessClaudeCLI, HarnessCodexCLI, HarnessOpenCodeCLI}
 	TransportFallbackReasons = []string{FallbackACPAdapterUnavailable, FallbackACPProtocolIncompatible, FallbackACPCapabilityMissing, FallbackACPMCPUnavailable}
 	ACPAdapterSources        = []string{ACPAdapterSourceSetupLedger, ACPAdapterSourceAdministrator}
 	ApprovalPolicies         = []string{ApprovalPolicyManual, ApprovalPolicyAuto, ApprovalPolicyBypass}

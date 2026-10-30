@@ -272,12 +272,16 @@ func (driver *ACPDriver) Execute(operationContext context.Context, invocation In
 	}
 
 	output := invocation.Output
+	permission := invocation.Permission
+	if provider.Permission != nil {
+		permission = provider.Permission(invocation.approvalPolicy, permission)
+	}
 	client := acp.NewClient(process.stdout, process.stdin, acp.Options{
 		RunID:                invocation.Run.ID,
 		ClientVersion:        driver.options.ClientVersion,
 		ExpectedAgentVersion: adapter.Version,
 		Secrets:              secrets,
-		Permission:           invocation.Permission,
+		Permission:           permission,
 		Events: func(event protocol.HarnessEvent) {
 			if event.Type == "message.delta" {
 				output(event.Text)
