@@ -292,10 +292,12 @@ echo '{"type":"result","result":"step succeeded"}'
 	require.NoError(t, err)
 	require.Equal(t, artifactBytes, downloaded)
 
-	mcpInitializeBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
+	mcpInitializeBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"orchestrator-test","version":"1.0.0"}}}`
 	mcpRequest, err := http.NewRequest(http.MethodPost, httpServer.URL+"/mcp", strings.NewReader(mcpInitializeBody))
 	require.NoError(t, err)
 	mcpRequest.Header.Set("Authorization", "Bearer master-secret-token")
+	mcpRequest.Header.Set("Content-Type", "application/json")
+	mcpRequest.Header.Set("Accept", "application/json, text/event-stream")
 	mcpResponse, err := http.DefaultClient.Do(mcpRequest)
 	require.NoError(t, err)
 	mcpSession := mcpResponse.Header.Get("Mcp-Session-Id")
@@ -306,6 +308,9 @@ echo '{"type":"result","result":"step succeeded"}'
 	listRequest, err := http.NewRequest(http.MethodPost, httpServer.URL+"/mcp", strings.NewReader(mcpListBody))
 	require.NoError(t, err)
 	listRequest.Header.Set("Authorization", "Bearer master-secret-token")
+	listRequest.Header.Set("Content-Type", "application/json")
+	listRequest.Header.Set("Accept", "application/json, text/event-stream")
+	listRequest.Header.Set("MCP-Protocol-Version", "2025-06-18")
 	listRequest.Header.Set("Mcp-Session-Id", mcpSession)
 	listResponse, err := http.DefaultClient.Do(listRequest)
 	require.NoError(t, err)

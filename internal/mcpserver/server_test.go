@@ -73,6 +73,8 @@ func TestMCPServerGrantDelegationAndPostArtifact(t *testing.T) {
 		require.NoError(t, requestErr)
 		request.Header.Set("Authorization", "Bearer "+configuration.Token)
 		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", "application/json, text/event-stream")
+		request.Header.Set("MCP-Protocol-Version", "2025-06-18")
 		response, doErr := http.DefaultClient.Do(request)
 		require.NoError(t, doErr)
 		defer response.Body.Close()
@@ -117,7 +119,7 @@ func TestMCPServerGrantDelegationAndPostArtifact(t *testing.T) {
 			"idempotencyKey": "art-ok",
 		},
 	})
-	require.Equal(t, false, artifactUploaded["result"].(map[string]any)["isError"])
+	require.NotEqual(t, true, artifactUploaded["result"].(map[string]any)["isError"])
 	require.Equal(t, []byte("hello artifact"), uploadedBytes)
 
 	server.Revoke(workerConfiguration.Token)

@@ -302,20 +302,3 @@ func ToolNames(canDelegate bool) []string {
 	}
 	return names
 }
-
-func tools(canDelegate bool) []map[string]any {
-	names := ToolNames(canDelegate)
-	listed := make([]map[string]any, 0, len(names))
-	for _, name := range names {
-		definition := definitions[name]
-		listed = append(listed, map[string]any{
-			"name":         name,
-			"title":        definition.title,
-			"description":  definition.description,
-			"inputSchema":  definition.input,
-			"outputSchema": definition.output,
-			"annotations":  map[string]bool{"readOnlyHint": definition.readOnly, "destructiveHint": false, "idempotentHint": true},
-		})
-	}
-	return listed
-}

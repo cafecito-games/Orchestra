@@ -4,6 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
@@ -189,6 +194,82 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 				"optionId":   map[string]any{"type": "string"},
 			}, []string{"approvalId"}),
 		},
+	}
+}
+
+func (service *Service) newMCPHTTPHandler() (http.Handler, func()) {
+	protocolServer := mcp.NewServer(
+		&mcp.Implementation{Name: "orchestra", Version: protocol.BuildVersion},
+		&mcp.ServerOptions{
+			Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}},
+		},
+	)
+	for _, definition := range OrchestratorToolDefinitions() {
+		protocolServer.AddTool(&mcp.Tool{
+			Name:        definition.Name,
+			Description: definition.Description,
+			InputSchema: definition.InputSchema,
+		}, func(operationContext context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			caller := callerFromMCPRequest(request)
+			resultBytes, err := service.ExecuteOrchestratorTool(
+				operationContext,
+				caller,
+				definition.Name,
+				request.Params.Arguments,
+			)
+			return orchestratorMCPResult(resultBytes, err), nil
+		})
+	}
+	handler := mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return protocolServer },
+		&mcp.StreamableHTTPOptions{
+			JSONResponse:        true,
+			MaxRequestBodyBytes: 4 << 20,
+			SessionTimeout:      30 * time.Minute,
+		},
+	)
+	closeSessions := func() {
+		for session := range protocolServer.Sessions() {
+			_ = session.Close()
+		}
+	}
+	return handler, closeSessions
+}
+
+func callerFromMCPRequest(request *mcp.CallToolRequest) CallerIdentity {
+	sessionID := "http-session"
+	if request.Session != nil && protocol.IsIdentifier(request.Session.ID()) {
+		sessionID = request.Session.ID()
+	}
+	clientID := ""
+	if request.Extra != nil {
+		clientID = strings.TrimSpace(request.Extra.Header.Get("X-Orchestra-Client-Id"))
+	}
+	if !protocol.IsIdentifier(clientID) {
+		clientID = sessionID
+	}
+	return CallerIdentity{Kind: "orchestrator-client", ClientID: clientID, SessionID: sessionID}
+}
+
+func orchestratorMCPResult(resultBytes json.RawMessage, callErr error) *mcp.CallToolResult {
+	if callErr != nil {
+		errorJSON, _ := json.Marshal(toHubRPCError(callErr))
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(errorJSON)}},
+			IsError: true,
+		}
+	}
+	var structured any
+	if err := json.Unmarshal(resultBytes, &structured); err != nil {
+		errorJSON, _ := json.Marshal(toHubRPCError(fmt.Errorf("encode MCP tool result: %w", err)))
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: string(errorJSON)}},
+			IsError: true,
+		}
+	}
+	return &mcp.CallToolResult{
+		Content:           []mcp.Content{&mcp.TextContent{Text: string(resultBytes)}},
+		StructuredContent: structured,
 	}
 }
 

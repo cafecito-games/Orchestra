@@ -29,7 +29,6 @@ import (
 
 const (
 	DefaultListenAddress = "127.0.0.1:8787"
-	mcpProtocolVersion   = "2025-06-18"
 )
 
 type Configuration struct {
@@ -103,6 +102,8 @@ type Service struct {
 
 	backgroundCancel context.CancelFunc
 	backgroundGroup  sync.WaitGroup
+	mcpHandler       http.Handler
+	closeMCP         func()
 }
 
 func NewService(options ServiceOptions) (*Service, error) {
@@ -145,6 +146,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 		clients:          map[string]*orchestratorClientSession{},
 		replayWindows:    map[string]*replayWindow{},
 	}
+	service.mcpHandler, service.closeMCP = service.newMCPHTTPHandler()
 
 	if len(options.ProjectProfiles) > 0 {
 		_, err := service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
@@ -187,6 +189,9 @@ func NewService(options ServiceOptions) (*Service, error) {
 }
 
 func (service *Service) Close() {
+	if service.closeMCP != nil {
+		service.closeMCP()
+	}
 	if service.backgroundCancel != nil {
 		service.backgroundCancel()
 	}
@@ -248,7 +253,7 @@ func (service *Service) Handler() http.Handler {
 	mux.HandleFunc("/healthz", service.handleHealth)
 	mux.HandleFunc("/control-agent", service.handleControlAgentUpgrade)
 	mux.HandleFunc("/orchestrator-client", service.handleOrchestratorClientUpgrade)
-	mux.HandleFunc("/mcp", service.handleStreamableHTTPMCP)
+	mux.Handle("/mcp", service.requireBearerHandler(service.mcpHandler))
 	mux.HandleFunc("/api/status", service.requireBearer(service.handleAPIStatus))
 	mux.HandleFunc("/api/nodes", service.requireBearer(service.handleAPINodes))
 	mux.HandleFunc("/api/threads", service.requireBearer(service.handleAPIThreads))
@@ -285,6 +290,16 @@ func (service *Service) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(writer, request)
 	}
+}
+
+func (service *Service) requireBearerHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !service.isBearerAuthorized(request) {
+			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+			return
+		}
+		next.ServeHTTP(writer, request)
+	})
 }
 
 func (service *Service) handleHealth(writer http.ResponseWriter, request *http.Request) {
@@ -445,149 +460,6 @@ func (service *Service) sendToOrchestratorSession(sessionID string, message prot
 		return
 	}
 	_ = session.send(context.Background(), message)
-}
-
-type jsonRPCEnvelope struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
-}
-
-func (service *Service) handleStreamableHTTPMCP(writer http.ResponseWriter, request *http.Request) {
-	if !service.isBearerAuthorized(request) {
-		writeJSONError(writer, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
-		return
-	}
-	if request.Method == http.MethodDelete {
-		writer.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if request.Method != http.MethodPost {
-		writer.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	bodyBytes, err := io.ReadAll(io.LimitReader(request.Body, 4*1024*1024))
-	if err != nil {
-		writeJSONError(writer, http.StatusBadRequest, "invalid_request", "failed reading MCP request body")
-		return
-	}
-
-	var envelope jsonRPCEnvelope
-	if err := json.Unmarshal(bodyBytes, &envelope); err != nil || envelope.JSONRPC != "2.0" {
-		writeJSONResponse(writer, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      nil,
-			"error":   map[string]any{"code": -32600, "message": "Invalid Request"},
-		})
-		return
-	}
-
-	sessionID := strings.TrimSpace(request.Header.Get("Mcp-Session-Id"))
-	if !protocol.IsIdentifier(sessionID) {
-		sessionID = "http-session"
-	}
-	clientID := strings.TrimSpace(request.Header.Get("X-Orchestra-Client-Id"))
-	if !protocol.IsIdentifier(clientID) {
-		clientID = sessionID
-	}
-
-	if len(envelope.ID) == 0 || string(envelope.ID) == "null" {
-		writer.WriteHeader(http.StatusAccepted)
-		return
-	}
-
-	switch envelope.Method {
-	case "initialize":
-		assignedSession := sessionID
-		if assignedSession == "http-session" {
-			assignedSession = protocol.NewIdentifier("mcpsess")
-		}
-		writer.Header().Set("Mcp-Session-Id", assignedSession)
-		writeJSONResponse(writer, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      envelope.ID,
-			"result": map[string]any{
-				"protocolVersion": mcpProtocolVersion,
-				"capabilities": map[string]any{
-					"tools": map[string]any{"listChanged": false},
-				},
-				"serverInfo": map[string]any{
-					"name":    "orchestra",
-					"version": protocol.BuildVersion,
-				},
-			},
-		})
-	case "ping":
-		writeJSONResponse(writer, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      envelope.ID,
-			"result":  map[string]any{},
-		})
-	case "tools/list":
-		writeJSONResponse(writer, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      envelope.ID,
-			"result": map[string]any{
-				"tools": OrchestratorToolDefinitions(),
-			},
-		})
-	case "tools/call":
-		var callParams struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal(envelope.Params, &callParams); err != nil || callParams.Name == "" {
-			writeJSONResponse(writer, http.StatusOK, map[string]any{
-				"jsonrpc": "2.0",
-				"id":      envelope.ID,
-				"error":   map[string]any{"code": -32602, "message": "Invalid tools/call parameters"},
-			})
-			return
-		}
-		caller := CallerIdentity{
-			Kind:      "orchestrator-client",
-			ClientID:  clientID,
-			SessionID: sessionID,
-		}
-		resultBytes, callErr := service.ExecuteOrchestratorTool(request.Context(), caller, callParams.Name, callParams.Arguments)
-		if callErr != nil {
-			rpcErr := toHubRPCError(callErr)
-			errorJSON, _ := json.Marshal(rpcErr)
-			writeJSONResponse(writer, http.StatusOK, map[string]any{
-				"jsonrpc": "2.0",
-				"id":      envelope.ID,
-				"result": map[string]any{
-					"content": []map[string]any{{
-						"type": "text",
-						"text": string(errorJSON),
-					}},
-					"isError": true,
-				},
-			})
-			return
-		}
-		var structured any
-		_ = json.Unmarshal(resultBytes, &structured)
-		writeJSONResponse(writer, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      envelope.ID,
-			"result": map[string]any{
-				"content": []map[string]any{{
-					"type": "text",
-					"text": string(resultBytes),
-				}},
-				"structuredContent": structured,
-			},
-		})
-	default:
-		writeJSONResponse(writer, http.StatusOK, map[string]any{
-			"jsonrpc": "2.0",
-			"id":      envelope.ID,
-			"error":   map[string]any{"code": -32601, "message": "Method not found"},
-		})
-	}
 }
 
 func (service *Service) handleAPIStatus(writer http.ResponseWriter, request *http.Request) {

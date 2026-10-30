@@ -3,7 +3,6 @@
 package mcpbridge
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -17,13 +16,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/cafecito-games/Orchestra/internal/orchestrator"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
@@ -31,9 +31,8 @@ import (
 )
 
 const (
-	mcpProtocolVersion = "2025-06-18"
-	maximumLineBytes   = 4 * 1024 * 1024
-	rpcCallTimeout     = 30 * time.Second
+	maximumLineBytes = 4 * 1024 * 1024
+	rpcCallTimeout   = 30 * time.Second
 )
 
 type Configuration struct {
@@ -96,8 +95,8 @@ type Bridge struct {
 	configuration Configuration
 	sessionID     string
 
-	stdoutMutex sync.Mutex
-	stdout      io.Writer
+	mcpConnectionMutex sync.RWMutex
+	mcpConnection      mcp.Connection
 
 	connectionMutex sync.Mutex
 	connection      *websocket.Conn
@@ -128,8 +127,6 @@ func NewBridge(configuration Configuration) *Bridge {
 }
 
 func (bridge *Bridge) Run(operationContext context.Context, input io.Reader, output io.Writer) error {
-	bridge.stdout = output
-
 	bridgeContext, cancelBridge := context.WithCancel(operationContext)
 	defer cancelBridge()
 
@@ -139,134 +136,96 @@ func (bridge *Bridge) Run(operationContext context.Context, input io.Reader, out
 		bridge.maintainWebSocketLoop(bridgeContext)
 	}()
 
-	scanner := bufio.NewScanner(input)
-	scanner.Buffer(make([]byte, 64*1024), maximumLineBytes)
-
-	var handlerGroup sync.WaitGroup
-	for scanner.Scan() {
-		lineBytes := bytes.TrimSpace(scanner.Bytes())
-		if len(lineBytes) == 0 {
-			continue
-		}
-		lineCopy := slices.Clone(lineBytes)
-		handlerGroup.Go(func() {
-			bridge.handleStdioLine(bridgeContext, lineCopy)
-		})
+	protocolServer := bridge.newProtocolServer()
+	transport := &capturingTransport{
+		bridge: bridge,
+		delegate: &mcp.IOTransport{
+			Reader:        closingReader{Reader: input},
+			Writer:        noCloseWriter{Writer: output},
+			MaxLineLength: maximumLineBytes,
+		},
 	}
-	scanErr := scanner.Err()
+	runErr := protocolServer.Run(bridgeContext, transport)
 	cancelBridge()
-	handlerGroup.Wait()
 	<-connectionDone
-	if errors.Is(scanErr, io.EOF) {
+	if errors.Is(runErr, io.EOF) || errors.Is(runErr, context.Canceled) {
 		return nil
 	}
-	return scanErr
+	return runErr
 }
 
-type stdioEnvelope struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
+type closingReader struct {
+	io.Reader
 }
 
-func (bridge *Bridge) handleStdioLine(operationContext context.Context, line []byte) {
-	var envelope stdioEnvelope
-	if err := json.Unmarshal(line, &envelope); err != nil || envelope.JSONRPC != "2.0" {
-		_ = bridge.writeJSON(map[string]any{
-			"jsonrpc": "2.0",
-			"id":      nil,
-			"error":   map[string]any{"code": -32700, "message": "Parse error"},
-		})
-		return
+func (reader closingReader) Close() error {
+	if closer, ok := reader.Reader.(io.Closer); ok {
+		return closer.Close()
 	}
+	return nil
+}
 
-	if len(envelope.ID) == 0 || string(envelope.ID) == "null" {
-		return
-	}
+type noCloseWriter struct {
+	io.Writer
+}
 
-	switch envelope.Method {
-	case "initialize":
-		_ = bridge.writeJSON(map[string]any{
-			"jsonrpc": "2.0",
-			"id":      envelope.ID,
-			"result": map[string]any{
-				"protocolVersion": mcpProtocolVersion,
-				"capabilities": map[string]any{
-					"tools": map[string]any{"listChanged": false},
-					"experimental": map[string]any{
-						"claude/channel": map[string]any{},
-					},
-				},
-				"serverInfo": map[string]any{
-					"name":    "orchestra",
-					"version": protocol.BuildVersion,
-				},
+func (writer noCloseWriter) Close() error { return nil }
+
+type capturingTransport struct {
+	bridge   *Bridge
+	delegate mcp.Transport
+}
+
+func (transport *capturingTransport) Connect(operationContext context.Context) (mcp.Connection, error) {
+	connection, err := transport.delegate.Connect(operationContext)
+	if err != nil {
+		return nil, err
+	}
+	transport.bridge.mcpConnectionMutex.Lock()
+	transport.bridge.mcpConnection = connection
+	transport.bridge.mcpConnectionMutex.Unlock()
+	return connection, nil
+}
+
+func (bridge *Bridge) newProtocolServer() *mcp.Server {
+	protocolServer := mcp.NewServer(
+		&mcp.Implementation{Name: "orchestra", Version: protocol.BuildVersion},
+		&mcp.ServerOptions{
+			Capabilities: &mcp.ServerCapabilities{
+				Tools:        &mcp.ToolCapabilities{},
+				Experimental: map[string]any{"claude/channel": map[string]any{}},
 			},
-		})
-	case "ping":
-		_ = bridge.writeJSON(map[string]any{
-			"jsonrpc": "2.0",
-			"id":      envelope.ID,
-			"result":  map[string]any{},
-		})
-	case "tools/list":
-		_ = bridge.writeJSON(map[string]any{
-			"jsonrpc": "2.0",
-			"id":      envelope.ID,
-			"result": map[string]any{
-				"tools": orchestrator.OrchestratorToolDefinitions(),
-			},
-		})
-	case "tools/call":
-		var callParams struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal(envelope.Params, &callParams); err != nil || callParams.Name == "" {
-			_ = bridge.writeJSON(map[string]any{
-				"jsonrpc": "2.0",
-				"id":      envelope.ID,
-				"error":   map[string]any{"code": -32602, "message": "Invalid tools/call parameters"},
-			})
-			return
-		}
-		resultBytes, rpcErr := bridge.invokeTool(operationContext, callParams.Name, callParams.Arguments)
-		if rpcErr != nil {
-			errorText, _ := json.Marshal(rpcErr)
-			_ = bridge.writeJSON(map[string]any{
-				"jsonrpc": "2.0",
-				"id":      envelope.ID,
-				"result": map[string]any{
-					"content": []map[string]any{{
-						"type": "text",
-						"text": string(errorText),
-					}},
-					"isError": true,
-				},
-			})
-			return
-		}
-		var structured any
-		_ = json.Unmarshal(resultBytes, &structured)
-		_ = bridge.writeJSON(map[string]any{
-			"jsonrpc": "2.0",
-			"id":      envelope.ID,
-			"result": map[string]any{
-				"content": []map[string]any{{
-					"type": "text",
-					"text": string(resultBytes),
-				}},
-				"structuredContent": structured,
-			},
-		})
-	default:
-		_ = bridge.writeJSON(map[string]any{
-			"jsonrpc": "2.0",
-			"id":      envelope.ID,
-			"error":   map[string]any{"code": -32601, "message": "Method not found"},
+		},
+	)
+	for _, definition := range orchestrator.OrchestratorToolDefinitions() {
+		protocolServer.AddTool(&mcp.Tool{
+			Name:        definition.Name,
+			Description: definition.Description,
+			InputSchema: definition.InputSchema,
+		}, func(operationContext context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			resultBytes, rpcErr := bridge.invokeTool(operationContext, definition.Name, request.Params.Arguments)
+			if rpcErr != nil {
+				errorText, _ := json.Marshal(rpcErr)
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: string(errorText)}},
+					IsError: true,
+				}, nil
+			}
+			var structured any
+			if err := json.Unmarshal(resultBytes, &structured); err != nil {
+				errorText, _ := json.Marshal(&protocol.HubRPCError{Code: "internal_error", Message: "malformed tool result"})
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: string(errorText)}},
+					IsError: true,
+				}, nil
+			}
+			return &mcp.CallToolResult{
+				Content:           []mcp.Content{&mcp.TextContent{Text: string(resultBytes)}},
+				StructuredContent: structured,
+			}, nil
 		})
 	}
+	return protocolServer
 }
 
 func (bridge *Bridge) invokeTool(
@@ -620,13 +579,21 @@ func (bridge *Bridge) emitDoorbellNotification(doorbell protocol.DoorbellNotific
 		meta["approval_ids"] = strings.Join(doorbell.ApprovalIDs, ",")
 	}
 	content := fmt.Sprintf("[Orchestra thread %s (%s)] %s", doorbell.ThreadTitle, doorbell.ThreadID, doorbell.Summary)
-	_ = bridge.writeJSON(map[string]any{
-		"jsonrpc": "2.0",
-		"method":  "notifications/claude/channel",
-		"params": map[string]any{
-			"content": content,
-			"meta":    meta,
-		},
+	parameters, err := json.Marshal(map[string]any{"content": content, "meta": meta})
+	if err != nil {
+		return
+	}
+	bridge.mcpConnectionMutex.RLock()
+	connection := bridge.mcpConnection
+	bridge.mcpConnectionMutex.RUnlock()
+	if connection == nil {
+		return
+	}
+	writeContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = connection.Write(writeContext, &jsonrpc.Request{
+		Method: "notifications/claude/channel",
+		Params: parameters,
 	})
 }
 
@@ -690,18 +657,6 @@ func (bridge *Bridge) failPendingCalls() {
 			},
 		}
 	}
-}
-
-func (bridge *Bridge) writeJSON(payload any) error {
-	encodedBytes, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	encodedBytes = append(encodedBytes, '\n')
-	bridge.stdoutMutex.Lock()
-	defer bridge.stdoutMutex.Unlock()
-	_, err = bridge.stdout.Write(encodedBytes)
-	return err
 }
 
 func (bridge *Bridge) orchestratorClientWebSocketURL() (string, error) {
