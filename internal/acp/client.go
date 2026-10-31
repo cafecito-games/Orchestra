@@ -129,7 +129,7 @@ func NewClient(stdout io.Reader, stdin io.WriteCloser, options Options) *Client 
 		options.Now = time.Now
 	}
 	options.ClientName = cmp.Or(options.ClientName, "orchestra-slave")
-	options.ClientVersion = cmp.Or(options.ClientVersion, protocol.BuildVersion)
+	options.ClientVersion = cmp.Or(options.ClientVersion, protocol.EffectiveBuildVersion())
 	client := &Client{
 		options:       options,
 		redaction:     newSecretRedactor(options.Secrets),

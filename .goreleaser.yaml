@@ -1,0 +1,78 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: orchestra
+
+env:
+  - SKIP_HOMEBREW_UPLOAD={{ if index .Env "SKIP_HOMEBREW_UPLOAD" }}{{ .Env.SKIP_HOMEBREW_UPLOAD }}{{ else }}false{{ end }}
+
+builds:
+  - id: orchestra
+    main: ./cmd/orchestra
+    binary: orchestra
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/cafecito-games/Orchestra/internal/protocol.BuildVersion={{ .Version }}
+        -X github.com/cafecito-games/Orchestra/internal/protocol.BuildCommit={{ .FullCommit }}
+        -X github.com/cafecito-games/Orchestra/internal/protocol.BuildDate={{ .CommitDate }}
+        -X github.com/cafecito-games/Orchestra/internal/protocol.BuildTreeState={{ if .IsGitDirty }}dirty{{ else }}clean{{ end }}
+
+archives:
+  - id: binaries
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+homebrew_casks:
+  - name: orchestra
+    repository:
+      owner: cafecito-games
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    skip_upload: '{{ if eq .Env.SKIP_HOMEBREW_UPLOAD "true" }}true{{ else }}auto{{ end }}'
+    homepage: "https://github.com/cafecito-games/Orchestra"
+    description: "Headless multi-machine control plane and worker daemon for coding agents"
+    # Release binaries are not notarized, so strip the macOS quarantine
+    # attribute on install to prevent Gatekeeper from blocking execution.
+    # custom_block emits Homebrew's declarative postflight_steps stanza directly
+    # rather than GoReleaser's deprecated postflight hook wrapper.
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          if_path_exists "/usr/bin/xattr" do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/orchestra"]
+          end
+        end
+      end
+
+release:
+  draft: false
+  prerelease: auto

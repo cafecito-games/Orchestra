@@ -241,16 +241,19 @@ func (client *Client) acquireResidentForRun(
 		return residentInstance{}, fmt.Errorf("instance %s is not resident on slave node %s", run.InstanceID, client.node.ID)
 	}
 	if resident.allocation.ID != run.AllocationID {
+		activeAllocationID := resident.allocation.ID
 		client.mutex.Unlock()
-		return residentInstance{}, fmt.Errorf("allocation %s does not match active resident allocation %s", run.AllocationID, resident.allocation.ID)
+		return residentInstance{}, fmt.Errorf("allocation %s does not match active resident allocation %s", run.AllocationID, activeAllocationID)
 	}
 	if resident.status != "active" {
+		residentStatus := resident.status
 		client.mutex.Unlock()
-		return residentInstance{}, fmt.Errorf("instance %s is %s and cannot accept new runs", run.InstanceID, resident.status)
+		return residentInstance{}, fmt.Errorf("instance %s is %s and cannot accept new runs", run.InstanceID, residentStatus)
 	}
 	if resident.activeRunID != "" {
+		activeRunID := resident.activeRunID
 		client.mutex.Unlock()
-		return residentInstance{}, fmt.Errorf("instance %s is already executing run %s", run.InstanceID, resident.activeRunID)
+		return residentInstance{}, fmt.Errorf("instance %s is already executing run %s", run.InstanceID, activeRunID)
 	}
 	if len(client.sessions) >= client.node.Concurrency {
 		client.mutex.Unlock()
@@ -265,7 +268,7 @@ func (client *Client) acquireResidentForRun(
 	return snapshot, nil
 }
 
-func (client *Client) releaseResidentRun(instanceID, allocationID, runID string) {
+func (client *Client) completeResidentRun(instanceID, allocationID, runID string) (bool, string) {
 	var emitReleased bool
 	var releaseReason string
 
@@ -284,6 +287,11 @@ func (client *Client) releaseResidentRun(instanceID, allocationID, runID string)
 		}
 	}
 	client.mutex.Unlock()
+	return emitReleased, releaseReason
+}
+
+func (client *Client) releaseResidentRun(instanceID, allocationID, runID string) {
+	emitReleased, releaseReason := client.completeResidentRun(instanceID, allocationID, runID)
 
 	if emitReleased {
 		client.sendOrQueue(protocol.SlaveControlMessage{

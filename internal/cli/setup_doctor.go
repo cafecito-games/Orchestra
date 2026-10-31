@@ -366,7 +366,7 @@ func buildActivationContext(
 					},
 				},
 				NativeBinaries: nativeBinaries,
-				ClientVersion:  protocol.BuildVersion,
+				ClientVersion:  protocol.EffectiveBuildVersion(),
 			})
 			timedContext, cancel := context.WithTimeout(probeContext, activationProbeDuration)
 			defer cancel()

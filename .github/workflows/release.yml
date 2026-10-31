@@ -1,0 +1,211 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      increment:
+        description: "Semantic version component to bump"
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      commit_sha: ${{ steps.target.outputs.commit_sha }}
+    steps:
+      - name: Ensure manual releases run from default branch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${REF_NAME}" != "${DEFAULT_BRANCH}" ]]; then
+            echo "::error::Manual releases must be triggered from ${DEFAULT_BRANCH}, not ${REF_NAME}."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.ref }}
+
+      - name: Record verified commit
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "commit_sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - uses: go-task/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.4
+          install-only: true
+
+      - name: Run static analysis
+        run: task lint
+
+      - name: Run unit tests
+        run: task unit:test
+
+      - name: Run multi-process system tests
+        run: task system:test
+
+  release:
+    name: Publish Release
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ github.event_name == 'workflow_dispatch' && needs.verify.outputs.commit_sha || github.ref }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Validate Homebrew tap publishing configuration
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          TAP_TOKEN_PRESENT: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${REPO_PRIVATE}" == "true" ]]; then
+            echo "SKIP_HOMEBREW_UPLOAD=true" >> "${GITHUB_ENV}"
+            {
+              echo "> [!NOTE]"
+              echo "> Skipped updating \`cafecito-games/homebrew-tap\` because \`${GITHUB_REPOSITORY}\` is currently private."
+              echo "> Once the repository is public, releases will publish the \`orchestra\` Homebrew cask automatically."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          echo "SKIP_HOMEBREW_UPLOAD=false" >> "${GITHUB_ENV}"
+
+          if [[ "${EVENT_NAME}" == "push" && "${REF_NAME}" == *-* ]]; then
+            exit 0
+          fi
+
+          if [[ "${TAP_TOKEN_PRESENT}" != "true" ]]; then
+            echo "::error::HOMEBREW_TAP_TOKEN repository secret is required to publish public releases to cafecito-games/homebrew-tap."
+            exit 1
+          fi
+
+      - name: Compute version and create release tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_INCREMENT: ${{ inputs.increment }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force origin
+
+          release_error="${RUNNER_TEMP}/orchestra-latest-release-error"
+          if latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name' 2>"${release_error}")"; then
+            :
+          elif grep -q 'HTTP 404' "${release_error}"; then
+            latest_tag="v0.0.0"
+          else
+            cat "${release_error}" >&2
+            exit 1
+          fi
+
+          current="${latest_tag#v}"
+          stable_semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "${current}" =~ ${stable_semver} ]]; then
+            echo "::error::Latest published release ${latest_tag} is not a stable semantic version"
+            exit 1
+          fi
+
+          IFS='.' read -r major minor patch <<< "${current}"
+          case "${RELEASE_INCREMENT}" in
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            patch)
+              patch=$((patch + 1))
+              ;;
+            *)
+              echo "::error::Unknown release increment ${RELEASE_INCREMENT}"
+              exit 1
+              ;;
+          esac
+
+          tag="v${major}.${minor}.${patch}"
+          head_sha="$(git rev-parse HEAD)"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+            tag_sha="$(git rev-list -n 1 "${tag}")"
+            if [[ "${tag_sha}" != "${head_sha}" ]]; then
+              echo "::error::${tag} already points to ${tag_sha}, not verified commit ${head_sha}"
+              exit 1
+            fi
+            echo "Reusing ${tag} at ${head_sha} for a release retry"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag --annotate "${tag}" --message "orchestra ${tag}"
+            git push origin "refs/tags/${tag}"
+            echo "Created ${tag} at ${head_sha}"
+          fi
+
+          {
+            echo "### Releasing ${tag}"
+            echo "- Previous release: \`${latest_tag}\`"
+            echo "- Increment: \`${RELEASE_INCREMENT}\`"
+            echo "- Commit: \`${head_sha}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

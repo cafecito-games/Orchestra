@@ -292,7 +292,7 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 
 func (service *Service) newMCPHTTPHandler() (http.Handler, func()) {
 	protocolServer := mcp.NewServer(
-		&mcp.Implementation{Name: "orchestra", Version: protocol.BuildVersion},
+		&mcp.Implementation{Name: "orchestra", Version: protocol.EffectiveBuildVersion()},
 		&mcp.ServerOptions{
 			Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}},
 		},

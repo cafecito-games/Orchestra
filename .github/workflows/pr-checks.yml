@@ -1,0 +1,158 @@
+name: PR Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - uses: go-task/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.4
+          install-only: true
+
+      - name: Run static analysis
+        run: task lint
+
+  unit-test:
+    name: Unit Tests (race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - uses: go-task/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run unit tests
+        run: task unit:test
+
+  system-test:
+    name: System Tests (race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - uses: go-task/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run multi-process system tests
+        run: task system:test
+
+  release-snapshot:
+    name: Release Snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Build GoReleaser snapshot
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean
+
+      - name: Verify injected binary version metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="./dist/orchestra_linux_amd64_v1/orchestra"
+          "${binary}" version
+          version_json="$("${binary}" version --json)"
+          echo "${version_json}"
+
+          injected_version="$(jq -r '.version' <<< "${version_json}")"
+          injected_commit="$(jq -r '.commit' <<< "${version_json}")"
+          injected_date="$(jq -r '.date' <<< "${version_json}")"
+
+          if [[ -z "${injected_version}" || "${injected_version}" == "dev" ]]; then
+            echo "::error::Expected GoReleaser to inject non-dev version, got '${injected_version}'"
+            exit 1
+          fi
+          if [[ -z "${injected_commit}" || "${injected_commit}" == "null" ]]; then
+            echo "::error::Expected GoReleaser to inject commit hash"
+            exit 1
+          fi
+          if [[ -z "${injected_date}" || "${injected_date}" == "null" ]]; then
+            echo "::error::Expected GoReleaser to inject build date"
+            exit 1
+          fi
+
+  all-checks:
+    name: All Checks
+    needs:
+      - lint
+      - unit-test
+      - system-test
+      - release-snapshot
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify all PR check lanes succeeded
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Lint & Static Analysis: ${{ needs.lint.result }}"
+          echo "Unit Tests (race):      ${{ needs.unit-test.result }}"
+          echo "System Tests (race):    ${{ needs.system-test.result }}"
+          echo "Release Snapshot:       ${{ needs.release-snapshot.result }}"
+
+          for result in \
+            "${{ needs.lint.result }}" \
+            "${{ needs.unit-test.result }}" \
+            "${{ needs.system-test.result }}" \
+            "${{ needs.release-snapshot.result }}"; do
+            if [[ "${result}" != "success" ]]; then
+              echo "::error::One or more required PR check lanes did not succeed."
+              exit 1
+            fi
+          done
