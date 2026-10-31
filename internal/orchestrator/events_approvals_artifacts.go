@@ -140,15 +140,23 @@ func (service *Service) handleRunCompleted(nodeID string, message protocol.Slave
 			if task, taskExists := state.Tasks[*runRecord.TaskID]; taskExists && !protocol.IsTerminalTaskStatus(task.Status) {
 				if task.Status != "blocked" {
 					if task.RequiredRoomSequence > task.LastReadRoomSequence && task.NudgedAtRoomSequence < task.RequiredRoomSequence {
+						currentAttempts := task.AttemptCount
+						if runRecord.Attempt != nil && *runRecord.Attempt > currentAttempts {
+							currentAttempts = *runRecord.Attempt
+						}
+						if currentAttempts < 1 {
+							currentAttempts = 1
+						}
 						task.NudgedAtRoomSequence = task.RequiredRoomSequence
 						task.Status = "ready"
 						task.Assignment = nil
 						task.PreferredInstanceID = runRecord.InstanceID
-						task.MaxAttempts++
+						task.AttemptCount = currentAttempts
+						task.MaxAttempts = currentAttempts + 1
 						if runRecord.Output != "" {
 							task.LastRunOutput = protocol.TruncateUTF8Head(runRecord.Output, 4000)
 						} else if task.Summary != "" {
-							task.LastRunOutput = protocol.TruncateUTF8Head(task.Summary, 4000)
+							task.LastRunOutput = protocol.TruncateUTF8Head(service.redactor.Redact(task.Summary), 4000)
 						}
 					} else {
 						task.Status = "completed"

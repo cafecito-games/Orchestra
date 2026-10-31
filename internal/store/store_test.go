@@ -264,3 +264,65 @@ func TestStoreRoomSQLiteDurabilityJSONLMirrorConcurrencyAndStartupReconciliation
 	require.NoError(t, err)
 	require.Equal(t, "secret", string(escapedBytes))
 }
+
+func TestStoreRoomMirrorFailureKeepsCommittedStateAndSelfHeals(t *testing.T) {
+	dataDirectory := t.TempDir()
+	openedStore, err := Open(dataDirectory)
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	createdAt := "2026-10-30T15:00:00Z"
+	threadID := "thread-heal1234ef567890"
+	expectedDirectoryName := protocol.RoomDirectoryName(threadID, createdAt)
+	roomsRoot := filepath.Join(openedStore.DataDirectory(), "rooms")
+	roomDirectoryPath := filepath.Join(roomsRoot, expectedDirectoryName)
+
+	outsideTarget := filepath.Join(t.TempDir(), "untouched.txt")
+	require.NoError(t, os.WriteFile(outsideTarget, []byte("original"), 0o600))
+	require.NoError(t, os.Symlink(outsideTarget, roomDirectoryPath))
+
+	_, err = openedStore.Mutate(func(state *State, mutation *Mutation) error {
+		state.Threads[threadID] = protocol.Thread{
+			ID:        threadID,
+			Title:     "Authoritative thread",
+			Status:    "open",
+			CreatedAt: createdAt,
+			UpdatedAt: createdAt,
+		}
+		head := protocol.ThreadRoomHead{
+			ThreadID:      threadID,
+			DirectoryName: expectedDirectoryName,
+			HeadSequence:  1,
+			CreatedAt:     createdAt,
+			UpdatedAt:     createdAt,
+		}
+		state.RoomHeads[threadID] = head
+		state.RoomMessages[threadID] = []protocol.RoomMessage{{
+			Sequence:  1,
+			ID:        "rmsg_0000000000000001",
+			ThreadID:  threadID,
+			CreatedAt: createdAt,
+			Author:    protocol.RoomAuthor{Kind: "operator", OperatorID: "cli"},
+			Kind:      "guidance",
+			Body:      "Committed while mirror path was blocked",
+		}}
+		return nil
+	})
+	require.NoError(t, err)
+
+	untouchedBytes, err := os.ReadFile(outsideTarget)
+	require.NoError(t, err)
+	require.Equal(t, "original", string(untouchedBytes))
+
+	_, _, err = openedStore.RoomJSONLPath(threadID)
+	require.Error(t, err)
+
+	require.NoError(t, os.Remove(roomDirectoryPath))
+
+	healedPath, exists, err := openedStore.RoomJSONLPath(threadID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	healedBytes, err := os.ReadFile(healedPath)
+	require.NoError(t, err)
+	require.Contains(t, string(healedBytes), "Committed while mirror path was blocked")
+}

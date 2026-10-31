@@ -86,6 +86,7 @@ type Store struct {
 	roomMirrorMutex    sync.Mutex
 	mirroredRoomCounts map[string]int
 	mirroredRoomSizes  map[string]int64
+	dirtyRoomMirrors   map[string]bool
 
 	subscriberSequence atomic.Int64
 	subscriberMutex    sync.Mutex
@@ -142,6 +143,7 @@ func Open(dataDirectory string) (*Store, error) {
 		now:                time.Now,
 		mirroredRoomCounts: map[string]int{},
 		mirroredRoomSizes:  map[string]int64{},
+		dirtyRoomMirrors:   map[string]bool{},
 		subscribers:        map[int64]chan []protocol.TaskEventEntry{},
 	}
 	if err := store.loadFromDatabase(); err != nil {
@@ -214,12 +216,6 @@ func (store *Store) Mutate(mutator func(state *State, mutation *Mutation) error)
 		store.mutex.Unlock()
 		return nil, err
 	}
-	for _, mirrorUpdate := range mirrorUpdates {
-		if verifyErr := store.verifyRoomMirrorTarget(mirrorUpdate.head); verifyErr != nil {
-			store.mutex.Unlock()
-			return nil, verifyErr
-		}
-	}
 
 	occurredAt := store.now().UTC().Format(time.RFC3339Nano)
 	committedEvents, prunedBelow := synthesizeThreadEvents(store.state, working, mutation.explicitEvents, occurredAt)
@@ -237,11 +233,9 @@ func (store *Store) Mutate(mutator func(state *State, mutation *Mutation) error)
 
 	store.state = working
 	store.serialized = nextSerialized
-	var mirrorSyncErr error
-	for _, mirrorUpdate := range mirrorUpdates {
-		if syncErr := store.syncRoomMirror(mirrorUpdate, false); syncErr != nil && mirrorSyncErr == nil {
-			mirrorSyncErr = syncErr
-		}
+	updatesToSync := store.expandDirtyRoomMirrorUpdates(mirrorUpdates)
+	for _, mirrorUpdate := range updatesToSync {
+		_ = store.syncRoomMirror(mirrorUpdate, false)
 	}
 	hooks := mutation.commitHooks
 	store.mutex.Unlock()
@@ -251,9 +245,6 @@ func (store *Store) Mutate(mutator func(state *State, mutation *Mutation) error)
 	}
 	for _, hook := range hooks {
 		hook()
-	}
-	if mirrorSyncErr != nil {
-		return committedEvents, mirrorSyncErr
 	}
 	return committedEvents, nil
 }

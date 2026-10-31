@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -540,4 +541,204 @@ func TestRoomSafePointsWaitEventsUpdateTaskGateAndEndOfTurnFollowUp(t *testing.T
 	require.NotEmpty(t, roomHTTPPayload.Path)
 	require.Len(t, roomHTTPPayload.Messages, 1)
 	require.Equal(t, int64(2), roomHTTPPayload.Messages[0].Sequence)
+}
+
+func TestRoomMirrorRecoverySingleShotNudgeRetryBoundAndAuthorRedaction(t *testing.T) {
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	service, err := NewService(ServiceOptions{
+		Store: openedStore,
+		Token: "master-secret-token",
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	orchestratorCaller := CallerIdentity{
+		Kind:      "orchestrator-client",
+		ClientID:  "orch-master-secret-token",
+		SessionID: "sess-redact",
+	}
+
+	roomsDirectory := filepath.Join(openedStore.DataDirectory(), "rooms")
+	if os.Geteuid() != 0 {
+		require.NoError(t, os.Chmod(roomsDirectory, 0o500))
+		defer func() {
+			_ = os.Chmod(roomsDirectory, 0o700)
+		}()
+	}
+
+	thread, _, err := service.CreateThread(orchestratorCaller, CreateThreadInput{Title: "Resilient room thread"})
+	require.NoError(t, err)
+
+	if os.Geteuid() == 0 {
+		roomDirectoryName := protocol.RoomDirectoryName(thread.ID, thread.CreatedAt)
+		roomDirectoryPath := filepath.Join(roomsDirectory, roomDirectoryName)
+		_ = os.RemoveAll(roomDirectoryPath)
+		require.NoError(t, os.WriteFile(roomDirectoryPath, []byte("blocker"), 0o600))
+	}
+
+	postedInitial, err := service.PostRoomMessage(orchestratorCaller, PostRoomMessageInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "orch-post-heal-1",
+		Kind:           "guidance",
+		Topic:          "resilience",
+		Body:           "Committed in SQLite while mirror cannot write",
+		Nudge:          true,
+	})
+	require.NoError(t, err)
+	require.False(t, postedInitial.Replayed)
+	require.Equal(t, int64(1), postedInitial.Message.Sequence)
+	require.NotContains(t, postedInitial.Message.Author.ClientID, "master-secret-token")
+
+	if os.Geteuid() != 0 {
+		require.NoError(t, os.Chmod(roomsDirectory, 0o700))
+	} else {
+		roomDirectoryName := protocol.RoomDirectoryName(thread.ID, thread.CreatedAt)
+		require.NoError(t, os.Remove(filepath.Join(roomsDirectory, roomDirectoryName)))
+	}
+
+	replayedPost, err := service.PostRoomMessage(orchestratorCaller, PostRoomMessageInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "orch-post-heal-1",
+		Kind:           "guidance",
+		Topic:          "resilience",
+		Body:           "Committed in SQLite while mirror cannot write",
+		Nudge:          true,
+	})
+	require.NoError(t, err)
+	require.True(t, replayedPost.Replayed)
+	require.Equal(t, postedInitial.Message.ID, replayedPost.Message.ID)
+
+	jsonlPath, exists, err := openedStore.RoomJSONLPath(thread.ID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	mirroredAfterReplay, err := os.ReadFile(jsonlPath)
+	require.NoError(t, err)
+	require.Contains(t, string(mirroredAfterReplay), "Committed in SQLite while mirror cannot write")
+	require.NotContains(t, string(mirroredAfterReplay), "master-secret-token")
+
+	rawWorkspace := t.TempDir()
+	nowText := service.nowUTC()
+	submitted, err := service.SubmitTasks(orchestratorCaller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "sub-redaction-and-retry",
+		Tasks: []SubmittedTaskSpec{{
+			ClientTaskID: "secret-title-task",
+			Title:        "Deploy using master-secret-token",
+			Instructions: "Run initial pass",
+			MaxAttempts:  3,
+		}},
+	})
+	require.NoError(t, err)
+	taskID := submitted.ClientTaskMap["secret-title-task"]
+
+	_, err = openedStore.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		attempt := 1
+		state.Nodes["node-bound"] = protocol.ComputeNode{
+			ID: "node-bound", Name: "node-bound", Kind: "local", Platform: "darwin-arm64",
+			Status: "online", LastSeen: nowText, Concurrency: 2, WorkspaceRoots: []string{rawWorkspace}, Version: "1.0.0",
+			Harnesses: []protocol.HarnessProfile{{
+				ID: "claude-cli", Label: "Claude", Binary: "/bin/echo", Available: true,
+				AuthMode: "local-subscription", Models: []string{"sonnet"}, Transports: []string{"acp-v1"},
+			}},
+		}
+		state.CapabilityReports["node-bound"] = protocol.NodeCapabilityReport{
+			NodeID: "node-bound", At: nowText,
+			Evidence: []protocol.NodeCapabilityEvidence{
+				{CapabilityID: "os", Source: "runtime", Success: true, NormalizedValue: "darwin", ObservedAt: nowText},
+				{CapabilityID: "architecture", Source: "runtime", Success: true, NormalizedValue: "arm64", ObservedAt: nowText},
+				{CapabilityID: "workspace-writable", Source: "runtime", Success: true, NormalizedValue: "true", ObservedAt: nowText},
+			},
+		}
+		state.Instances["inst-bound"] = protocol.AgentInstance{
+			ID: "inst-bound", ThreadID: thread.ID, Status: "busy", AutoManaged: true, CreatedAt: nowText, UpdatedAt: nowText,
+			Lease: protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+		}
+		state.Allocations["alloc-bound"] = protocol.InstanceAllocation{
+			ID: "alloc-bound", InstanceID: "inst-bound", NodeID: "node-bound", HarnessID: "claude-cli", Model: "sonnet",
+			Transport: "acp-v1", Workspace: rawWorkspace, Status: "active", CreatedAt: nowText, UpdatedAt: nowText,
+			Lease: protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+		}
+		state.Runs["run-bound-1"] = protocol.Run{
+			ID: "run-bound-1", ThreadID: thread.ID, InstanceID: "inst-bound", AllocationID: "alloc-bound", NodeID: "node-bound",
+			HarnessID: "claude-cli", Model: "sonnet", Transport: "acp-v1", Workspace: rawWorkspace,
+			Status: "running", CreatedAt: nowText, TaskID: &taskID, Attempt: &attempt,
+		}
+		task := state.Tasks[taskID]
+		task.Status = "running"
+		task.AttemptCount = 1
+		task.Assignment = &protocol.TaskAssignment{
+			RunID: "run-bound-1", InstanceID: "inst-bound", AllocationID: "alloc-bound", NodeID: "node-bound", Attempt: 1, AssignedAt: nowText,
+		}
+		state.Tasks[taskID] = task
+		return nil
+	})
+	require.NoError(t, err)
+
+	workerCaller := CallerIdentity{
+		Kind:       "run",
+		RunID:      "run-bound-1",
+		TaskID:     taskID,
+		ThreadID:   thread.ID,
+		InstanceID: "inst-bound",
+	}
+	workerPost, err := service.PostRoomMessage(workerCaller, PostRoomMessageInput{
+		IdempotencyKey: "worker-author-redact-1",
+		Kind:           "finding",
+		Body:           "Initial finding from task with sensitive title",
+	})
+	require.NoError(t, err)
+	require.NotContains(t, workerPost.Message.Author.Title, "master-secret-token")
+
+	_, err = service.PostRoomMessage(orchestratorCaller, PostRoomMessageInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "orch-nudge-seq-3",
+		Kind:           "guidance",
+		Body:           "Read this nudge before final completion",
+		Nudge:          true,
+	})
+	require.NoError(t, err)
+
+	turnOneOutput := "completed attempt 1 before reading seq 3"
+	service.handleRunCompleted("node-bound", protocol.SlaveControlMessage{
+		Type:   "run.completed",
+		RunID:  "run-bound-1",
+		Output: &turnOneOutput,
+	})
+
+	var dispatchedFollowUp protocol.MasterControlMessage
+	_, err = openedStore.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		task := state.Tasks[taskID]
+		require.Equal(t, "ready", task.Status)
+		require.Equal(t, 1, task.AttemptCount)
+		require.Equal(t, 2, task.MaxAttempts)
+
+		effectiveRequirements := mergeProjectProfileRequirements(state, task.Requirements)
+		instance := state.Instances["inst-bound"]
+		allocation := state.Allocations["alloc-bound"]
+		dispatchedFollowUp = service.assignTaskToResident(state, &task, &instance, &allocation, effectiveRequirements, service.nowUTC())
+		return nil
+	})
+	require.NoError(t, err)
+
+	failureDiagnostic := "transient transport failure on follow-up turn"
+	service.handleRunFailed("node-bound", protocol.SlaveControlMessage{
+		Type:  "run.failed",
+		RunID: dispatchedFollowUp.RunID,
+		Error: &failureDiagnostic,
+	}, true)
+
+	require.NoError(t, openedStore.Read(func(state *store.State) error {
+		task := state.Tasks[taskID]
+		require.Equal(t, "failed", task.Status)
+		require.Equal(t, 2, task.AttemptCount)
+		require.Equal(t, 2, task.MaxAttempts)
+		return nil
+	}))
+
+	finalMirroredJSONL, err := os.ReadFile(jsonlPath)
+	require.NoError(t, err)
+	require.NotContains(t, string(finalMirroredJSONL), "master-secret-token")
 }

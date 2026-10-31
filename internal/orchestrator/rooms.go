@@ -327,10 +327,6 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 			}
 		}
 
-		if verifyErr := service.store.VerifyRoomWritable(head); verifyErr != nil {
-			return fmt.Errorf("room mirror path unsafe: %w", verifyErr)
-		}
-
 		nowText := service.nowUTC()
 		nextSequence := head.HeadSequence + 1
 
@@ -350,7 +346,7 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 			ID:                 protocol.NewRoomMessageIdentifier(),
 			ThreadID:           threadID,
 			CreatedAt:          nowText,
-			Author:             roomAuthorForCaller(state, caller),
+			Author:             service.roomAuthorForCaller(state, caller),
 			Kind:               kind,
 			Topic:              service.redactor.Redact(topic),
 			Body:               service.redactor.Redact(body),
@@ -526,13 +522,13 @@ func (service *Service) NudgeRoom(caller CallerIdentity, input NudgeRoomInput) (
 	return result, nil
 }
 
-func roomAuthorForCaller(state *store.State, caller CallerIdentity) protocol.RoomAuthor {
+func (service *Service) roomAuthorForCaller(state *store.State, caller CallerIdentity) protocol.RoomAuthor {
 	switch caller.Kind {
 	case "run":
 		title := ""
 		if caller.TaskID != "" {
 			if task, exists := state.Tasks[caller.TaskID]; exists {
-				title = task.Title
+				title = service.redactor.Redact(task.Title)
 			}
 		}
 		return protocol.RoomAuthor{
@@ -544,7 +540,7 @@ func roomAuthorForCaller(state *store.State, caller CallerIdentity) protocol.Roo
 	case "orchestrator-client":
 		return protocol.RoomAuthor{
 			Kind:     "orchestrator",
-			ClientID: caller.ClientID,
+			ClientID: service.redactor.Redact(caller.ClientID),
 		}
 	default:
 		operatorID := caller.OperatorID
@@ -553,7 +549,7 @@ func roomAuthorForCaller(state *store.State, caller CallerIdentity) protocol.Roo
 		}
 		return protocol.RoomAuthor{
 			Kind:       "operator",
-			OperatorID: operatorID,
+			OperatorID: service.redactor.Redact(operatorID),
 		}
 	}
 }

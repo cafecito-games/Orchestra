@@ -39,6 +39,9 @@ func collectRoomDiff(
 
 	for _, threadID := range sortedKeys(next.RoomHeads) {
 		nextHead := next.RoomHeads[threadID]
+		if !isSafeRoomDirectoryName(nextHead.DirectoryName) {
+			return nil, nil, nil, fmt.Errorf("unsafe room directory name %q", nextHead.DirectoryName)
+		}
 		previousHead, hadPreviousHead := previous.RoomHeads[threadID]
 		previousSlice := previous.RoomMessages[threadID]
 		nextSlice := next.RoomMessages[threadID]
@@ -123,9 +126,65 @@ func (store *Store) reconcileAllRooms() error {
 	return nil
 }
 
-func (store *Store) syncRoomMirror(update roomMirrorUpdate, forceReconcile bool) error {
+func (store *Store) expandDirtyRoomMirrorUpdates(initialUpdates []roomMirrorUpdate) []roomMirrorUpdate {
+	queuedThreadIDs := make(map[string]bool, len(initialUpdates))
+	for _, update := range initialUpdates {
+		queuedThreadIDs[update.head.ThreadID] = true
+	}
+
 	store.roomMirrorMutex.Lock()
-	defer store.roomMirrorMutex.Unlock()
+	dirtyThreadIDs := sortedKeys(store.dirtyRoomMirrors)
+	store.roomMirrorMutex.Unlock()
+
+	if len(dirtyThreadIDs) == 0 {
+		return initialUpdates
+	}
+
+	expanded := make([]roomMirrorUpdate, 0, len(initialUpdates)+len(dirtyThreadIDs))
+	expanded = append(expanded, initialUpdates...)
+	for _, threadID := range dirtyThreadIDs {
+		if queuedThreadIDs[threadID] {
+			continue
+		}
+		head, exists := store.state.RoomHeads[threadID]
+		if !exists {
+			continue
+		}
+		messages := store.state.RoomMessages[threadID]
+		clonedMessages := make([]protocol.RoomMessage, len(messages))
+		copy(clonedMessages, messages)
+		expanded = append(expanded, roomMirrorUpdate{
+			head:          head,
+			allMessages:   clonedMessages,
+			previousCount: 0,
+		})
+	}
+	return expanded
+}
+
+func (store *Store) isRoomMirrorDirty(threadID string) bool {
+	store.roomMirrorMutex.Lock()
+	dirty := store.dirtyRoomMirrors[threadID]
+	store.roomMirrorMutex.Unlock()
+	return dirty
+}
+
+func (store *Store) syncRoomMirror(update roomMirrorUpdate, forceReconcile bool) (syncError error) {
+	store.roomMirrorMutex.Lock()
+	defer func() {
+		if syncError != nil {
+			delete(store.mirroredRoomCounts, update.head.ThreadID)
+			delete(store.mirroredRoomSizes, update.head.ThreadID)
+			store.dirtyRoomMirrors[update.head.ThreadID] = true
+		} else {
+			delete(store.dirtyRoomMirrors, update.head.ThreadID)
+		}
+		store.roomMirrorMutex.Unlock()
+	}()
+
+	if store.dirtyRoomMirrors[update.head.ThreadID] {
+		forceReconcile = true
+	}
 
 	if err := store.verifyRoomMirrorTarget(update.head); err != nil {
 		return err
@@ -163,7 +222,9 @@ func (store *Store) syncRoomMirror(update roomMirrorUpdate, forceReconcile bool)
 				appended := update.allMessages[update.previousCount:]
 				if len(appended) == 0 {
 					if information.Mode().Perm() != 0o600 {
-						_ = os.Chmod(verifiedPath, 0o600)
+						if chmodErr := os.Chmod(verifiedPath, 0o600); chmodErr != nil {
+							return chmodErr
+						}
 					}
 					return nil
 				}
@@ -315,8 +376,24 @@ func writeAtomicRegularFile(rootDirectory string, parentDirectory string, destin
 	return nil
 }
 
-func (store *Store) VerifyRoomWritable(head protocol.ThreadRoomHead) error {
-	return store.verifyRoomMirrorTarget(head)
+func (store *Store) ReconcileRoomMirror(threadID string) error {
+	store.mutex.RLock()
+	defer store.mutex.RUnlock()
+	if store.database == nil {
+		return ErrStoreClosed
+	}
+	head, exists := store.state.RoomHeads[threadID]
+	if !exists {
+		return nil
+	}
+	messages := store.state.RoomMessages[threadID]
+	clonedMessages := make([]protocol.RoomMessage, len(messages))
+	copy(clonedMessages, messages)
+	return store.syncRoomMirror(roomMirrorUpdate{
+		head:          head,
+		allMessages:   clonedMessages,
+		previousCount: 0,
+	}, true)
 }
 
 func (store *Store) RoomJSONLPath(threadID string) (string, bool, error) {
@@ -326,14 +403,39 @@ func (store *Store) RoomJSONLPath(threadID string) (string, bool, error) {
 		return "", false, ErrStoreClosed
 	}
 	head, exists := store.state.RoomHeads[threadID]
-	store.mutex.RUnlock()
 	if !exists {
+		store.mutex.RUnlock()
 		return "", false, nil
 	}
 	if !isSafeRoomDirectoryName(head.DirectoryName) {
+		store.mutex.RUnlock()
 		return "", false, fmt.Errorf("unsafe room directory name %q", head.DirectoryName)
 	}
 	targetPath := filepath.Join(store.roomsDirectory, head.DirectoryName, "messages.jsonl")
+	metadataPath := filepath.Join(store.roomsDirectory, head.DirectoryName, "room.json")
+	needsReconcile := store.isRoomMirrorDirty(threadID)
+	if !needsReconcile {
+		if _, err := os.Lstat(targetPath); errors.Is(err, fs.ErrNotExist) {
+			needsReconcile = true
+		} else if _, metadataErr := os.Lstat(metadataPath); errors.Is(metadataErr, fs.ErrNotExist) {
+			needsReconcile = true
+		}
+	}
+	if needsReconcile {
+		messages := store.state.RoomMessages[threadID]
+		clonedMessages := make([]protocol.RoomMessage, len(messages))
+		copy(clonedMessages, messages)
+		_ = store.syncRoomMirror(roomMirrorUpdate{
+			head:          head,
+			allMessages:   clonedMessages,
+			previousCount: 0,
+		}, true)
+	}
+	store.mutex.RUnlock()
+
+	if _, _, err := safepath.VerifyRegularFileWithinRoot(store.roomsDirectory, metadataPath); err != nil {
+		return "", false, err
+	}
 	verifiedPath, _, err := safepath.VerifyRegularFileWithinRoot(store.roomsDirectory, targetPath)
 	if err != nil {
 		return "", false, err

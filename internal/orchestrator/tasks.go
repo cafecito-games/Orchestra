@@ -520,13 +520,13 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 		}
 
 		if input.Progress != nil {
-			task.Progress = strings.TrimSpace(*input.Progress)
+			task.Progress = service.redactor.Redact(strings.TrimSpace(*input.Progress))
 		}
 		if input.Summary != nil {
-			task.Summary = strings.TrimSpace(*input.Summary)
+			task.Summary = service.redactor.Redact(strings.TrimSpace(*input.Summary))
 		}
 		if input.Completion != nil {
-			task.Summary = completionSummary
+			task.Summary = service.redactor.Redact(completionSummary)
 			for _, artifactID := range input.Completion.ArtifactIDs {
 				if !slices.Contains(task.ArtifactIDs, artifactID) {
 					task.ArtifactIDs = append(task.ArtifactIDs, artifactID)
@@ -534,13 +534,13 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 			}
 		}
 		if input.BlockerReason != nil {
-			task.BlockerReason = strings.TrimSpace(*input.BlockerReason)
+			task.BlockerReason = service.redactor.Redact(strings.TrimSpace(*input.BlockerReason))
 		}
 		if input.BlockedReason.Set {
 			if input.BlockedReason.Value == nil {
 				task.BlockerReason = ""
 			} else {
-				task.BlockerReason = strings.TrimSpace(*input.BlockedReason.Value)
+				task.BlockerReason = service.redactor.Redact(strings.TrimSpace(*input.BlockedReason.Value))
 			}
 		}
 		for _, artifactID := range input.ArtifactIDs {
