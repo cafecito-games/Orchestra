@@ -360,6 +360,10 @@ case "$*" in
     echo '{"type":"assistant","session_id":"sess-workspace-b","message":{"content":[{"type":"text","text":"workspace b turn"}]}}'
     echo '{"type":"result","result":"workspace b completed"}'
     ;;
+  *"FAIL_BEFORE_SESSION_EVENT"*)
+    echo 'session resume rejected immediately' >&2
+    exit 1
+    ;;
   *)
     echo '{"type":"assistant","session_id":"sess-native-1","message":{"content":[{"type":"text","text":"standard turn"}]}}'
     echo '{"type":"result","result":"standard completed"}'
@@ -599,9 +603,13 @@ esac
 	require.NotContains(t, invocationLines[3], "--resume")
 
 	// Verify reverse transport isolation as well: querying acp-v1 on workspaceB (where only a native-cli binding exists) returns false.
+	var workspaceBBindingID string
+	var workspaceBInstanceID string
 	err = openedStore.Read(func(state *store.State) error {
 		for _, binding := range state.SessionBindings {
 			if binding.Workspace == workspaceB && binding.Transport == protocol.TransportNativeCLI && binding.Status == "idle" {
+				workspaceBBindingID = binding.ID
+				workspaceBInstanceID = binding.InstanceID
 				_, foundCross := findIdleSessionBinding(
 					state,
 					binding.InstanceID,
@@ -618,6 +626,72 @@ esac
 		return nil
 	})
 	require.NoError(t, err)
+
+	// An immediate CLI resume failure before emitting any session event transitions the binding to failed,
+	// so the next task on that resident instance starts a clean session without --resume.
+	batch5, err := service.SubmitTasks(caller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "resume-batch-5",
+		Tasks: []SubmittedTaskSpec{{
+			ClientTaskID: "task-5",
+			Title:        "Failing resumed turn",
+			Instructions: "FAIL_BEFORE_SESSION_EVENT",
+			MaxAttempts:  1,
+			InstanceID:   workspaceBInstanceID,
+			Requirements: protocol.ExecutionRequirements{
+				Workspace: &protocol.WorkspaceRequirements{Path: workspaceB},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	task5ID := batch5.ClientTaskMap["task-5"]
+	require.Eventually(t, func() bool {
+		snapshot, snapshotErr := service.GetThreadDetail(thread.ID)
+		if snapshotErr != nil {
+			return false
+		}
+		for _, task := range snapshot.Tasks {
+			if task.ID == task5ID && task.Status == "failed" {
+				return true
+			}
+		}
+		return false
+	}, 6*time.Second, 25*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		snapshot, snapshotErr := service.GetThreadDetail(thread.ID)
+		if snapshotErr != nil {
+			return false
+		}
+		for _, binding := range snapshot.SessionBindings {
+			if binding.ID == workspaceBBindingID && binding.Status == "failed" {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second, 20*time.Millisecond)
+
+	batch6, err := service.SubmitTasks(caller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "resume-batch-6",
+		Tasks: []SubmittedTaskSpec{{
+			ClientTaskID: "task-6",
+			Title:        "Clean turn after failed resume",
+			Instructions: "WORKSPACE_B_TASK",
+			InstanceID:   workspaceBInstanceID,
+			Requirements: protocol.ExecutionRequirements{
+				Workspace: &protocol.WorkspaceRequirements{Path: workspaceB},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	task6ID := batch6.ClientTaskMap["task-6"]
+	_ = waitForTaskCompleted(task6ID)
+
+	invocationLines = readInvocations()
+	require.Len(t, invocationLines, 6)
+	require.Contains(t, invocationLines[4], "--resume sess-workspace-b")
+	require.NotContains(t, invocationLines[5], "--resume")
 
 	cancelWorker()
 	require.NoError(t, <-workerDone)

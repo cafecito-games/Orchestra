@@ -459,6 +459,10 @@ case "$*" in
     echo 'fatal harness crash' >&2
     exit 1
     ;;
+  *"fail-before-session"*)
+    echo 'stale session rejected before json event' >&2
+    exit 1
+    ;;
   *)
     echo '{"type":"assistant","session_id":"sess-100","message":{"content":[{"type":"text","text":"turn ok"}]}}'
     echo '{"type":"result","result":"turn completed"}'
@@ -725,6 +729,38 @@ esac
 	_ = waitFor(func(message protocol.SlaveControlMessage) bool {
 		return message.Type == "run.failed" && message.RunID == "run-n4"
 	}, "run-n4 failed")
+
+	sendMaster(protocol.MasterControlMessage{
+		Type: "dispatch",
+		Run: &protocol.Run{
+			ID:           "run-n5",
+			ThreadID:     "thread-1",
+			InstanceID:   "inst-native-1",
+			AllocationID: "alloc-native-1",
+			NodeID:       "worker-native",
+			HarnessID:    protocol.HarnessClaudeCLI,
+			Model:        "sonnet",
+			Workspace:    workspaceRoot,
+			Prompt:       "ignored",
+			Transport:    protocol.TransportNativeCLI,
+			CreatedAt:    nowText,
+		},
+		SessionBinding: &protocol.DispatchSessionBinding{
+			ID:                "sbind-immediate-fail",
+			ProviderSessionID: "sess-100",
+			Transport:         protocol.TransportNativeCLI,
+			ResumePrompt:      "fail-before-session",
+		},
+	})
+	immediateFailedBinding := waitFor(func(message protocol.SlaveControlMessage) bool {
+		return message.Type == "session.binding" && message.RunID == "run-n5" && message.Binding != nil && message.Binding.Status == "failed"
+	}, "run-n5 immediate failed session.binding")
+	require.Equal(t, "sbind-immediate-fail", immediateFailedBinding.Binding.BindingID)
+	require.Equal(t, "sess-100", immediateFailedBinding.Binding.ProviderSessionID)
+	require.Equal(t, protocol.TransportNativeCLI, immediateFailedBinding.Binding.Transport)
+	_ = waitFor(func(message protocol.SlaveControlMessage) bool {
+		return message.Type == "run.failed" && message.RunID == "run-n5"
+	}, "run-n5 failed")
 
 	sendMaster(protocol.MasterControlMessage{
 		Type: "dispatch",

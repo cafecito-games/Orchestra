@@ -195,6 +195,19 @@ func (session *runSession) execute(
 			return
 		}
 		if err := session.client.runner.AdmitResume(session.run.HarnessID, effectiveTransport); err != nil {
+			failedBinding := protocol.SessionBindingUpdate{
+				BindingID:         dispatchedBinding.ID,
+				ProviderSessionID: dispatchedBinding.ProviderSessionID,
+				HarnessID:         session.run.HarnessID,
+				Transport:         effectiveTransport,
+				Status:            "failed",
+			}
+			session.client.sendOrQueue(protocol.SlaveControlMessage{
+				Type:    "session.binding",
+				RunID:   session.run.ID,
+				Binding: &failedBinding,
+				At:      session.client.nowUTC(),
+			})
 			session.emitTerminalFailure(errors.New(protocol.SessionResumeUnavailableReason))
 			return
 		}
@@ -335,7 +348,13 @@ func (session *runSession) execute(
 	bindingID := session.sessionBindingID
 	session.mutex.Unlock()
 
+	if selectedTransport == "" {
+		selectedTransport = effectiveTransport
+	}
 	wasCancelled := session.cancelled.Load() || errors.Is(executeErr, context.Canceled)
+	if providerSessionID == "" && executeErr != nil && !wasCancelled && dispatchedBinding != nil && bindingID != "" {
+		providerSessionID = dispatchedBinding.ProviderSessionID
+	}
 	if providerSessionID != "" && (selectedTransport == protocol.TransportACP || selectedTransport == protocol.TransportNativeCLI) {
 		nextBindingStatus := "idle"
 		if executeErr != nil && !wasCancelled {
