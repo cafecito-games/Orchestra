@@ -162,13 +162,6 @@ func (store *Store) expandDirtyRoomMirrorUpdates(initialUpdates []roomMirrorUpda
 	return expanded
 }
 
-func (store *Store) isRoomMirrorDirty(threadID string) bool {
-	store.roomMirrorMutex.Lock()
-	dirty := store.dirtyRoomMirrors[threadID]
-	store.roomMirrorMutex.Unlock()
-	return dirty
-}
-
 func (store *Store) syncRoomMirror(update roomMirrorUpdate, forceReconcile bool) (syncError error) {
 	store.roomMirrorMutex.Lock()
 	defer func() {
@@ -413,23 +406,33 @@ func (store *Store) RoomJSONLPath(threadID string) (string, bool, error) {
 	}
 	targetPath := filepath.Join(store.roomsDirectory, head.DirectoryName, "messages.jsonl")
 	metadataPath := filepath.Join(store.roomsDirectory, head.DirectoryName, "room.json")
-	needsReconcile := store.isRoomMirrorDirty(threadID)
+	messages := store.state.RoomMessages[threadID]
+
+	store.roomMirrorMutex.Lock()
+	dirty := store.dirtyRoomMirrors[threadID]
+	expectedCount, hasCount := store.mirroredRoomCounts[threadID]
+	expectedSize := store.mirroredRoomSizes[threadID]
+	store.roomMirrorMutex.Unlock()
+
+	needsReconcile := dirty || !hasCount || expectedCount != len(messages)
 	if !needsReconcile {
-		if _, err := os.Lstat(targetPath); errors.Is(err, fs.ErrNotExist) {
+		if targetInfo, err := os.Lstat(targetPath); err != nil || !targetInfo.Mode().IsRegular() || targetInfo.Size() != expectedSize {
 			needsReconcile = true
-		} else if _, metadataErr := os.Lstat(metadataPath); errors.Is(metadataErr, fs.ErrNotExist) {
+		} else if metadataInfo, metadataErr := os.Lstat(metadataPath); metadataErr != nil || !metadataInfo.Mode().IsRegular() {
 			needsReconcile = true
 		}
 	}
 	if needsReconcile {
-		messages := store.state.RoomMessages[threadID]
 		clonedMessages := make([]protocol.RoomMessage, len(messages))
 		copy(clonedMessages, messages)
-		_ = store.syncRoomMirror(roomMirrorUpdate{
+		if reconcileErr := store.syncRoomMirror(roomMirrorUpdate{
 			head:          head,
 			allMessages:   clonedMessages,
 			previousCount: 0,
-		}, true)
+		}, true); reconcileErr != nil {
+			store.mutex.RUnlock()
+			return "", false, reconcileErr
+		}
 	}
 	store.mutex.RUnlock()
 

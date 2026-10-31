@@ -336,7 +336,7 @@ func runRoomPath(
 
 	localAccessible := false
 	if result.Path != "" {
-		if information, statErr := os.Stat(result.Path); statErr == nil && information.Mode().IsRegular() {
+		if information, statErr := os.Lstat(result.Path); statErr == nil && information.Mode().IsRegular() {
 			localAccessible = true
 		}
 	}

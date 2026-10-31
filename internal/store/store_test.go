@@ -325,4 +325,37 @@ func TestStoreRoomMirrorFailureKeepsCommittedStateAndSelfHeals(t *testing.T) {
 	healedBytes, err := os.ReadFile(healedPath)
 	require.NoError(t, err)
 	require.Contains(t, string(healedBytes), "Committed while mirror path was blocked")
+
+	roomMetadataPath := filepath.Join(roomDirectoryPath, "room.json")
+	require.NoError(t, os.Remove(roomMetadataPath))
+	require.NoError(t, os.Mkdir(roomMetadataPath, 0o700))
+
+	_, err = openedStore.Mutate(func(state *State, mutation *Mutation) error {
+		head := state.RoomHeads[threadID]
+		head.HeadSequence = 2
+		head.UpdatedAt = "2026-10-30T15:01:00Z"
+		state.RoomHeads[threadID] = head
+		state.RoomMessages[threadID] = append(state.RoomMessages[threadID], protocol.RoomMessage{
+			Sequence:  2,
+			ID:        "rmsg_0000000000000002",
+			ThreadID:  threadID,
+			CreatedAt: head.UpdatedAt,
+			Author:    protocol.RoomAuthor{Kind: "operator", OperatorID: "cli"},
+			Kind:      "decision",
+			Body:      "Sequence two committed while old messages.jsonl remained regular",
+		})
+		return nil
+	})
+	require.NoError(t, err)
+
+	_, _, err = openedStore.RoomJSONLPath(threadID)
+	require.Error(t, err, "RoomJSONLPath must not advertise a stale regular messages.jsonl when repair fails")
+
+	require.NoError(t, os.Remove(roomMetadataPath))
+	repairedPath, exists, err := openedStore.RoomJSONLPath(threadID)
+	require.NoError(t, err)
+	require.True(t, exists)
+	repairedBytes, err := os.ReadFile(repairedPath)
+	require.NoError(t, err)
+	require.Contains(t, string(repairedBytes), "Sequence two committed while old messages.jsonl remained regular")
 }
