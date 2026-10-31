@@ -24,6 +24,10 @@ func (client *Client) handleInstanceProvision(instance *protocol.AgentInstance, 
 	}
 
 	client.mutex.Lock()
+	if client.restartingForUpdate {
+		client.mutex.Unlock()
+		return
+	}
 	if existing, exists := client.instances[instance.ID]; exists {
 		if existing.allocation.ID == allocation.ID {
 			if existing.status == "active" {
@@ -80,7 +84,7 @@ func (client *Client) handleInstanceProvision(instance *protocol.AgentInstance, 
 	}
 
 	client.mutex.Lock()
-	if client.releasedAllocations[allocation.ID] {
+	if client.restartingForUpdate || client.releasedAllocations[allocation.ID] {
 		client.mutex.Unlock()
 		return
 	}

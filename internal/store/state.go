@@ -23,6 +23,7 @@ type InstanceDelivery struct {
 
 type State struct {
 	Nodes               map[string]protocol.ComputeNode
+	NodeUpdates         map[string]protocol.NodeUpdateState
 	CapabilityReports   map[string]protocol.NodeCapabilityReport
 	ComponentReports    map[string]protocol.ComponentInventoryReport
 	ProjectProfiles     map[string]protocol.ProjectProfile
@@ -60,6 +61,7 @@ type State struct {
 func NewState() *State {
 	return &State{
 		Nodes:               map[string]protocol.ComputeNode{},
+		NodeUpdates:         map[string]protocol.NodeUpdateState{},
 		CapabilityReports:   map[string]protocol.NodeCapabilityReport{},
 		ComponentReports:    map[string]protocol.ComponentInventoryReport{},
 		ProjectProfiles:     map[string]protocol.ProjectProfile{},
@@ -111,6 +113,9 @@ func (state *State) Clone() *State {
 func (state *State) ensureInitialized() {
 	if state.Nodes == nil {
 		state.Nodes = map[string]protocol.ComputeNode{}
+	}
+	if state.NodeUpdates == nil {
+		state.NodeUpdates = map[string]protocol.NodeUpdateState{}
 	}
 	if state.CapabilityReports == nil {
 		state.CapabilityReports = map[string]protocol.NodeCapabilityReport{}

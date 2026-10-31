@@ -23,6 +23,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/cafecito-games/Orchestra/internal/protocol"
+	"github.com/cafecito-games/Orchestra/internal/selfupdate"
 	"github.com/cafecito-games/Orchestra/internal/setup"
 	"github.com/cafecito-games/Orchestra/internal/slave"
 	"github.com/cafecito-games/Orchestra/internal/store"
@@ -44,14 +45,17 @@ type Configuration struct {
 }
 
 type ServiceOptions struct {
-	Store            *store.Store
-	Token            string
-	ProjectProfiles  []protocol.ProjectProfile
-	DoorbellDebounce time.Duration
-	PingInterval     time.Duration
-	PongTimeout      time.Duration
-	SweepInterval    time.Duration
-	Now              func() time.Time
+	Store                *store.Store
+	Token                string
+	ProjectProfiles      []protocol.ProjectProfile
+	DoorbellDebounce     time.Duration
+	PingInterval         time.Duration
+	PongTimeout          time.Duration
+	SweepInterval        time.Duration
+	NodeUpdateTimeout    time.Duration
+	ReleaseClient        *selfupdate.ReleaseClient
+	UpdateCacheDirectory string
+	Now                  func() time.Time
 }
 
 type orchestratorClientSession struct {
@@ -80,16 +84,19 @@ type replayWindow struct {
 }
 
 type Service struct {
-	baseContext      context.Context
-	store            *store.Store
-	token            string
-	redactor         *protocol.Redactor
-	doorbellDebounce time.Duration
-	pingInterval     time.Duration
-	pongTimeout      time.Duration
-	sweepInterval    time.Duration
-	now              func() time.Time
-	startedAt        string
+	baseContext       context.Context
+	store             *store.Store
+	token             string
+	redactor          *protocol.Redactor
+	doorbellDebounce  time.Duration
+	pingInterval      time.Duration
+	pongTimeout       time.Duration
+	sweepInterval     time.Duration
+	nodeUpdateTimeout time.Duration
+	releaseClient     *selfupdate.ReleaseClient
+	updateCache       *selfupdate.BundleCache
+	now               func() time.Time
+	startedAt         string
 
 	scheduleWakeup chan struct{}
 
@@ -136,23 +143,46 @@ func NewService(options ServiceOptions) (*Service, error) {
 	if sweepInterval <= 0 {
 		sweepInterval = 5 * time.Second
 	}
+	nodeUpdateTimeout := options.NodeUpdateTimeout
+	if nodeUpdateTimeout <= 0 {
+		nodeUpdateTimeout = defaultNodeUpdateTimeout
+	}
+	releaseClient := options.ReleaseClient
+	if releaseClient == nil {
+		createdClient, clientErr := selfupdate.NewReleaseClient(selfupdate.ReleaseClientOptions{})
+		if clientErr != nil {
+			return nil, clientErr
+		}
+		releaseClient = createdClient
+	}
+	cacheDirectory := strings.TrimSpace(options.UpdateCacheDirectory)
+	if cacheDirectory == "" {
+		cacheDirectory = filepath.Join(options.Store.DataDirectory(), "updates")
+	}
+	updateCache, cacheErr := selfupdate.NewBundleCache(cacheDirectory)
+	if cacheErr != nil {
+		return nil, cacheErr
+	}
 
 	service := &Service{
-		baseContext:      context.Background(),
-		store:            options.Store,
-		token:            options.Token,
-		redactor:         protocol.NewRedactor(options.Token),
-		doorbellDebounce: debounce,
-		pingInterval:     pingInterval,
-		pongTimeout:      pongTimeout,
-		sweepInterval:    sweepInterval,
-		now:              nowFunction,
-		startedAt:        nowFunction().UTC().Format(time.RFC3339Nano),
-		scheduleWakeup:   make(chan struct{}, 1),
-		slaves:           map[string]*slaveSession{},
-		clients:          map[string]*orchestratorClientSession{},
-		replayWindows:    map[string]*replayWindow{},
-		mailSubscribers:  map[int64]chan protocol.MailMessage{},
+		baseContext:       context.Background(),
+		store:             options.Store,
+		token:             options.Token,
+		redactor:          protocol.NewRedactor(options.Token),
+		doorbellDebounce:  debounce,
+		pingInterval:      pingInterval,
+		pongTimeout:       pongTimeout,
+		sweepInterval:     sweepInterval,
+		nodeUpdateTimeout: nodeUpdateTimeout,
+		releaseClient:     releaseClient,
+		updateCache:       updateCache,
+		now:               nowFunction,
+		startedAt:         nowFunction().UTC().Format(time.RFC3339Nano),
+		scheduleWakeup:    make(chan struct{}, 1),
+		slaves:            map[string]*slaveSession{},
+		clients:           map[string]*orchestratorClientSession{},
+		replayWindows:     map[string]*replayWindow{},
+		mailSubscribers:   map[int64]chan protocol.MailMessage{},
 	}
 	service.mcpHandler, service.closeMCP = service.newMCPHTTPHandler()
 
@@ -239,6 +269,7 @@ func (service *Service) runSweepLoop(operationContext context.Context) {
 		case <-ticker.C:
 			service.expireIdleInstances()
 			service.expirePendingApprovals()
+			service.expireStaleNodeUpdates()
 		}
 	}
 }
@@ -273,6 +304,8 @@ func (service *Service) Handler() http.Handler {
 	mux.Handle("/mcp", service.requireBearerHandler(service.mcpHandler))
 	mux.HandleFunc("/api/status", service.requireBearer(service.handleAPIStatus))
 	mux.HandleFunc("/api/nodes", service.requireBearer(service.handleAPINodes))
+	mux.HandleFunc("/api/nodes/update", service.requireBearer(service.handleAPINodesUpdate))
+	mux.HandleFunc("/api/updates/bundles/", service.requireBearer(service.handleAPIUpdateBundle))
 	mux.HandleFunc("/api/threads", service.requireBearer(service.handleAPIThreads))
 	mux.HandleFunc("/api/threads/", service.requireBearer(service.handleAPIThreadSubroutes))
 	mux.HandleFunc("/api/runs/", service.requireBearer(service.handleAPIRunSubroutes))
@@ -1249,6 +1282,7 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 		localConfig := configuration.LocalWorker
 		localConfig.ControlEndpoint = loopbackBaseURL
 		localConfig.Token = configuration.Token
+		localConfig.DisableSelfUpdate = true
 		if tlsConfiguration != nil {
 			localConfig.HTTPClient = &http.Client{
 				Transport: &http.Transport{

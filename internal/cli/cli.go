@@ -78,6 +78,8 @@ func Run(
 		return runResolveApproval(operationContext, "reject", "rejected", remaining, standardOutput, standardError, lookupEnvironment)
 	case "cancel":
 		return runCancel(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
+	case "update":
+		return runUpdate(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "setup":
 		return runSetup(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "doctor":
@@ -100,7 +102,7 @@ Runtime Modes:
 
 Operator Commands:
   status      Inspect orchestrator health, connected nodes, and active workloads
-  nodes       List registered worker machines, harnesses, capabilities, and capacity
+  nodes       List registered worker machines or trigger remote self-updates (nodes update)
   threads     List coordination threads on the orchestrator
   thread      Inspect a thread's task DAG, resident instances, runs, messages, and transcripts
   room        Read, post, nudge, or locate a thread's shared blackboard room
@@ -110,7 +112,8 @@ Operator Commands:
   reject      Reject a pending worker permission request
   cancel      Cancel an active run or task by identifier
 
-Node Setup & Diagnostics:
+Node Setup, Updates & Diagnostics:
+  update      Self-update the local Orchestra binary (and optionally slave nodes) from GitHub Releases
   setup       Manage pinned ACP adapters and harness components (plan, apply, activate, rollback, prune, uninstall)
   doctor      Inspect local harness readiness, managed components, auth gates, and master connectivity
   version     Print the Orchestra build and protocol version
@@ -289,6 +292,7 @@ Flags:
   --claude-acp-auth-mode string Claude ACP auth mode: local-subscription or api (env ORCHESTRA_CLAUDE_ACP_AUTH_MODE)
   --data-root string            Managed component data root (env ORCHESTRA_DATA_ROOT)
   --adapter-manifest string     Optional component manifest override path (env ORCHESTRA_ADAPTER_MANIFEST)
+  --disable-self-update         Reject remote self-update directives on this slave (env ORCHESTRA_DISABLE_SELF_UPDATE)
   --tls-ca string               CA certificate PEM path for https:// and wss:// (env ORCHESTRA_TLS_CA)
   --tls-insecure                Skip TLS certificate verification (env ORCHESTRA_TLS_INSECURE)
 `)

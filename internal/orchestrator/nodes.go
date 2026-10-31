@@ -93,6 +93,8 @@ func (service *Service) ListNodeDetails() ([]protocol.NodeDetail, error) {
 			switch {
 			case !connected:
 				node.Status = "offline"
+			case isNodeUpdatingInState(state, nodeID):
+				node.Status = "updating"
 			case activeRuns >= node.Concurrency:
 				node.Status = "busy"
 			default:
@@ -108,6 +110,11 @@ func (service *Service) ListNodeDetails() ([]protocol.NodeDetail, error) {
 			if report, exists := state.ComponentReports[nodeID]; exists {
 				reportCopy := report
 				componentReport = &reportCopy
+			}
+			var updateStatus *protocol.NodeUpdateState
+			if update, exists := state.NodeUpdates[nodeID]; exists {
+				updateCopy := update
+				updateStatus = &updateCopy
 			}
 
 			var residentIDs []string
@@ -125,6 +132,7 @@ func (service *Service) ListNodeDetails() ([]protocol.NodeDetail, error) {
 				CapabilityReport:  capabilityReport,
 				ComponentReport:   componentReport,
 				ResidentInstances: residentIDs,
+				UpdateStatus:      updateStatus,
 			})
 		}
 		return nil
@@ -278,9 +286,22 @@ func (service *Service) serveSlaveConnection(requestContext context.Context, con
 	}()
 
 	_, _ = service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		registrationTime := service.nowUTC()
 		node.Status = "online"
-		node.LastSeen = service.nowUTC()
+		node.LastSeen = registrationTime
 		state.Nodes[node.ID] = node
+		wasUpdating := isNodeUpdatingInState(state, node.ID)
+		service.reconcileNodeUpdateOnRegisterInState(state, node, registrationTime)
+		if wasUpdating {
+			if !isNodeUpdatingInState(state, node.ID) {
+				mutation.OnCommit(func() {
+					service.TriggerSchedule()
+				})
+			} else {
+				node.Status = "updating"
+				state.Nodes[node.ID] = node
+			}
+		}
 		return nil
 	})
 
@@ -367,6 +388,8 @@ func (service *Service) dispatchSlaveMessage(
 		service.handleNodeCapabilities(nodeID, message)
 	case "sync.complete":
 		service.handleSyncComplete(session, message)
+	case "node.update.status":
+		service.handleNodeUpdateStatus(nodeID, message)
 	case "instance.ready":
 		service.handleInstanceReady(nodeID, message)
 	case "instance.failed":
@@ -410,9 +433,12 @@ func (service *Service) handleNodeHeartbeat(nodeID string, message protocol.Slav
 			value := *message.ActiveInstances
 			node.ActiveInstances = &value
 		}
-		if node.ActiveRuns >= node.Concurrency {
+		switch {
+		case isNodeUpdatingInState(state, nodeID):
+			node.Status = "updating"
+		case node.ActiveRuns >= node.Concurrency:
 			node.Status = "busy"
-		} else {
+		default:
 			node.Status = "online"
 		}
 		state.Nodes[nodeID] = node

@@ -323,6 +323,11 @@ Every inspection and control command reads `ORCHESTRA_ENDPOINT` (default `http:/
 orchestra status
 orchestra nodes
 
+# Self-update local CLI/master binary or roll out a release to connected slaves
+orchestra update --check
+orchestra update
+orchestra nodes update --wait
+
 # Inspect coordination threads, task DAGs, and transcripts
 orchestra threads --status open
 orchestra thread <thread-id>
@@ -364,11 +369,11 @@ orchestra cancel <run-id|task-id>
 <details>
 <summary><strong>MCP Tool Reference (Orchestrator & Worker Surfaces)</strong></summary>
 
-#### Orchestrator Surface (`orchestra mcp` & `POST /mcp` — 27 Tools)
+#### Orchestrator Surface (`orchestra mcp` & `POST /mcp` — 28 Tools)
 
 | Area | Tools |
 | :--- | :--- |
-| **Inventory** | `get_execution_inventory` |
+| **Inventory & Updates** | `get_execution_inventory`, `update_nodes` |
 | **Threads & Events** | `create_thread`, `list_threads`, `attach_thread`, `detach_thread`, `get_thread_context`, `get_thread_events`, `update_thread` |
 | **Blackboard Room** | `read_room`, `post_room_message`, `nudge_room` |
 | **Tasks & Artifacts** | `submit_tasks`, `update_task`, `send_task_message`, `post_artifact` |
@@ -416,6 +421,7 @@ Each worker run receives an isolated `127.0.0.1` Streamable HTTP MCP server expo
 | `--claude-acp-auth-mode` | `ORCHESTRA_CLAUDE_ACP_AUTH_MODE` | `local-subscription` or `api` safety gate for Claude ACP |
 | `--acp-adapter` | `ORCHESTRA_ACP_ADAPTERS` | Pin `<harness>=sha256:<hex>:/abs/path` (repeatable) |
 | `--require-acp` | `ORCHESTRA_REQUIRE_ACP` | Withhold harnesses that only have `native-cli` transport |
+| `--disable-self-update` | `ORCHESTRA_DISABLE_SELF_UPDATE` | Reject remote self-update directives on this slave node |
 | `--tls-ca`, `--tls-insecure` | `ORCHESTRA_TLS_CA`, `ORCHESTRA_TLS_INSECURE` | Custom CA bundle path or TLS verification skip |
 
 #### `orchestra mcp`

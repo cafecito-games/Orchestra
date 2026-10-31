@@ -62,6 +62,10 @@ func (client *Client) handleDispatch(message protocol.MasterControlMessage) {
 	}
 
 	client.mutex.Lock()
+	if client.restartingForUpdate {
+		client.mutex.Unlock()
+		return
+	}
 	if _, alreadyRunning := client.sessions[run.ID]; alreadyRunning {
 		client.mutex.Unlock()
 		return
@@ -97,6 +101,12 @@ func (client *Client) handleDispatch(message protocol.MasterControlMessage) {
 	}
 
 	client.mutex.Lock()
+	if client.restartingForUpdate {
+		client.mutex.Unlock()
+		cancelRun()
+		client.releaseResidentRun(resident.instance.ID, resident.allocation.ID, run.ID)
+		return
+	}
 	if _, duplicate := client.sessions[run.ID]; duplicate || client.completedRuns[run.ID] {
 		client.mutex.Unlock()
 		cancelRun()
@@ -104,6 +114,7 @@ func (client *Client) handleDispatch(message protocol.MasterControlMessage) {
 		return
 	}
 	client.sessions[run.ID] = session
+	client.inFlightSessions++
 	client.mutex.Unlock()
 
 	client.waitGroup.Go(func() {
@@ -151,6 +162,7 @@ func (session *runSession) execute(
 			})
 		}
 		session.client.sendHeartbeat()
+		session.client.settleSession()
 	}()
 
 	workingDirectory := session.run.Workspace
