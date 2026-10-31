@@ -179,6 +179,7 @@ func (service *Service) SpawnInstance(
 		}
 		state.Instances[instanceID] = instance
 		state.Allocations[allocationID] = allocation
+		service.ensureInstanceMailboxInState(state, instance, allocation, nowText)
 
 		delivery := store.InstanceDelivery{
 			ID:           protocol.NewIdentifier("idlv"),
@@ -514,6 +515,7 @@ func (service *Service) initiateInstanceReleaseInState(
 		instance.Status = "draining"
 		instance.UpdatedAt = nowText
 		state.Instances[instance.ID] = *instance
+		service.syncInstanceMailboxInState(state, instance.ID, nowText)
 	}
 
 	for deliveryID, delivery := range state.InstanceDeliveries {
@@ -555,6 +557,7 @@ func (service *Service) initiateInstanceReleaseInState(
 		instance.Status = "released"
 		instance.UpdatedAt = nowText
 		state.Instances[instance.ID] = *instance
+		service.syncInstanceMailboxInState(state, instance.ID, nowText)
 		delete(state.ReleaseIntents, instance.ID)
 		return
 	}
@@ -631,6 +634,8 @@ func (service *Service) handleInstanceReady(nodeID string, message protocol.Slav
 			instance.UpdatedAt = nowText
 			state.Instances[instance.ID] = instance
 		}
+		service.syncInstanceMailboxInState(state, instance.ID, nowText)
+		service.enqueuePendingInstanceMailWakeInState(state, instance.ID, nowText)
 
 		mutation.OnCommit(func() {
 			service.TriggerSchedule()
@@ -664,6 +669,7 @@ func (service *Service) handleInstanceFailed(nodeID string, message protocol.Sla
 		instance.Status = "failed"
 		instance.UpdatedAt = nowText
 		state.Instances[instance.ID] = instance
+		service.syncInstanceMailboxInState(state, instance.ID, nowText)
 
 		failureReason := "resident instance failed on slave node"
 		if message.Error != nil && *message.Error != "" {
@@ -724,6 +730,7 @@ func (service *Service) handleInstanceReleased(nodeID string, message protocol.S
 			instance.UpdatedAt = nowText
 			state.Instances[instance.ID] = instance
 		}
+		service.syncInstanceMailboxInState(state, instance.ID, nowText)
 
 		mutation.OnCommit(func() {
 			service.TriggerSchedule()

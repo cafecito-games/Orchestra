@@ -307,6 +307,8 @@ func (service *Service) releaseInstanceAfterRunInState(
 		instance.UpdatedAt = nowText
 		state.Instances[instanceID] = instance
 	}
+	service.syncInstanceMailboxInState(state, instanceID, nowText)
+	service.enqueuePendingInstanceMailWakeInState(state, instanceID, nowText)
 }
 
 func (service *Service) handleHarnessEvent(nodeID string, message protocol.SlaveControlMessage) {
@@ -1072,8 +1074,8 @@ func (service *Service) PostArtifact(
 			taskID = caller.TaskID
 		}
 	}
-	if !protocol.IsIdentifier(threadID) {
-		return PostArtifactResult{}, invalidRequest("threadId is required")
+	if threadID != "" && !protocol.IsIdentifier(threadID) {
+		return PostArtifactResult{}, invalidRequest("threadId must be a valid identifier")
 	}
 	name := strings.TrimSpace(input.Name)
 	if name == "" && input.RelativePath != "" {
@@ -1107,10 +1109,15 @@ func (service *Service) PostArtifact(
 
 	var result PostArtifactResult
 	_, err := service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
-		if _, exists := state.Threads[threadID]; !exists {
-			return notFound(fmt.Sprintf("thread %s does not exist", threadID))
+		if threadID != "" {
+			if _, exists := state.Threads[threadID]; !exists {
+				return notFound(fmt.Sprintf("thread %s does not exist", threadID))
+			}
 		}
 		if taskID != "" {
+			if threadID == "" {
+				return invalidRequest("threadId is required when taskId is specified")
+			}
 			if targetTask, exists := state.Tasks[taskID]; !exists || targetTask.ThreadID != threadID {
 				return invalidRequest(fmt.Sprintf("task %s does not exist in thread %s", taskID, threadID))
 			}

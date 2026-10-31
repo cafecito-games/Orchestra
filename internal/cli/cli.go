@@ -73,6 +73,8 @@ func Run(
 		return runThreadDetail(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "room":
 		return runRoom(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
+	case "mail":
+		return runMail(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "approvals":
 		return runApprovals(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "approve":
@@ -107,6 +109,7 @@ Operator Commands:
   threads     List coordination threads on the orchestrator
   thread      Inspect a thread's task DAG, resident instances, runs, messages, and transcripts
   room        Read, post, nudge, or locate a thread's shared blackboard room
+  mail        List <handle>@<host> agent mailboxes, send or read agent mail, and rename handles
   approvals   List worker permission requests
   approve     Approve a pending worker permission request
   reject      Reject a pending worker permission request
@@ -314,6 +317,8 @@ Flags:
   --endpoint string    Orchestra master HTTP or WebSocket endpoint (default http://127.0.0.1:8787, env ORCHESTRA_ENDPOINT)
   --token string       Bearer token matching ORCHESTRA_TOKEN (env ORCHESTRA_TOKEN)
   --client-id string   Stable orchestrator client identifier (env ORCHESTRA_CLIENT_ID)
+  --name string        Optional agent mail handle, e.g. "auth-api" (env ORCHESTRA_MAIL_NAME)
+  --host string        Optional agent mail host override (defaults to local hostname, env ORCHESTRA_MAIL_HOST)
   --tls-ca string      CA certificate PEM path for https:// and wss:// (env ORCHESTRA_TLS_CA)
   --tls-insecure       Skip TLS certificate verification (env ORCHESTRA_TLS_INSECURE)
 `)

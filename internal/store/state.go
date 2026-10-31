@@ -50,6 +50,9 @@ type State struct {
 	RoomMessages        map[string][]protocol.RoomMessage
 	RoomMessageReceipts map[string]protocol.RoomMessageReceipt
 	RoomNudgeReceipts   map[string]protocol.RoomNudgeReceipt
+	Mailboxes           map[string]protocol.AgentMailbox
+	MailMessages        map[string]protocol.MailMessage
+	MailReceipts        map[string]protocol.MailReceipt
 	EventStreams        map[string]protocol.ThreadEventStream
 	ThreadEvents        map[string][]protocol.TaskEventEntry
 }
@@ -84,6 +87,9 @@ func NewState() *State {
 		RoomMessages:        map[string][]protocol.RoomMessage{},
 		RoomMessageReceipts: map[string]protocol.RoomMessageReceipt{},
 		RoomNudgeReceipts:   map[string]protocol.RoomNudgeReceipt{},
+		Mailboxes:           map[string]protocol.AgentMailbox{},
+		MailMessages:        map[string]protocol.MailMessage{},
+		MailReceipts:        map[string]protocol.MailReceipt{},
 		EventStreams:        map[string]protocol.ThreadEventStream{},
 		ThreadEvents:        map[string][]protocol.TaskEventEntry{},
 	}
@@ -186,6 +192,15 @@ func (state *State) ensureInitialized() {
 	}
 	if state.RoomNudgeReceipts == nil {
 		state.RoomNudgeReceipts = map[string]protocol.RoomNudgeReceipt{}
+	}
+	if state.Mailboxes == nil {
+		state.Mailboxes = map[string]protocol.AgentMailbox{}
+	}
+	if state.MailMessages == nil {
+		state.MailMessages = map[string]protocol.MailMessage{}
+	}
+	if state.MailReceipts == nil {
+		state.MailReceipts = map[string]protocol.MailReceipt{}
 	}
 	if state.EventStreams == nil {
 		state.EventStreams = map[string]protocol.ThreadEventStream{}

@@ -39,6 +39,10 @@ type Configuration struct {
 	Endpoint   string
 	Token      string
 	ClientID   string
+	MailName   string
+	MailHost   string
+	Workspace  string
+	ProcessID  int
 	HTTPClient *http.Client
 }
 
@@ -55,6 +59,8 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	if defaultClientID == "" {
 		defaultClientID = protocol.NewIdentifier("mcp-client")
 	}
+	defaultMailName := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_MAIL_NAME", "ORCHESTRA_AGENT_NAME")
+	defaultMailHost := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_MAIL_HOST")
 	defaultTLSCACert := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_CA")
 	defaultTLSInsecure := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_INSECURE") == "1" ||
 		strings.EqualFold(firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_INSECURE"), "true")
@@ -69,6 +75,8 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	flagSet.StringVar(&configuration.Endpoint, "control-endpoint", defaultEndpoint, "Orchestra master HTTP or WebSocket endpoint")
 	flagSet.StringVar(&configuration.Token, "token", defaultToken, "Bearer token matching ORCHESTRA_TOKEN")
 	flagSet.StringVar(&configuration.ClientID, "client-id", defaultClientID, "Stable orchestrator client identifier")
+	flagSet.StringVar(&configuration.MailName, "name", defaultMailName, "Optional agent mail handle (for example \"auth-api\")")
+	flagSet.StringVar(&configuration.MailHost, "host", defaultMailHost, "Optional agent mail host override (defaults to local hostname)")
 	flagSet.StringVar(&tlsCACert, "tls-ca", defaultTLSCACert, "Optional CA certificate PEM path for wss:// / https://")
 	flagSet.BoolVar(&tlsInsecure, "tls-insecure", defaultTLSInsecure, "Skip TLS certificate verification")
 
@@ -80,6 +88,20 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	}
 	if !protocol.IsIdentifier(configuration.ClientID) {
 		return Configuration{}, fmt.Errorf("invalid --client-id %q", configuration.ClientID)
+	}
+	if strings.TrimSpace(configuration.MailHost) != "" {
+		if _, ok := protocol.NormalizeMailHost(configuration.MailHost); !ok {
+			return Configuration{}, fmt.Errorf("invalid --host %q", configuration.MailHost)
+		}
+	}
+	if strings.TrimSpace(configuration.MailName) != "" {
+		hostForValidation := configuration.MailHost
+		if strings.TrimSpace(hostForValidation) == "" {
+			hostForValidation = "local"
+		}
+		if _, _, _, err := protocol.NormalizeRenameTarget(configuration.MailName, hostForValidation); err != nil {
+			return Configuration{}, fmt.Errorf("invalid --name %q: %w", configuration.MailName, err)
+		}
 	}
 	if tlsCACert != "" || tlsInsecure {
 		httpClient, tlsErr := protocol.BuildHTTPClient(tlsCACert, tlsInsecure, 0)
@@ -108,6 +130,11 @@ type Bridge struct {
 
 	attachedMutex   sync.Mutex
 	attachedThreads map[string]bool
+
+	mailMutex        sync.RWMutex
+	mailRegistration protocol.ClientMailRegistration
+	mailIdentified   bool
+	mailbox          *protocol.AgentMailbox
 }
 
 func NewBridge(configuration Configuration) *Bridge {
@@ -117,12 +144,39 @@ func NewBridge(configuration Configuration) *Bridge {
 	if configuration.ClientID == "" {
 		configuration.ClientID = protocol.NewIdentifier("mcp-client")
 	}
+	host := strings.TrimSpace(configuration.MailHost)
+	if host == "" {
+		if hostname, err := os.Hostname(); err == nil && strings.TrimSpace(hostname) != "" {
+			host = protocol.NormalizeHostnameSlug(hostname)
+		} else {
+			host = "local"
+		}
+	} else {
+		host = protocol.NormalizeHostnameSlug(host)
+	}
+	workspace := strings.TrimSpace(configuration.Workspace)
+	if workspace == "" {
+		if currentDirectory, err := os.Getwd(); err == nil {
+			workspace = currentDirectory
+		}
+	}
+	processID := configuration.ProcessID
+	if processID <= 0 {
+		processID = os.Getppid()
+	}
 	return &Bridge{
 		configuration:   configuration,
 		sessionID:       protocol.NewIdentifier("mcp-session"),
 		connected:       make(chan struct{}),
 		pendingCalls:    map[string]chan protocol.OrchestratorServerMessage{},
 		attachedThreads: map[string]bool{},
+		mailRegistration: protocol.ClientMailRegistration{
+			RequestedName: strings.TrimSpace(configuration.MailName),
+			Host:          host,
+			Workspace:     workspace,
+			PushCapable:   true,
+			ProcessID:     processID,
+		},
 	}
 }
 
@@ -187,16 +241,39 @@ func (transport *capturingTransport) Connect(operationContext context.Context) (
 	return connection, nil
 }
 
+const bridgeInstructions = "Orchestra connects coding agents across machines. " +
+	"Every agent session participates in Orchestra Agent Mail (<handle>@<host>): inspect your address with get_mail_identity, " +
+	"rename your handle with set_mail_identity, list active peer agents with list_mailboxes, send prompts or replies with send_mail, " +
+	"and read or await incoming mail with read_mail and wait_for_mail."
+
 func (bridge *Bridge) newProtocolServer() *mcp.Server {
 	protocolServer := mcp.NewServer(
 		&mcp.Implementation{Name: "orchestra", Version: protocol.BuildVersion},
 		&mcp.ServerOptions{
+			Instructions: bridgeInstructions,
 			Capabilities: &mcp.ServerCapabilities{
 				Tools:        &mcp.ToolCapabilities{},
 				Experimental: map[string]any{"claude/channel": map[string]any{}},
 			},
 		},
 	)
+	protocolServer.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(operationContext context.Context, method string, request mcp.Request) (mcp.Result, error) {
+			if method == "initialize" && request != nil {
+				if initializeParameters, ok := request.GetParams().(*mcp.InitializeParams); ok && initializeParameters != nil && initializeParameters.ClientInfo != nil {
+					clientName := strings.TrimSpace(initializeParameters.ClientInfo.Name)
+					if clientName != "" {
+						bridge.mailMutex.Lock()
+						bridge.mailRegistration.Harness = clientName
+						bridge.mailIdentified = true
+						bridge.mailMutex.Unlock()
+						bridge.identifyMailbox(operationContext)
+					}
+				}
+			}
+			return next(operationContext, method, request)
+		}
+	})
 	for _, definition := range orchestrator.OrchestratorToolDefinitions() {
 		protocolServer.AddTool(&mcp.Tool{
 			Name:        definition.Name,
@@ -267,6 +344,22 @@ func (bridge *Bridge) invokeTool(
 			}
 			if json.Unmarshal(resultBytes, &created) == nil && created.Thread.ID != "" {
 				bridge.rememberAttachedThread(created.Thread.ID, true)
+			}
+		}
+	case "set_mail_identity":
+		var parsedArguments struct {
+			Address string `json:"address"`
+		}
+		if json.Unmarshal(rawArguments, &parsedArguments) == nil && strings.TrimSpace(parsedArguments.Address) == "" {
+			var updated struct {
+				Mailbox protocol.AgentMailbox `json:"mailbox"`
+			}
+			if json.Unmarshal(resultBytes, &updated) == nil && updated.Mailbox.Handle != "" {
+				bridge.mailMutex.Lock()
+				bridge.mailRegistration.RequestedName = updated.Mailbox.Handle
+				mailboxCopy := updated.Mailbox
+				bridge.mailbox = &mailboxCopy
+				bridge.mailMutex.Unlock()
 			}
 		}
 	}
@@ -501,11 +594,13 @@ func (bridge *Bridge) runSingleWebSocketSession(operationContext context.Context
 		_ = connection.Close(websocket.StatusNormalClosure, "closing")
 	}()
 
+	initialRegistration, wasIdentified := bridge.snapshotMailRegistration()
 	registrationBytes, _ := json.Marshal(protocol.OrchestratorClientMessage{
 		Type:            "register",
 		ProtocolVersion: protocol.ProtocolVersion,
 		ClientID:        bridge.configuration.ClientID,
 		SessionID:       bridge.sessionID,
+		Mail:            &initialRegistration,
 		At:              time.Now().UTC().Format(time.RFC3339Nano),
 	})
 	writeContext, cancelWrite := context.WithTimeout(operationContext, 10*time.Second)
@@ -525,12 +620,18 @@ func (bridge *Bridge) runSingleWebSocketSession(operationContext context.Context
 	if err := json.Unmarshal(welcomePayload, &welcome); err != nil || welcome.Type != "welcome" {
 		return false
 	}
+	if welcome.Mailbox != nil {
+		bridge.storeMailbox(*welcome.Mailbox)
+	}
 
 	bridge.connectionMutex.Lock()
 	bridge.connection = connection
 	close(bridge.connected)
 	bridge.connectionMutex.Unlock()
 
+	if _, nowIdentified := bridge.snapshotMailRegistration(); nowIdentified && !wasIdentified {
+		go bridge.identifyMailbox(operationContext)
+	}
 	if reattach {
 		go bridge.reattachRememberedThreads(operationContext)
 	}
@@ -545,19 +646,28 @@ func (bridge *Bridge) runSingleWebSocketSession(operationContext context.Context
 			continue
 		}
 		switch message.Type {
-		case "tool.result":
-			bridge.pendingMutex.Lock()
-			channel, waiting := bridge.pendingCalls[message.RequestID]
-			if waiting {
-				delete(bridge.pendingCalls, message.RequestID)
+		case "tool.result", "mail.identified":
+			if message.Mailbox != nil {
+				bridge.storeMailbox(*message.Mailbox)
 			}
-			bridge.pendingMutex.Unlock()
-			if waiting {
-				channel <- message
+			if message.RequestID != "" {
+				bridge.pendingMutex.Lock()
+				channel, waiting := bridge.pendingCalls[message.RequestID]
+				if waiting {
+					delete(bridge.pendingCalls, message.RequestID)
+				}
+				bridge.pendingMutex.Unlock()
+				if waiting {
+					channel <- message
+				}
 			}
 		case "doorbell":
 			if message.Doorbell != nil {
 				bridge.emitDoorbellNotification(*message.Doorbell)
+			}
+		case "mail.received":
+			if message.Mail != nil {
+				bridge.emitMailNotification(*message.Mail)
 			}
 		case "attachment.replaced":
 			if message.ThreadID != "" {
@@ -565,6 +675,138 @@ func (bridge *Bridge) runSingleWebSocketSession(operationContext context.Context
 			}
 		}
 	}
+}
+
+func (bridge *Bridge) Mailbox() *protocol.AgentMailbox {
+	bridge.mailMutex.RLock()
+	defer bridge.mailMutex.RUnlock()
+	if bridge.mailbox == nil {
+		return nil
+	}
+	copyValue := *bridge.mailbox
+	return &copyValue
+}
+
+func (bridge *Bridge) storeMailbox(mailbox protocol.AgentMailbox) {
+	bridge.mailMutex.Lock()
+	copyValue := mailbox
+	bridge.mailbox = &copyValue
+	bridge.mailMutex.Unlock()
+}
+
+func (bridge *Bridge) snapshotMailRegistration() (protocol.ClientMailRegistration, bool) {
+	bridge.mailMutex.RLock()
+	defer bridge.mailMutex.RUnlock()
+	return bridge.mailRegistration, bridge.mailIdentified
+}
+
+func (bridge *Bridge) identifyMailbox(operationContext context.Context) {
+	waitContext, cancelWait := context.WithTimeout(operationContext, 2*time.Second)
+	connection, err := bridge.awaitConnection(waitContext)
+	cancelWait()
+	if err != nil {
+		return
+	}
+
+	registration, _ := bridge.snapshotMailRegistration()
+	requestID := fmt.Sprintf("identify-%d", bridge.requestSequence.Add(1))
+	responseChannel := make(chan protocol.OrchestratorServerMessage, 1)
+
+	bridge.pendingMutex.Lock()
+	bridge.pendingCalls[requestID] = responseChannel
+	bridge.pendingMutex.Unlock()
+
+	defer func() {
+		bridge.pendingMutex.Lock()
+		delete(bridge.pendingCalls, requestID)
+		bridge.pendingMutex.Unlock()
+	}()
+
+	payloadBytes, err := json.Marshal(protocol.OrchestratorClientMessage{
+		Type:      "mail.identify",
+		RequestID: requestID,
+		ClientID:  bridge.configuration.ClientID,
+		SessionID: bridge.sessionID,
+		Mail:      &registration,
+		At:        time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return
+	}
+
+	writeContext, cancelWrite := context.WithTimeout(operationContext, 2*time.Second)
+	writeErr := connection.Write(writeContext, websocket.MessageText, payloadBytes)
+	cancelWrite()
+	if writeErr != nil {
+		return
+	}
+
+	awaitContext, cancelAwait := context.WithTimeout(operationContext, 2*time.Second)
+	defer cancelAwait()
+	select {
+	case <-responseChannel:
+	case <-awaitContext.Done():
+	}
+}
+
+func (bridge *Bridge) emitMailNotification(notification protocol.MailNotification) {
+	meta := map[string]string{
+		"kind":        "agent_mail",
+		"message_id":  notification.Message.ID,
+		"from":        notification.Message.FromAddress,
+		"to":          notification.MailboxAddress,
+		"occurred_at": notification.OccurredAt,
+	}
+	if notification.Message.Subject != "" {
+		meta["subject"] = notification.Message.Subject
+	}
+	if notification.Message.ReplyToID != "" {
+		meta["reply_to_id"] = notification.Message.ReplyToID
+	}
+	if len(notification.Message.ArtifactIDs) > 0 {
+		meta["artifact_ids"] = strings.Join(notification.Message.ArtifactIDs, ",")
+	}
+
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf(
+		"[Orchestra Mail from %s -> %s | id=%s]",
+		notification.Message.FromAddress,
+		notification.MailboxAddress,
+		notification.Message.ID,
+	))
+	if notification.Message.Subject != "" {
+		builder.WriteString(" Subject: " + notification.Message.Subject)
+	}
+	builder.WriteByte('\n')
+	builder.WriteString(notification.Message.Body)
+	if !strings.HasSuffix(notification.Message.Body, "\n") {
+		builder.WriteByte('\n')
+	}
+	builder.WriteString(fmt.Sprintf(
+		"(Reply via `send_mail` with `to: %q` and `replyToId: %q`, or mark handled with `read_mail`.)",
+		notification.Message.FromAddress,
+		notification.Message.ID,
+	))
+
+	parameters, err := json.Marshal(map[string]any{
+		"content": builder.String(),
+		"meta":    meta,
+	})
+	if err != nil {
+		return
+	}
+	bridge.mcpConnectionMutex.RLock()
+	connection := bridge.mcpConnection
+	bridge.mcpConnectionMutex.RUnlock()
+	if connection == nil {
+		return
+	}
+	writeContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = connection.Write(writeContext, &jsonrpc.Request{
+		Method: "notifications/claude/channel",
+		Params: parameters,
+	})
 }
 
 func (bridge *Bridge) emitDoorbellNotification(doorbell protocol.DoorbellNotification) {

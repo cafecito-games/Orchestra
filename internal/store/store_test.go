@@ -359,3 +359,98 @@ func TestStoreRoomMirrorFailureKeepsCommittedStateAndSelfHeals(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(repairedBytes), "Sequence two committed while old messages.jsonl remained regular")
 }
+
+func TestStoreMailboxesMessagesAndReceiptsDurability(t *testing.T) {
+	dataDirectory := t.TempDir()
+	openedStore, err := Open(dataDirectory)
+	require.NoError(t, err)
+
+	createdAt := "2026-10-30T16:00:00Z"
+	_, err = openedStore.Mutate(func(state *State, mutation *Mutation) error {
+		state.Mailboxes["mbox-claude"] = protocol.AgentMailbox{
+			ID:           "mbox-claude",
+			Address:      "claude1234@fabrica",
+			Handle:       "claude1234",
+			Host:         "fabrica",
+			Aliases:      []string{"claude0001@fabrica"},
+			CustomHandle: true,
+			Kind:         "mcp-session",
+			Status:       "online",
+			Harness:      "claude",
+			Workspace:    "/workspaces/orchestra",
+			PushCapable:  true,
+			ClientID:     "claude-desktop",
+			SessionID:    "sess-1",
+			UnreadCount:  1,
+			CreatedAt:    createdAt,
+			UpdatedAt:    createdAt,
+			LastSeenAt:   createdAt,
+		}
+		state.Mailboxes["mbox-codex"] = protocol.AgentMailbox{
+			ID:          "mbox-codex",
+			Address:     "codex345@bunker",
+			Handle:      "codex345",
+			Host:        "bunker",
+			Kind:        "instance",
+			Status:      "idle",
+			Harness:     "codex",
+			InstanceID:  "inst-codex-1",
+			NodeID:      "bunker",
+			UnreadCount: 0,
+			CreatedAt:   createdAt,
+			UpdatedAt:   createdAt,
+			LastSeenAt:  createdAt,
+		}
+		state.MailMessages["mail-1"] = protocol.MailMessage{
+			ID:             "mail-1",
+			Sequence:       1,
+			SourceKey:      "mbox:mbox-codex",
+			IdempotencyKey: "send-1",
+			Digest:         "digest-1",
+			FromMailboxID:  "mbox-codex",
+			FromAddress:    "codex345@bunker",
+			ToMailboxID:    "mbox-claude",
+			ToAddress:      "claude1234@fabrica",
+			Subject:        "API migration ready",
+			Body:           "Please review commit abc1234.",
+			WakeRequested:  true,
+			Read:           false,
+			CreatedAt:      createdAt,
+		}
+		state.MailReceipts["mrec-1"] = protocol.MailReceipt{
+			ID:             "mrec-1",
+			SourceKey:      "mbox:mbox-codex",
+			IdempotencyKey: "send-1",
+			Digest:         "digest-1",
+			MessageID:      "mail-1",
+			CreatedAt:      createdAt,
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, openedStore.Close())
+
+	reopenedStore, err := Open(dataDirectory)
+	require.NoError(t, err)
+	defer reopenedStore.Close()
+
+	require.NoError(t, reopenedStore.Read(func(state *State) error {
+		mailbox, exists := state.Mailboxes["mbox-claude"]
+		require.True(t, exists)
+		require.Equal(t, "claude1234@fabrica", mailbox.Address)
+		require.Equal(t, []string{"claude0001@fabrica"}, mailbox.Aliases)
+		require.Equal(t, 1, mailbox.UnreadCount)
+
+		message, exists := state.MailMessages["mail-1"]
+		require.True(t, exists)
+		require.Equal(t, int64(1), message.Sequence)
+		require.Equal(t, "codex345@bunker", message.FromAddress)
+		require.Equal(t, "claude1234@fabrica", message.ToAddress)
+		require.Equal(t, "Please review commit abc1234.", message.Body)
+
+		receipt, exists := state.MailReceipts["mrec-1"]
+		require.True(t, exists)
+		require.Equal(t, "mail-1", receipt.MessageID)
+		return nil
+	}))
+}

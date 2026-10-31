@@ -2082,3 +2082,313 @@ func TestSystemAgentRoomsJSONLMirrorAndEndOfTurnNudgeFollowUp(t *testing.T) {
 	jsonlLines := strings.Split(strings.TrimSuffix(string(rawJSONL), "\n"), "\n")
 	require.Len(t, jsonlLines, 2)
 }
+
+func TestSystemAgentMailCrossSessionPushAndInstanceWakeReply(t *testing.T) {
+	binaries := ensureCompiledBinaries(t)
+	fakeHarnesses := installFakeHarnesses(t, binaries.fakeHarnessPath)
+
+	const bearerToken = "mail-system-test-token-778899"
+	listenAddress := allocateFreeLoopbackAddress(t)
+	masterBaseURL := "http://" + listenAddress
+	masterDataDirectory := filepath.Join(t.TempDir(), "mail-master-sqlite")
+
+	rawWorkspaceRoot := filepath.Join(t.TempDir(), "mail-workspace-root")
+	require.NoError(t, os.MkdirAll(rawWorkspaceRoot, 0o755))
+	canonicalRoots, err := slave.CanonicalizeWorkspaceRoots([]string{rawWorkspaceRoot})
+	require.NoError(t, err)
+	repositoryBackend := filepath.Join(canonicalRoots[0], "repo-backend")
+	initializeGitRepository(t, repositoryBackend)
+
+	workerDataRoot := filepath.Join(t.TempDir(), "mail-worker-data")
+	workerEnvironment := buildWorkerEnvironment(fakeHarnesses, "ORCHESTRA_DATA_ROOT="+workerDataRoot)
+
+	masterProcess := startManagedProcess(t, "mail-master", binaries.orchestraPath, []string{
+		"master",
+		"--listen", listenAddress,
+		"--token", bearerToken,
+		"--data-dir", masterDataDirectory,
+	}, workerEnvironment)
+	waitForMasterReady(t, masterBaseURL, masterProcess)
+
+	workerProcess := startManagedProcess(t, "mail-slave-bunker", binaries.orchestraPath, []string{
+		"slave",
+		"--endpoint", masterBaseURL,
+		"--token", bearerToken,
+		"--id", "worker-bunker",
+		"--name", "bunker",
+		"--concurrency", "2",
+		"--instance-capacity", "4",
+		"--workspace-root", canonicalRoots[0],
+		"--data-root", workerDataRoot,
+		"--acp-adapter", fakeHarnesses.codexACPArgument,
+	}, workerEnvironment)
+
+	claudeFabrica := startMCPStdioSession(
+		t,
+		binaries.orchestraPath,
+		masterBaseURL,
+		bearerToken,
+		"mcp-fabrica-claude",
+		"--host", "fabrica",
+	)
+	codexLab := startMCPStdioSession(
+		t,
+		binaries.orchestraPath,
+		masterBaseURL,
+		bearerToken,
+		"mcp-lab-codex",
+		"--host", "lab",
+		"--name", "codex-peer",
+	)
+
+	var renamedFabrica struct {
+		Mailbox protocol.AgentMailbox `json:"mailbox"`
+	}
+	claudeFabrica.callTool(t, "set_mail_identity", map[string]any{
+		"name": "claude1234",
+	}, &renamedFabrica)
+	require.Equal(t, "claude1234@fabrica", renamedFabrica.Mailbox.Address)
+
+	require.Eventually(t, func() bool {
+		var listed struct {
+			Mailboxes []protocol.AgentMailbox `json:"mailboxes"`
+		}
+		claudeFabrica.callTool(t, "list_mailboxes", map[string]any{"onlineOnly": true}, &listed)
+		foundFabrica := false
+		foundLab := false
+		for _, candidate := range listed.Mailboxes {
+			if candidate.Address == "claude1234@fabrica" {
+				foundFabrica = true
+			}
+			if candidate.Address == "codex-peer@lab" {
+				foundLab = true
+			}
+		}
+		return foundFabrica && foundLab
+	}, 10*time.Second, 100*time.Millisecond)
+
+	claudeFabrica.callTool(t, "send_mail", map[string]any{
+		"idempotencyKey": "fabrica-to-lab-1",
+		"to":             "codex-peer@lab",
+		"subject":        "Sync API contract",
+		"body":           "Please review /v2/orders pagination before release.",
+	}, nil)
+
+	require.Eventually(t, func() bool {
+		for _, frame := range codexLab.notificationsSnapshot() {
+			if frame["method"] != "notifications/claude/channel" {
+				continue
+			}
+			parameters, _ := frame["params"].(map[string]any)
+			metadata, _ := parameters["meta"].(map[string]any)
+			contentText, _ := parameters["content"].(string)
+			if metadata["kind"] == "agent_mail" &&
+				metadata["from"] == "claude1234@fabrica" &&
+				metadata["to"] == "codex-peer@lab" &&
+				strings.Contains(contentText, "Please review /v2/orders pagination") {
+				return true
+			}
+		}
+		return false
+	}, 8*time.Second, 50*time.Millisecond)
+
+	cliEnvironment := append(slices.Clone(workerEnvironment), "ORCHESTRA_ENDPOINT="+masterBaseURL, "ORCHESTRA_TOKEN="+bearerToken)
+	renameOutput, _ := invokeOrchestraCLI(t, binaries.orchestraPath, cliEnvironment, "mail", "rename", "codex-peer@lab", "codex345")
+	require.Contains(t, renameOutput, "codex345@lab")
+
+	require.Eventually(t, func() bool {
+		var inventory struct {
+			Nodes []protocol.NodeDetail `json:"nodes"`
+		}
+		claudeFabrica.callTool(t, "get_execution_inventory", map[string]any{}, &inventory)
+		for _, detail := range inventory.Nodes {
+			if detail.Node.ID == "worker-bunker" && detail.Connected && detail.Synced {
+				return true
+			}
+		}
+		return false
+	}, 12*time.Second, 100*time.Millisecond)
+
+	var createdThread struct {
+		Thread protocol.Thread `json:"thread"`
+	}
+	claudeFabrica.callTool(t, "create_thread", map[string]any{
+		"title": "Agent Mail Resident Wake Verification",
+	}, &createdThread)
+	threadID := createdThread.Thread.ID
+
+	var spawned protocol.InstanceLifecycleResult
+	claudeFabrica.callTool(t, "spawn_instance", map[string]any{
+		"threadId":       threadID,
+		"idempotencyKey": "spawn-bunker-backend",
+		"purpose": map[string]any{
+			"name":    "backend",
+			"summary": "Resident backend specialist on bunker",
+		},
+		"requirements": map[string]any{
+			"harnessIds": []string{"codex-cli"},
+			"transports": []string{"acp-v1"},
+			"workspace": map[string]any{
+				"path":     repositoryBackend,
+				"writable": true,
+			},
+		},
+		"idleTimeoutSeconds": 300,
+	}, &spawned)
+	backendInstanceID := spawned.Instance.ID
+
+	require.Eventually(t, func() bool {
+		var instanceState struct {
+			Instance protocol.AgentInstance `json:"instance"`
+		}
+		claudeFabrica.callTool(t, "get_instance", map[string]any{"instanceId": backendInstanceID}, &instanceState)
+		return instanceState.Instance.Status == "ready" || instanceState.Instance.Status == "idle"
+	}, 10*time.Second, 100*time.Millisecond)
+
+	agentsOutput, _ := invokeOrchestraCLI(t, binaries.orchestraPath, cliEnvironment, "mail", "agents")
+	require.Contains(t, agentsOutput, "backend@bunker")
+	require.Contains(t, agentsOutput, "claude1234@fabrica")
+	require.Contains(t, agentsOutput, "codex345@lab")
+
+	turnOneScript := formatFakeScript(t,
+		map[string]any{
+			"call": "get_mail_identity",
+			"as":   "selfMail",
+		},
+		map[string]any{
+			"call": "update_task",
+			"arguments": map[string]any{
+				"idempotencyKey": "backend-turn-1",
+				"completion": map[string]any{
+					"summary": "Initialized resident mailbox {{selfMail.mailbox.address}}",
+				},
+			},
+		},
+		map[string]any{
+			"message": "backend-turn1 session={{session}} addr={{selfMail.mailbox.address}}",
+		},
+	)
+
+	var initialSubmit struct {
+		Tasks []protocol.Task `json:"tasks"`
+	}
+	claudeFabrica.callTool(t, "submit_tasks", map[string]any{
+		"threadId":       threadID,
+		"idempotencyKey": "backend-initial-task",
+		"tasks": []map[string]any{{
+			"clientTaskId": "init-backend",
+			"title":        "Warm up backend resident session",
+			"instructions": "Warm up resident session\n" + turnOneScript,
+			"instanceId":   backendInstanceID,
+			"requirements": map[string]any{
+				"harnessIds": []string{"codex-cli"},
+				"transports": []string{"acp-v1"},
+				"workspace":  map[string]any{"path": repositoryBackend, "writable": true},
+			},
+		}},
+	}, &initialSubmit)
+	initialTaskID := initialSubmit.Tasks[0].ID
+
+	require.Eventually(t, func() bool {
+		var threadContext struct {
+			Tasks []protocol.Task `json:"tasks"`
+		}
+		claudeFabrica.callTool(t, "get_thread_context", map[string]any{"threadId": threadID}, &threadContext)
+		for _, candidate := range threadContext.Tasks {
+			if candidate.ID == initialTaskID && candidate.Status == "completed" {
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 100*time.Millisecond, "master:\n%s\nworker:\n%s", masterProcess.logs(), workerProcess.logs())
+
+	require.Eventually(t, func() bool {
+		var instanceState struct {
+			Instance protocol.AgentInstance `json:"instance"`
+		}
+		claudeFabrica.callTool(t, "get_instance", map[string]any{"instanceId": backendInstanceID}, &instanceState)
+		return instanceState.Instance.Status == "idle"
+	}, 10*time.Second, 100*time.Millisecond)
+
+	wakeReplyScript := formatFakeScript(t,
+		map[string]any{
+			"call": "get_mail_identity",
+			"as":   "identity",
+		},
+		map[string]any{
+			"call": "send_mail",
+			"arguments": map[string]any{
+				"idempotencyKey": "backend-reply-1",
+				"to":             "claude1234@fabrica",
+				"subject":        "Re: Implement /v2/orders filter",
+				"body":           "Implemented /v2/orders filter on {{identity.mailbox.address}} in session={{session}}",
+			},
+		},
+		map[string]any{
+			"call": "update_task",
+			"arguments": map[string]any{
+				"idempotencyKey": "backend-wake-complete-1",
+				"completion": map[string]any{
+					"summary": "Handled mail request from claude1234@fabrica and sent reply",
+				},
+			},
+		},
+		map[string]any{
+			"message": "backend-wake-turn session={{session}}",
+		},
+	)
+
+	var wakeMailSent struct {
+		Message protocol.MailMessage `json:"message"`
+	}
+	claudeFabrica.callTool(t, "send_mail", map[string]any{
+		"idempotencyKey": "mail-wake-backend-1",
+		"to":             "backend@bunker",
+		"subject":        "Implement /v2/orders filter",
+		"body":           "Please implement status filter on /v2/orders and reply when done.\n" + wakeReplyScript,
+	}, &wakeMailSent)
+	require.True(t, wakeMailSent.Message.WakeDispatched)
+	require.NotEmpty(t, wakeMailSent.Message.WakeTaskID)
+
+	var replyContent string
+	require.Eventually(t, func() bool {
+		for _, frame := range claudeFabrica.notificationsSnapshot() {
+			if frame["method"] != "notifications/claude/channel" {
+				continue
+			}
+			parameters, _ := frame["params"].(map[string]any)
+			metadata, _ := parameters["meta"].(map[string]any)
+			contentText, _ := parameters["content"].(string)
+			if metadata["kind"] == "agent_mail" &&
+				metadata["from"] == "backend@bunker" &&
+				metadata["to"] == "claude1234@fabrica" &&
+				strings.Contains(contentText, "Implemented /v2/orders filter on backend@bunker") {
+				replyContent = contentText
+				return true
+			}
+		}
+		return false
+	}, 20*time.Second, 100*time.Millisecond, "master:\n%s\nworker:\n%s", masterProcess.logs(), workerProcess.logs())
+
+	require.Eventually(t, func() bool {
+		var threadContext struct {
+			Tasks []protocol.Task `json:"tasks"`
+		}
+		claudeFabrica.callTool(t, "get_thread_context", map[string]any{"threadId": threadID}, &threadContext)
+		for _, candidate := range threadContext.Tasks {
+			if candidate.ID == wakeMailSent.Message.WakeTaskID && candidate.Status == "completed" {
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 100*time.Millisecond)
+
+	var detail protocol.ThreadDetailResponse
+	detailOutput, _ := invokeOrchestraCLI(t, binaries.orchestraPath, cliEnvironment, "thread", threadID, "--json")
+	require.NoError(t, json.Unmarshal([]byte(detailOutput), &detail))
+	require.Len(t, detail.Runs, 2)
+	require.NotNil(t, detail.Runs[0].ProviderSessionID)
+	require.NotNil(t, detail.Runs[1].ProviderSessionID)
+	require.Equal(t, *detail.Runs[0].ProviderSessionID, *detail.Runs[1].ProviderSessionID, "mail wake turn must resume resident ACP session")
+	require.Contains(t, replyContent, "session="+*detail.Runs[0].ProviderSessionID)
+}

@@ -180,6 +180,7 @@ func (service *Service) scheduleReadyTasks() {
 			}
 			state.Instances[instanceID] = instance
 			state.Allocations[allocationID] = allocation
+			service.ensureInstanceMailboxInState(state, instance, allocation, nowText)
 			delivery := store.InstanceDelivery{
 				ID:           protocol.NewIdentifier("idlv"),
 				NodeID:       selection.node.ID,
@@ -455,6 +456,7 @@ func (service *Service) assignTaskToResident(
 	instance.Status = "busy"
 	instance.UpdatedAt = nowText
 	state.Instances[instance.ID] = *instance
+	service.syncInstanceMailboxInState(state, instance.ID, nowText)
 
 	task.Status = "running"
 	task.AttemptCount = attempt
