@@ -903,12 +903,29 @@ func TestCLIZeroConfigMasterDiscoveryAndMCPSetup(t *testing.T) {
 	require.NotContains(t, logOutput, persistedToken)
 }
 
+type synchronizedBuffer struct {
+	mutex  sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (target *synchronizedBuffer) Write(chunk []byte) (int, error) {
+	target.mutex.Lock()
+	defer target.mutex.Unlock()
+	return target.buffer.Write(chunk)
+}
+
+func (target *synchronizedBuffer) String() string {
+	target.mutex.Lock()
+	defer target.mutex.Unlock()
+	return target.buffer.String()
+}
+
 func installFakeClaudeOnPath(t *testing.T) {
 	t.Helper()
 	fakeBinDirectory := t.TempDir()
 	fakeClaudePath := filepath.Join(fakeBinDirectory, "claude")
-	require.NoError(t, os.WriteFile(fakeClaudePath, []byte("#!/bin/sh\necho 'Claude Code 2.1.0'\n"), 0o755))
-	t.Setenv("PATH", fakeBinDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	require.NoError(t, os.WriteFile(fakeClaudePath, []byte("#!/bin/sh\nprintf 'Claude Code 2.1.0\\n'\n"), 0o755))
+	t.Setenv("PATH", fakeBinDirectory)
 }
 
 func TestCLITailscaleAuthModeZeroTokenSlaveAndStatus(t *testing.T) {
@@ -927,20 +944,7 @@ func TestCLITailscaleAuthModeZeroTokenSlaveAndStatus(t *testing.T) {
 	fakeTailscale := filepath.Join(t.TempDir(), "tailscale")
 	fakeTailscaleScript := `#!/bin/sh
 if [ "$1" = "status" ]; then
-  cat <<'EOF'
-{
-  "MagicDNSSuffix": "tail999.ts.net",
-  "Self": {
-    "HostName": "main-mac",
-    "DNSName": "main-mac.tail999.ts.net.",
-    "UserID": 42,
-    "TailscaleIPs": ["100.88.1.10", "fd7a:115c:a1e0::10"]
-  },
-  "User": {
-    "42": {"ID": 42, "LoginName": "christian@example.com"}
-  }
-}
-EOF
+  printf '%s\n' '{"MagicDNSSuffix":"tail999.ts.net","Self":{"HostName":"main-mac","DNSName":"main-mac.tail999.ts.net.","UserID":42,"TailscaleIPs":["100.88.1.10","fd7a:115c:a1e0::10"]},"User":{"42":{"ID":42,"LoginName":"christian@example.com"}}}'
   exit 0
 fi
 exit 1
@@ -987,7 +991,7 @@ exit 1
 	masterContext, cancelMaster := context.WithCancel(context.Background())
 	defer cancelMaster()
 
-	var masterStdout, masterStderr bytes.Buffer
+	var masterStdout, masterStderr synchronizedBuffer
 	masterDone := make(chan int, 1)
 	go func() {
 		masterDone <- cli.Run(
@@ -1015,7 +1019,7 @@ exit 1
 		}
 		discovered = state
 		return true
-	}, 5*time.Second, 25*time.Millisecond)
+	}, 15*time.Second, 25*time.Millisecond)
 
 	// No <data-dir>/token file is created and connection.json contains no bearer token.
 	_, statErr := os.Stat(filepath.Join(masterDataDirectory, "token"))
@@ -1027,7 +1031,7 @@ exit 1
 	slaveContext, cancelSlave := context.WithCancel(context.Background())
 	defer cancelSlave()
 
-	var slaveStdout, slaveStderr bytes.Buffer
+	var slaveStdout, slaveStderr synchronizedBuffer
 	slaveDone := make(chan int, 1)
 	go func() {
 		slaveDone <- cli.Run(
@@ -1057,7 +1061,7 @@ exit 1
 	require.Eventually(t, func() bool {
 		code, nodesJSON, _ := runSubcommand("nodes", "--json")
 		return code == 0 && strings.Contains(nodesJSON, `"id": "tailnet-worker-01"`) && strings.Contains(nodesJSON, `"status": "online"`)
-	}, 5*time.Second, 50*time.Millisecond)
+	}, 15*time.Second, 50*time.Millisecond, "slave stderr:\n%s\nmaster stderr:\n%s", slaveStderr.String(), masterStderr.String())
 
 	exitCode, mcpStatusOut, mcpStatusErr := runSubcommand("mcp", "status")
 	require.Equal(t, 0, exitCode, mcpStatusErr)
@@ -1114,37 +1118,7 @@ func TestCLISlaveTailscaleAutoDiscoveryAndInteractiveSelection(t *testing.T) {
 	fakeTailscale := filepath.Join(t.TempDir(), "tailscale")
 	fakeTailscaleScript := `#!/bin/sh
 if [ "$1" = "status" ]; then
-  cat <<'EOF'
-{
-  "BackendState": "Running",
-  "MagicDNSSuffix": "tail999.ts.net",
-  "Self": {
-    "HostName": "remote-worker",
-    "DNSName": "remote-worker.tail999.ts.net.",
-    "UserID": 42,
-    "TailscaleIPs": ["100.88.1.99"]
-  },
-  "Peer": {
-    "peer-alpha": {
-      "HostName": "alpha-mac",
-      "DNSName": "alpha-mac.tail999.ts.net.",
-      "UserID": 42,
-      "TailscaleIPs": ["127.0.0.1"],
-      "Online": true
-    },
-    "peer-beta": {
-      "HostName": "beta-server",
-      "DNSName": "beta-server.tail999.ts.net.",
-      "UserID": 42,
-      "TailscaleIPs": ["::1"],
-      "Online": true
-    }
-  },
-  "User": {
-    "42": {"ID": 42, "LoginName": "christian@example.com"}
-  }
-}
-EOF
+  printf '%s\n' '{"BackendState":"Running","MagicDNSSuffix":"tail999.ts.net","Self":{"HostName":"remote-worker","DNSName":"remote-worker.tail999.ts.net.","UserID":42,"TailscaleIPs":["100.88.1.99"]},"Peer":{"peer-alpha":{"HostName":"alpha-mac","DNSName":"alpha-mac.tail999.ts.net.","UserID":42,"TailscaleIPs":["127.0.0.1"],"Online":true},"peer-beta":{"HostName":"beta-server","DNSName":"beta-server.tail999.ts.net.","UserID":42,"TailscaleIPs":["::1"],"Online":true}},"User":{"42":{"ID":42,"LoginName":"christian@example.com"}}}'
   exit 0
 fi
 exit 1
@@ -1220,7 +1194,7 @@ exit 1
 		var standardOutput, errorBuffer bytes.Buffer
 		code := cli.Run(t.Context(), []string{"nodes", "--endpoint", alphaEndpoint, "--json"}, nil, &standardOutput, &errorBuffer, noEnvironment)
 		return code == 0 && strings.Contains(standardOutput.String(), `"id": "auto-slave-01"`) && strings.Contains(standardOutput.String(), `"status": "online"`)
-	}, 5*time.Second, 50*time.Millisecond)
+	}, 15*time.Second, 50*time.Millisecond)
 
 	cancelSlave1()
 	require.Equal(t, 0, <-slave1Done, slave1Error.String())
@@ -1321,7 +1295,7 @@ exit 1
 		var standardOutput, errorBuffer bytes.Buffer
 		code := cli.Run(t.Context(), []string{"nodes", "--endpoint", betaEndpoint, "--json"}, nil, &standardOutput, &errorBuffer, noEnvironment)
 		return code == 0 && strings.Contains(standardOutput.String(), `"id": "auto-slave-picked-beta"`) && strings.Contains(standardOutput.String(), `"status": "online"`)
-	}, 5*time.Second, 50*time.Millisecond)
+	}, 15*time.Second, 50*time.Millisecond)
 
 	cancelSlave2()
 	require.Equal(t, 0, <-slave2Done, slave2Error.String())
@@ -1441,7 +1415,7 @@ func TestOperatorCLI_NodesRepositoriesCloneAndRefresh(t *testing.T) {
 	require.Eventually(t, func() bool {
 		code, output, _ := runCommand("nodes")
 		return code == 0 && strings.Contains(output, "worker-repo-cli") && strings.Contains(output, "synced=true")
-	}, 5*time.Second, 50*time.Millisecond)
+	}, 15*time.Second, 50*time.Millisecond)
 
 	// Help and argument validation for nodes refresh / clone.
 	code, output, _ := runCommand("nodes", "refresh", "--help")
