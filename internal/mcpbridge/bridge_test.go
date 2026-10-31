@@ -254,12 +254,26 @@ func TestStdioBridgeAgentMailIdentityRenameAndLiveChannelPush(t *testing.T) {
 	var claudeNotifications []map[string]any
 	sendRPC(claudeClient, map[string]any{
 		"jsonrpc": "2.0",
+		"id":      "discover-1",
+		"method":  "server/discover",
+		"params": map[string]any{
+			"_meta": map[string]any{
+				"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+				"io.modelcontextprotocol/clientInfo": map[string]string{
+					"name":    "claude-code",
+					"version": "2.1.314",
+				},
+			},
+		},
+	})
+	sendRPC(claudeClient, map[string]any{
+		"jsonrpc": "2.0",
 		"id":      1,
 		"method":  "initialize",
 		"params": map[string]any{
 			"protocolVersion": "2025-06-18",
 			"capabilities":    map[string]any{},
-			"clientInfo":      map[string]string{"name": "claude-code", "version": "1.0.0"},
+			"clientInfo":      map[string]string{"name": "", "version": "1.0.0"},
 		},
 	})
 	_ = readByID(claudeClient, 1, &claudeNotifications)
