@@ -264,7 +264,7 @@ func (service *Service) findReusableResident(
 		}
 
 		node, nodeExists := state.Nodes[allocation.NodeID]
-		if !nodeExists || !service.isNodeLiveAndSynced(node.ID) {
+		if !nodeExists || !service.isNodeLiveAndSynced(node.ID) || isNodeUpdatingInState(state, node.ID) {
 			continue
 		}
 		activeRuns := countActiveRunsOnNode(state, node.ID)
@@ -548,6 +548,15 @@ func (service *Service) selectOfferingForRequirements(
 				Requirement: "online-and-synced",
 				NodeID:      nodeID,
 				Detail:      fmt.Sprintf("node %s is offline or still synchronizing", nodeID),
+			})
+			continue
+		}
+		if update, updating := activeNodeUpdateInState(state, nodeID); updating {
+			diagnostic.Unsatisfied = append(diagnostic.Unsatisfied, protocol.UnsatisfiedRequirement{
+				Kind:        "node-updating",
+				Requirement: "not-updating",
+				NodeID:      nodeID,
+				Detail:      fmt.Sprintf("node %s is updating to %s", nodeID, update.TargetVersion),
 			})
 			continue
 		}

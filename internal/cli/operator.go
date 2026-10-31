@@ -97,6 +97,26 @@ func (connection operatorConnectionFlags) requestJSON(
 	requestBody any,
 	destination any,
 ) error {
+	return connection.requestJSONWithTimeout(
+		operationContext,
+		method,
+		apiPath,
+		query,
+		requestBody,
+		destination,
+		operatorRequestTimeout,
+	)
+}
+
+func (connection operatorConnectionFlags) requestJSONWithTimeout(
+	operationContext context.Context,
+	method string,
+	apiPath string,
+	query url.Values,
+	requestBody any,
+	destination any,
+	timeout time.Duration,
+) error {
 	baseURL, err := resolveHTTPBaseURL(*connection.endpoint)
 	if err != nil {
 		return err
@@ -115,7 +135,7 @@ func (connection operatorConnectionFlags) requestJSON(
 		bodyReader = bytes.NewReader(encodedBytes)
 	}
 
-	httpClient, err := protocol.BuildHTTPClient(*connection.tlsCACert, *connection.tlsInsecure, operatorRequestTimeout)
+	httpClient, err := protocol.BuildHTTPClient(*connection.tlsCACert, *connection.tlsInsecure, timeout)
 	if err != nil {
 		return err
 	}
@@ -260,6 +280,9 @@ func runNodes(
 	standardError io.Writer,
 	lookupEnvironment func(string) (string, bool),
 ) int {
+	if len(arguments) > 0 && arguments[0] == "update" {
+		return runNodesUpdate(operationContext, arguments[1:], standardOutput, standardError, lookupEnvironment)
+	}
 	flagSet := flag.NewFlagSet("orchestra nodes", flag.ContinueOnError)
 	flagSet.SetOutput(standardError)
 	connection := registerOperatorFlags(flagSet, lookupEnvironment)
@@ -304,10 +327,11 @@ func runNodes(
 		}
 		fmt.Fprintf(
 			standardOutput,
-			"%s (%s) — status=%s connected=%t synced=%t kind=%s platform=%s runs=%d/%d instances=%s\n",
+			"%s (%s) — status=%s version=%s connected=%t synced=%t kind=%s platform=%s runs=%d/%d instances=%s\n",
 			node.ID,
 			node.Name,
 			node.Status,
+			defaultIfEmpty(node.Version, "unknown"),
 			detail.Connected,
 			detail.Synced,
 			node.Kind,
@@ -316,6 +340,20 @@ func runNodes(
 			node.Concurrency,
 			instanceUsage,
 		)
+		if detail.UpdateStatus != nil {
+			updateNote := detail.UpdateStatus.Message
+			if detail.UpdateStatus.Error != "" {
+				updateNote = detail.UpdateStatus.Error
+			}
+			fmt.Fprintf(
+				standardOutput,
+				"  Update:          %s (target=%s, previous=%s, detail=%s)\n",
+				detail.UpdateStatus.Status,
+				detail.UpdateStatus.TargetVersion,
+				defaultIfEmpty(detail.UpdateStatus.PreviousVersion, "unknown"),
+				defaultIfEmpty(updateNote, "-"),
+			)
+		}
 		fmt.Fprintf(standardOutput, "  Workspace Roots: %s\n", defaultIfEmpty(strings.Join(node.WorkspaceRoots, ", "), "none"))
 		for _, harnessProfile := range node.Harnesses {
 			if !harnessProfile.Available {

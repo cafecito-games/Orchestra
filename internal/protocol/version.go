@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -136,6 +137,95 @@ func normalizeBuildVersion(rawValue string) string {
 		return trimmed[1:]
 	}
 	return trimmed
+}
+
+// NormalizeReleaseTarget normalizes a requested update version ("", "latest",
+// "v1.2.3", or "1.2.3") into either "latest" or a tagless release version.
+func NormalizeReleaseTarget(rawValue string) (string, error) {
+	trimmed := strings.TrimSpace(rawValue)
+	if trimmed == "" || strings.EqualFold(trimmed, "latest") {
+		return "latest", nil
+	}
+	normalized := normalizeBuildVersion(trimmed)
+	if !IsSafeReleaseVersion(normalized) {
+		return "", errors.New("release version must be 'latest' or a semantic version such as 0.2.0")
+	}
+	return normalized, nil
+}
+
+// IsSafeReleaseVersion reports whether value is a safe, normalized release version
+// suitable for URL segments and filesystem cache directories.
+func IsSafeReleaseVersion(value string) bool {
+	if value == "" || value == "." || value == ".." || len(value) > 64 || strings.EqualFold(value, "latest") || value == "dev" {
+		return false
+	}
+	if value[0] < '0' || value[0] > '9' {
+		return false
+	}
+	for _, character := range value {
+		isDigit := character >= '0' && character <= '9'
+		isLower := character >= 'a' && character <= 'z'
+		isUpper := character >= 'A' && character <= 'Z'
+		if !isDigit && !isLower && !isUpper && character != '.' && character != '-' && character != '+' {
+			return false
+		}
+	}
+	return !strings.Contains(value, "..")
+}
+
+// CompareSemanticVersions compares two normalized or v-prefixed semantic versions.
+// It returns (-1, true) if left < right, (0, true) if equal, (1, true) if left > right,
+// or (0, false) if either version is not a valid MAJOR.MINOR.PATCH semantic version.
+func CompareSemanticVersions(leftRaw string, rightRaw string) (int, bool) {
+	leftMajor, leftMinor, leftPatch, leftPrerelease, leftValid := parseSemanticVersion(leftRaw)
+	rightMajor, rightMinor, rightPatch, rightPrerelease, rightValid := parseSemanticVersion(rightRaw)
+	if !leftValid || !rightValid {
+		return 0, false
+	}
+	if compared := cmp.Compare(leftMajor, rightMajor); compared != 0 {
+		return compared, true
+	}
+	if compared := cmp.Compare(leftMinor, rightMinor); compared != 0 {
+		return compared, true
+	}
+	if compared := cmp.Compare(leftPatch, rightPatch); compared != 0 {
+		return compared, true
+	}
+	switch {
+	case leftPrerelease == "" && rightPrerelease == "":
+		return 0, true
+	case leftPrerelease == "":
+		return 1, true
+	case rightPrerelease == "":
+		return -1, true
+	default:
+		return cmp.Compare(leftPrerelease, rightPrerelease), true
+	}
+}
+
+func parseSemanticVersion(rawValue string) (int, int, int, string, bool) {
+	normalized := normalizeBuildVersion(rawValue)
+	withoutBuild, _, _ := strings.Cut(normalized, "+")
+	corePart, prerelease, hasPrerelease := strings.Cut(withoutBuild, "-")
+	if hasPrerelease && prerelease == "" {
+		return 0, 0, 0, "", false
+	}
+	segments := strings.Split(corePart, ".")
+	if len(segments) != 3 {
+		return 0, 0, 0, "", false
+	}
+	var numbers [3]int
+	for index, segment := range segments {
+		if segment == "" || (len(segment) > 1 && segment[0] == '0') {
+			return 0, 0, 0, "", false
+		}
+		parsed, err := strconv.Atoi(segment)
+		if err != nil || parsed < 0 {
+			return 0, 0, 0, "", false
+		}
+		numbers[index] = parsed
+	}
+	return numbers[0], numbers[1], numbers[2], prerelease, true
 }
 
 func normalizeTreeState(rawValue string) string {

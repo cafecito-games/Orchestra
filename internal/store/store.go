@@ -30,6 +30,7 @@ var (
 
 const (
 	collectionNodes               = "nodes"
+	collectionNodeUpdates         = "node_updates"
 	collectionCapabilityReports   = "capability_reports"
 	collectionComponentReports    = "component_reports"
 	collectionProjectProfiles     = "project_profiles"
@@ -768,6 +769,9 @@ func serializeCollections(state *State) (map[string]map[string]string, error) {
 	if result[collectionNodes], err = serializeMap(state.Nodes); err != nil {
 		return nil, err
 	}
+	if result[collectionNodeUpdates], err = serializeMap(state.NodeUpdates); err != nil {
+		return nil, err
+	}
 	if result[collectionCapabilityReports], err = serializeMap(state.CapabilityReports); err != nil {
 		return nil, err
 	}
@@ -868,6 +872,8 @@ func decodeRecordIntoState(state *State, collection, recordID string, data []byt
 	switch collection {
 	case collectionNodes:
 		return decodeInto(state.Nodes, recordID, data)
+	case collectionNodeUpdates:
+		return decodeInto(state.NodeUpdates, recordID, data)
 	case collectionCapabilityReports:
 		return decodeInto(state.CapabilityReports, recordID, data)
 	case collectionComponentReports:

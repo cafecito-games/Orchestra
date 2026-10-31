@@ -29,39 +29,52 @@ const (
 )
 
 type ClientOptions struct {
-	Endpoint          string
-	Token             string
-	Node              protocol.ComputeNode
-	Runner            *harness.Runner
-	WorkspaceManager  *workspace.Manager
-	CapabilityReport  *protocol.NodeCapabilityReport
-	ComponentReport   *protocol.ComponentInventoryReport
-	HTTPClient        *http.Client
-	ReconnectMinDelay time.Duration
-	ReconnectMaxDelay time.Duration
-	Logger            func(string)
-	Now               func() time.Time
+	Endpoint           string
+	Token              string
+	Node               protocol.ComputeNode
+	Runner             *harness.Runner
+	WorkspaceManager   *workspace.Manager
+	CapabilityReport   *protocol.NodeCapabilityReport
+	ComponentReport    *protocol.ComponentInventoryReport
+	HTTPClient         *http.Client
+	DataRoot           string
+	ExecutablePath     string
+	DisableSelfUpdate  bool
+	ExecReplacement    func(executablePath string, arguments []string, environment []string) error
+	ProcessArguments   []string
+	ProcessEnvironment []string
+	ReconnectMinDelay  time.Duration
+	ReconnectMaxDelay  time.Duration
+	Logger             func(string)
+	Now                func() time.Time
 }
 
 type Client struct {
-	endpoint          string
-	token             string
-	node              protocol.ComputeNode
-	runner            *harness.Runner
-	capabilityReport  *protocol.NodeCapabilityReport
-	componentReport   *protocol.ComponentInventoryReport
-	httpClient        *http.Client
-	reconnectMinDelay time.Duration
-	reconnectMaxDelay time.Duration
-	loggerMutex       sync.RWMutex
-	logger            func(string)
-	now               func() time.Time
+	endpoint           string
+	token              string
+	node               protocol.ComputeNode
+	runner             *harness.Runner
+	capabilityReport   *protocol.NodeCapabilityReport
+	componentReport    *protocol.ComponentInventoryReport
+	httpClient         *http.Client
+	dataRoot           string
+	executablePath     string
+	disableSelfUpdate  bool
+	execReplacement    func(executablePath string, arguments []string, environment []string) error
+	processArguments   []string
+	processEnvironment []string
+	reconnectMinDelay  time.Duration
+	reconnectMaxDelay  time.Duration
+	loggerMutex        sync.RWMutex
+	logger             func(string)
+	now                func() time.Time
 
 	mcpServer *mcpserver.Server
 	leases    *leaseCoordinator
 
-	rootContext context.Context
-	waitGroup   sync.WaitGroup
+	rootContext   context.Context
+	cancelRunLoop context.CancelFunc
+	waitGroup     sync.WaitGroup
 
 	writeMutex sync.Mutex
 	connection *websocket.Conn
@@ -69,12 +82,19 @@ type Client struct {
 
 	mutex               sync.Mutex
 	sessions            map[string]*runSession
+	inFlightSessions    int
+	sessionSettled      chan struct{}
 	completedRuns       map[string]bool
 	completedOrder      []string
 	instances           map[string]*residentInstance
 	releasedAllocations map[string]bool
 	releasedOrder       []string
 	outbox              []protocol.SlaveControlMessage
+	restartingForUpdate bool
+	pendingExecPath     string
+
+	updateMutex    sync.Mutex
+	activeUpdateID string
 
 	rpcSequence atomic.Int64
 	rpcMutex    sync.Mutex
@@ -97,6 +117,7 @@ func NewClient(options ClientOptions) *Client {
 	if options.Node.Concurrency <= 0 {
 		options.Node.Concurrency = DefaultConcurrency
 	}
+	options.Node.SelfUpdateDisabled = options.Node.SelfUpdateDisabled || options.DisableSelfUpdate
 	client := &Client{
 		endpoint:            strings.TrimSpace(options.Endpoint),
 		token:               options.Token,
@@ -105,12 +126,19 @@ func NewClient(options ClientOptions) *Client {
 		capabilityReport:    options.CapabilityReport,
 		componentReport:     options.ComponentReport,
 		httpClient:          options.HTTPClient,
+		dataRoot:            strings.TrimSpace(options.DataRoot),
+		executablePath:      strings.TrimSpace(options.ExecutablePath),
+		disableSelfUpdate:   options.DisableSelfUpdate || options.Node.SelfUpdateDisabled,
+		execReplacement:     options.ExecReplacement,
+		processArguments:    slices.Clone(options.ProcessArguments),
+		processEnvironment:  slices.Clone(options.ProcessEnvironment),
 		reconnectMinDelay:   minimumDelay,
 		reconnectMaxDelay:   maximumDelay,
 		logger:              options.Logger,
 		now:                 nowFunction,
 		rootContext:         context.Background(),
 		sessions:            map[string]*runSession{},
+		sessionSettled:      make(chan struct{}),
 		completedRuns:       map[string]bool{},
 		instances:           map[string]*residentInstance{},
 		releasedAllocations: map[string]bool{},
@@ -118,6 +146,7 @@ func NewClient(options ClientOptions) *Client {
 	}
 	client.leases = newLeaseCoordinator(client, options.WorkspaceManager)
 	client.mcpServer = mcpserver.New(client.callHubRPC, client.uploadArtifactContent)
+	client.restoreUpdateHandoff()
 	return client
 }
 
@@ -138,27 +167,38 @@ func (client *Client) logf(format string, arguments ...any) {
 }
 
 func (client *Client) Run(operationContext context.Context) error {
+	runLoopContext, cancelRunLoop := context.WithCancel(operationContext)
+	defer cancelRunLoop()
+
 	client.mutex.Lock()
-	client.rootContext = operationContext
+	client.rootContext = runLoopContext
+	client.cancelRunLoop = cancelRunLoop
+	client.restartingForUpdate = false
+	client.pendingExecPath = ""
 	client.mutex.Unlock()
 
-	if err := client.mcpServer.Start(operationContext); err != nil {
+	if err := client.mcpServer.Start(runLoopContext); err != nil {
 		return err
+	}
+
+	finishRunLoop := func() error {
+		client.shutdownSessions()
+		client.waitGroup.Wait()
+		if execPath := client.takePendingExecPath(); execPath != "" && operationContext.Err() == nil {
+			return client.invokeExecReplacement(execPath)
+		}
+		return nil
 	}
 
 	delay := client.reconnectMinDelay
 	for {
-		if operationContext.Err() != nil {
-			client.shutdownSessions()
-			client.waitGroup.Wait()
-			return nil
+		if runLoopContext.Err() != nil {
+			return finishRunLoop()
 		}
 
-		admittedOnce, connectionErr := client.runConnection(operationContext)
-		if operationContext.Err() != nil {
-			client.shutdownSessions()
-			client.waitGroup.Wait()
-			return nil
+		admittedOnce, connectionErr := client.runConnection(runLoopContext)
+		if runLoopContext.Err() != nil {
+			return finishRunLoop()
 		}
 		if connectionErr != nil {
 			client.logf("control connection closed (node=%s): %v", client.node.ID, connectionErr)
@@ -169,11 +209,9 @@ func (client *Client) Run(operationContext context.Context) error {
 
 		timer := time.NewTimer(delay)
 		select {
-		case <-operationContext.Done():
+		case <-runLoopContext.Done():
 			timer.Stop()
-			client.shutdownSessions()
-			client.waitGroup.Wait()
-			return nil
+			return finishRunLoop()
 		case <-timer.C:
 		}
 		delay = min(delay*2, client.reconnectMaxDelay)
@@ -397,6 +435,13 @@ func (client *Client) dispatchMasterMessage(message protocol.MasterControlMessag
 		}
 	case "hub.rpc.response":
 		client.handleHubRPCResponse(message)
+	case "node.update":
+		if message.NodeUpdate != nil {
+			directiveCopy := *message.NodeUpdate
+			client.waitGroup.Go(func() {
+				client.handleNodeUpdate(directiveCopy)
+			})
+		}
 	}
 }
 

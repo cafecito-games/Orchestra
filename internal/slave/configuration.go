@@ -54,6 +54,7 @@ type Configuration struct {
 	ACPAdapters          []acpadapter.Override
 	ACPNativeFallback    []string
 	RequireACP           bool
+	DisableSelfUpdate    bool
 	ClaudeACPAuthMode    string
 	ApprovalPolicies     harness.ApprovalPolicies
 	BuiltInACPExecutable string
@@ -129,6 +130,14 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 		}
 		defaultRequireACP = parsedRequireACP
 	}
+	defaultDisableSelfUpdate := false
+	if rawDisableSelfUpdate := firstEnvironment(lookupEnvironment, "ORCHESTRA_DISABLE_SELF_UPDATE"); rawDisableSelfUpdate != "" {
+		parsedDisableUpdate, err := parseStrictBool(rawDisableSelfUpdate)
+		if err != nil {
+			return Configuration{}, fmt.Errorf("invalid ORCHESTRA_DISABLE_SELF_UPDATE %q: %w", rawDisableSelfUpdate, err)
+		}
+		defaultDisableSelfUpdate = parsedDisableUpdate
+	}
 
 	defaultConcurrency := DefaultConcurrency
 	if raw := firstEnvironment(lookupEnvironment, "ORCHESTRA_CONCURRENCY"); raw != "" {
@@ -192,6 +201,7 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	flagSet.Var(&acpAdapterFlag, "acp-adapter", "Pinned ACP adapter override harness=sha256:digest:/abs/path (repeatable)")
 	flagSet.Var(&acpFallbackFlag, "acp-native-fallback", "Harness ID allowed to fall back from acp-v1 to native-cli (repeatable)")
 	flagSet.BoolVar(&configuration.RequireACP, "require-acp", defaultRequireACP, "Require verified acp-v1 readiness and disable native-cli advertisement")
+	flagSet.BoolVar(&configuration.DisableSelfUpdate, "disable-self-update", defaultDisableSelfUpdate, "Disable master-triggered remote self-updates")
 	flagSet.Var(&approvalPolicyFlag, "approval-policy", "Harness approval policy manual|auto|bypass or harness=policy (repeatable)")
 
 	if err := flagSet.Parse(arguments); err != nil {
@@ -458,19 +468,20 @@ func BuildRuntime(operationContext context.Context, configuration Configuration)
 	activeInstances := 0
 	instanceCapacity := configuration.InstanceCapacity
 	node := protocol.ComputeNode{
-		ID:               configuration.NodeID,
-		Name:             configuration.Name,
-		Kind:             configuration.Kind,
-		Platform:         platform,
-		Status:           "online",
-		LastSeen:         observedAt,
-		ActiveRuns:       0,
-		Concurrency:      configuration.Concurrency,
-		InstanceCapacity: &instanceCapacity,
-		ActiveInstances:  &activeInstances,
-		WorkspaceRoots:   slices.Clone(configuration.WorkspaceRoots),
-		Version:          configuration.Version,
-		Harnesses:        advertisedProfiles,
+		ID:                 configuration.NodeID,
+		Name:               configuration.Name,
+		Kind:               configuration.Kind,
+		Platform:           platform,
+		Status:             "online",
+		LastSeen:           observedAt,
+		ActiveRuns:         0,
+		Concurrency:        configuration.Concurrency,
+		InstanceCapacity:   &instanceCapacity,
+		ActiveInstances:    &activeInstances,
+		WorkspaceRoots:     slices.Clone(configuration.WorkspaceRoots),
+		Version:            configuration.Version,
+		SelfUpdateDisabled: configuration.DisableSelfUpdate,
+		Harnesses:          advertisedProfiles,
 	}
 
 	capabilityReport := readiness.BuildCapabilityReport(operationContext, readiness.NodeSettings{
@@ -496,14 +507,16 @@ func BuildRuntime(operationContext context.Context, configuration Configuration)
 	componentReport := setup.ComponentInventoryReport(configuration.NodeID, observedAt, assessments)
 
 	client := NewClient(ClientOptions{
-		Endpoint:         configuration.ControlEndpoint,
-		Token:            configuration.Token,
-		Node:             node,
-		Runner:           runner,
-		WorkspaceManager: workspaceManager,
-		CapabilityReport: &capabilityReport,
-		ComponentReport:  &componentReport,
-		HTTPClient:       configuration.HTTPClient,
+		Endpoint:          configuration.ControlEndpoint,
+		Token:             configuration.Token,
+		Node:              node,
+		Runner:            runner,
+		WorkspaceManager:  workspaceManager,
+		CapabilityReport:  &capabilityReport,
+		ComponentReport:   &componentReport,
+		HTTPClient:        configuration.HTTPClient,
+		DataRoot:          configuration.DataRoot,
+		DisableSelfUpdate: configuration.DisableSelfUpdate,
 	})
 
 	return &Runtime{

@@ -1,18 +1,22 @@
 package cli_test
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,10 +24,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cafecito-games/Orchestra/internal/cli"
+	"github.com/cafecito-games/Orchestra/internal/harness"
 	"github.com/cafecito-games/Orchestra/internal/orchestrator"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
+	"github.com/cafecito-games/Orchestra/internal/selfupdate"
 	"github.com/cafecito-games/Orchestra/internal/slave"
 	"github.com/cafecito-games/Orchestra/internal/store"
+	"github.com/cafecito-games/Orchestra/internal/workspace"
 )
 
 func TestCLIVersionAndHelp(t *testing.T) {
@@ -579,4 +586,198 @@ func TestCLIMasterStartAndShutdown(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		require.Fail(t, "timed out waiting for orchestra master to shut down")
 	}
+}
+
+func TestCLIUpdateAndNodesUpdate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell script fixture")
+	}
+
+	platform := runtime.GOOS + "-" + runtime.GOARCH
+	archiveName := fmt.Sprintf("orchestra_9.9.9_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+	newScript := fmt.Appendf(nil, "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\n  echo '{\"version\":\"9.9.9\",\"protocolVersion\":%q}'\n  exit 0\nfi\nexit 0\n", protocol.ProtocolVersion)
+
+	var tarBuffer bytes.Buffer
+	gzipWriter := gzip.NewWriter(&tarBuffer)
+	tarWriter := tar.NewWriter(gzipWriter)
+	require.NoError(t, tarWriter.WriteHeader(&tar.Header{
+		Name:     "orchestra",
+		Mode:     0o755,
+		Size:     int64(len(newScript)),
+		Typeflag: tar.TypeReg,
+	}))
+	_, err := tarWriter.Write(newScript)
+	require.NoError(t, err)
+	require.NoError(t, tarWriter.Close())
+	require.NoError(t, gzipWriter.Close())
+
+	archiveBytes := tarBuffer.Bytes()
+	archiveDigest := sha256.Sum256(archiveBytes)
+	checksumContent := fmt.Sprintf("%s  %s\n", hex.EncodeToString(archiveDigest[:]), archiveName)
+
+	var releaseServer *httptest.Server
+	releaseMux := http.NewServeMux()
+	writeRelease := func(writer http.ResponseWriter) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(map[string]any{
+			"tag_name":     "v9.9.9",
+			"published_at": "2026-10-31T12:00:00Z",
+			"assets": []map[string]any{
+				{
+					"name":                 "checksums.txt",
+					"url":                  releaseServer.URL + "/assets/checksums.txt",
+					"browser_download_url": releaseServer.URL + "/assets/checksums.txt",
+					"size":                 len(checksumContent),
+				},
+				{
+					"name":                 archiveName,
+					"url":                  releaseServer.URL + "/assets/" + archiveName,
+					"browser_download_url": releaseServer.URL + "/assets/" + archiveName,
+					"size":                 len(archiveBytes),
+				},
+			},
+		})
+	}
+	releaseMux.HandleFunc("/repos/cafecito-games/Orchestra/releases/latest", func(writer http.ResponseWriter, request *http.Request) {
+		writeRelease(writer)
+	})
+	releaseMux.HandleFunc("/repos/cafecito-games/Orchestra/releases/tags/v9.9.9", func(writer http.ResponseWriter, request *http.Request) {
+		writeRelease(writer)
+	})
+	releaseMux.HandleFunc("/assets/checksums.txt", func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = writer.Write([]byte(checksumContent))
+	})
+	releaseMux.HandleFunc("/assets/"+archiveName, func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = writer.Write(archiveBytes)
+	})
+	releaseServer = httptest.NewServer(releaseMux)
+	defer releaseServer.Close()
+
+	releaseClient, err := selfupdate.NewReleaseClient(selfupdate.ReleaseClientOptions{
+		APIBaseURL:        releaseServer.URL,
+		Repository:        "cafecito-games/Orchestra",
+		DisableGHFallback: true,
+	})
+	require.NoError(t, err)
+
+	openedStore, err := store.Open(filepath.Join(t.TempDir(), "master-state"))
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	const bearerToken = "cli-update-token"
+	service, err := orchestrator.NewService(orchestrator.ServiceOptions{
+		Store:         openedStore,
+		Token:         bearerToken,
+		ReleaseClient: releaseClient,
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	masterServer := httptest.NewServer(service.Handler())
+	defer masterServer.Close()
+
+	canonicalRoots, err := slave.CanonicalizeWorkspaceRoots([]string{t.TempDir()})
+	require.NoError(t, err)
+	workerBinaryPath := filepath.Join(t.TempDir(), "worker-orchestra")
+	require.NoError(t, os.WriteFile(workerBinaryPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	var reconnectOnce sync.Once
+	replacementContext, cancelReplacement := context.WithCancel(t.Context())
+	defer cancelReplacement()
+
+	newWorker := func(version string, onExec func(string, []string, []string) error) *slave.Client {
+		return slave.NewClient(slave.ClientOptions{
+			Endpoint:       masterServer.URL,
+			Token:          bearerToken,
+			ExecutablePath: workerBinaryPath,
+			Node: protocol.ComputeNode{
+				ID:             "worker-cli-upd",
+				Name:           "Worker CLI Update",
+				Kind:           "local",
+				Platform:       platform,
+				Status:         "online",
+				LastSeen:       protocol.NowTimestamp(),
+				Concurrency:    1,
+				WorkspaceRoots: canonicalRoots,
+				Version:        version,
+			},
+			Runner:           harness.NewRunner(nil),
+			WorkspaceManager: workspace.NewManager(canonicalRoots, nil),
+			ExecReplacement:  onExec,
+		})
+	}
+
+	workerV1 := newWorker("0.1.0", func(string, []string, []string) error {
+		reconnectOnce.Do(func() {
+			workerV2 := newWorker("9.9.9", nil)
+			go func() {
+				_ = workerV2.Run(replacementContext)
+			}()
+		})
+		return nil
+	})
+	go func() {
+		_ = workerV1.Run(t.Context())
+	}()
+
+	require.Eventually(t, func() bool {
+		details, listErr := service.ListNodeDetails()
+		return listErr == nil && len(details) == 1 && details[0].Synced
+	}, 5*time.Second, 25*time.Millisecond)
+
+	environment := map[string]string{
+		"ORCHESTRA_ENDPOINT":        masterServer.URL,
+		"ORCHESTRA_TOKEN":           bearerToken,
+		"ORCHESTRA_RELEASE_API_URL": releaseServer.URL,
+		"ORCHESTRA_RELEASE_REPO":    "cafecito-games/Orchestra",
+	}
+	lookupEnvironment := func(name string) (string, bool) {
+		value, exists := environment[name]
+		return value, exists
+	}
+	runCLI := func(arguments ...string) (int, string, string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		exitCode := cli.Run(t.Context(), arguments, nil, &stdout, &stderr, lookupEnvironment)
+		return exitCode, stdout.String(), stderr.String()
+	}
+
+	code, stdout, stderr := runCLI("update", "--help")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "orchestra update")
+
+	code, stdout, stderr = runCLI("nodes", "update", "--help")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "orchestra nodes update")
+
+	localExecutable := filepath.Join(t.TempDir(), "local-orchestra")
+	require.NoError(t, os.WriteFile(localExecutable, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	code, stdout, stderr = runCLI("update", "--check", "--executable", localExecutable, "--json")
+	assert.Equal(t, 0, code, stderr)
+	var checkResult selfupdate.LocalUpdateResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &checkResult))
+	assert.Equal(t, "9.9.9", checkResult.TargetVersion)
+	assert.True(t, checkResult.UpdateAvailable)
+	assert.False(t, checkResult.Updated)
+
+	code, stdout, stderr = runCLI("update", "--version", "9.9.9", "--executable", localExecutable, "--json")
+	assert.Equal(t, 0, code, stderr)
+	var updateResult selfupdate.LocalUpdateResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &updateResult))
+	assert.True(t, updateResult.Updated)
+	assert.Equal(t, "9.9.9", updateResult.TargetVersion)
+
+	installedBytes, err := os.ReadFile(localExecutable)
+	require.NoError(t, err)
+	assert.Equal(t, newScript, installedBytes)
+
+	code, stdout, stderr = runCLI("nodes", "update", "worker-cli-upd", "--version", "9.9.9", "--wait", "--json")
+	assert.Equal(t, 0, code, stderr)
+	var nodesResponse orchestrator.UpdateNodesResponse
+	require.NoError(t, json.Unmarshal([]byte(stdout), &nodesResponse))
+	require.Len(t, nodesResponse.Nodes, 1)
+	assert.Equal(t, "succeeded", nodesResponse.Nodes[0].Status)
+	assert.Equal(t, "0.1.0", nodesResponse.Nodes[0].PreviousVersion)
+	assert.Equal(t, "9.9.9", nodesResponse.Nodes[0].CurrentVersion)
 }

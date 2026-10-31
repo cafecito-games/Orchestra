@@ -44,6 +44,7 @@ var DelegationHubToolNames = []string{
 // OrchestratorToolNames are the tools exposed on the master's orchestrator MCP surface.
 var OrchestratorToolNames = []string{
 	"get_execution_inventory",
+	"update_nodes",
 	"create_thread",
 	"list_threads",
 	"attach_thread",
@@ -109,6 +110,7 @@ type SlaveControlMessage struct {
 	Lease             *WorkspaceLeaseUpdate     `json:"lease,omitempty"`
 	CapabilityReport  *NodeCapabilityReport     `json:"report,omitempty"`
 	ComponentReport   *ComponentInventoryReport `json:"componentReport,omitempty"`
+	NodeUpdate        *NodeUpdateReport         `json:"nodeUpdate,omitempty"`
 	RequestID         string                    `json:"requestId,omitempty"`
 	Method            string                    `json:"method,omitempty"`
 	Params            json.RawMessage           `json:"params,omitempty"`
@@ -132,6 +134,7 @@ type MasterControlMessage struct {
 	WorkspaceLease *WorkspaceLeaseGrant    `json:"workspaceLease,omitempty"`
 	Lease          *WorkspaceLeaseGrant    `json:"lease,omitempty"`
 	Decision       *ApprovalDecision       `json:"decision,omitempty"`
+	NodeUpdate     *NodeUpdateDirective    `json:"nodeUpdate,omitempty"`
 	RequestID      string                  `json:"requestId,omitempty"`
 	Result         json.RawMessage         `json:"result,omitempty"`
 	Error          *HubRPCError            `json:"error,omitempty"`
@@ -221,6 +224,7 @@ type NodeDetail struct {
 	Synced            bool                      `json:"synced"`
 	CapabilityReport  *NodeCapabilityReport     `json:"capabilityReport,omitempty"`
 	ComponentReport   *ComponentInventoryReport `json:"componentReport,omitempty"`
+	UpdateStatus      *NodeUpdateState          `json:"updateStatus,omitempty"`
 	ResidentInstances []string                  `json:"residentInstances,omitempty"`
 }
 

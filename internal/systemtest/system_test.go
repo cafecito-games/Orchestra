@@ -3,8 +3,10 @@
 package systemtest
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -21,6 +23,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,7 +38,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cafecito-games/Orchestra/internal/orchestrator"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
+	"github.com/cafecito-games/Orchestra/internal/selfupdate"
 	"github.com/cafecito-games/Orchestra/internal/setup"
 	"github.com/cafecito-games/Orchestra/internal/slave"
 )
@@ -2397,4 +2402,467 @@ func TestSystemAgentMailCrossSessionPushAndInstanceWakeReply(t *testing.T) {
 	require.NotNil(t, detail.Runs[1].ProviderSessionID)
 	require.Equal(t, *detail.Runs[0].ProviderSessionID, *detail.Runs[1].ProviderSessionID, "mail wake turn must resume resident ACP session")
 	require.Contains(t, replyContent, "session="+*detail.Runs[0].ProviderSessionID)
+}
+
+func compileVersionedOrchestraBinary(t *testing.T, destinationPath string, version string) {
+	t.Helper()
+	_, currentFile, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", ".."))
+	ldflags := "-X github.com/cafecito-games/Orchestra/internal/protocol.BuildVersion=" + version
+
+	buildCommand := exec.CommandContext(
+		t.Context(),
+		"go",
+		"build",
+		"-trimpath",
+		"-ldflags", ldflags,
+		"-o", destinationPath,
+		"./cmd/orchestra",
+	)
+	buildCommand.Dir = repositoryRoot
+	buildCommand.Env = append(os.Environ(), "CGO_ENABLED=0")
+	output, err := buildCommand.CombinedOutput()
+	require.NoError(t, err, "build versioned orchestra %s failed:\n%s", version, string(output))
+}
+
+func packageReleaseArchive(t *testing.T, binaryPath string) ([]byte, string) {
+	t.Helper()
+	binaryBytes, err := os.ReadFile(binaryPath)
+	require.NoError(t, err)
+	binaryName := "orchestra"
+	if runtime.GOOS == "windows" {
+		binaryName = "orchestra.exe"
+	}
+
+	var buffer bytes.Buffer
+	gzipWriter := gzip.NewWriter(&buffer)
+	tarWriter := tar.NewWriter(gzipWriter)
+	require.NoError(t, tarWriter.WriteHeader(&tar.Header{
+		Name:     binaryName,
+		Mode:     0o755,
+		Size:     int64(len(binaryBytes)),
+		Typeflag: tar.TypeReg,
+	}))
+	_, err = tarWriter.Write(binaryBytes)
+	require.NoError(t, err)
+	require.NoError(t, tarWriter.Close())
+	require.NoError(t, gzipWriter.Close())
+
+	archiveBytes := buffer.Bytes()
+	digest := sha256.Sum256(archiveBytes)
+	return archiveBytes, hex.EncodeToString(digest[:])
+}
+
+func TestSlaveSelfUpdateInPlacePreservesPIDAndACPResidentSession(t *testing.T) {
+	binaries := ensureCompiledBinaries(t)
+	fakeHarnesses := installFakeHarnesses(t, binaries.fakeHarnessPath)
+
+	extension := ""
+	if runtime.GOOS == "windows" {
+		extension = ".exe"
+	}
+	workerBinaryDirectory := filepath.Join(t.TempDir(), "worker-bin")
+	releaseBuildDirectory := filepath.Join(t.TempDir(), "release-build")
+	localCLIDirectory := filepath.Join(t.TempDir(), "local-cli-bin")
+	for _, directory := range []string{workerBinaryDirectory, releaseBuildDirectory, localCLIDirectory} {
+		require.NoError(t, os.MkdirAll(directory, 0o755))
+	}
+
+	workerBinaryPath := filepath.Join(workerBinaryDirectory, "orchestra"+extension)
+	releaseBinaryPath := filepath.Join(releaseBuildDirectory, "orchestra"+extension)
+	localCLIBinaryPath := filepath.Join(localCLIDirectory, "orchestra"+extension)
+
+	compileVersionedOrchestraBinary(t, workerBinaryPath, "0.1.0")
+	compileVersionedOrchestraBinary(t, releaseBinaryPath, "0.2.0")
+
+	v1Bytes, err := os.ReadFile(workerBinaryPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(localCLIBinaryPath, v1Bytes, 0o755))
+
+	archiveName := fmt.Sprintf("orchestra_0.2.0_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+	archiveBytes, archiveSHA256 := packageReleaseArchive(t, releaseBinaryPath)
+	checksumPayload := fmt.Sprintf("%s  %s\n", archiveSHA256, archiveName)
+
+	var releaseServer *httptest.Server
+	releaseMux := http.NewServeMux()
+	writeReleaseJSON := func(writer http.ResponseWriter) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(map[string]any{
+			"tag_name":     "v0.2.0",
+			"published_at": "2026-10-31T12:00:00Z",
+			"html_url":     releaseServer.URL + "/releases/v0.2.0",
+			"assets": []map[string]any{
+				{
+					"name":                 "checksums.txt",
+					"url":                  releaseServer.URL + "/assets/checksums.txt",
+					"browser_download_url": releaseServer.URL + "/assets/checksums.txt",
+					"size":                 len(checksumPayload),
+				},
+				{
+					"name":                 archiveName,
+					"url":                  releaseServer.URL + "/assets/" + archiveName,
+					"browser_download_url": releaseServer.URL + "/assets/" + archiveName,
+					"size":                 len(archiveBytes),
+				},
+			},
+		})
+	}
+	releaseMux.HandleFunc("/repos/cafecito-games/Orchestra/releases/latest", func(writer http.ResponseWriter, request *http.Request) {
+		writeReleaseJSON(writer)
+	})
+	releaseMux.HandleFunc("/repos/cafecito-games/Orchestra/releases/tags/v0.2.0", func(writer http.ResponseWriter, request *http.Request) {
+		writeReleaseJSON(writer)
+	})
+	releaseMux.HandleFunc("/assets/checksums.txt", func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = writer.Write([]byte(checksumPayload))
+	})
+	releaseMux.HandleFunc("/assets/"+archiveName, func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = writer.Write(archiveBytes)
+	})
+	releaseServer = httptest.NewServer(releaseMux)
+	defer releaseServer.Close()
+
+	const bearerToken = "system-self-update-token-123456"
+	listenAddress := allocateFreeLoopbackAddress(t)
+	masterBaseURL := "http://" + listenAddress
+	masterDataDirectory := filepath.Join(t.TempDir(), "master-state")
+
+	rawWorkspaceRoot := filepath.Join(t.TempDir(), "workspaces")
+	require.NoError(t, os.MkdirAll(rawWorkspaceRoot, 0o755))
+	canonicalRoots, err := slave.CanonicalizeWorkspaceRoots([]string{rawWorkspaceRoot})
+	require.NoError(t, err)
+	repositoryPath := filepath.Join(canonicalRoots[0], "service-repo")
+	initializeGitRepository(t, repositoryPath)
+
+	workerEnvironment := buildWorkerEnvironment(fakeHarnesses)
+	masterEnvironment := append(
+		slices.Clone(workerEnvironment),
+		"ORCHESTRA_RELEASE_API_URL="+releaseServer.URL,
+		"ORCHESTRA_RELEASE_REPO=cafecito-games/Orchestra",
+	)
+
+	masterProcess := startManagedProcess(
+		t,
+		"master-self-update",
+		binaries.orchestraPath,
+		[]string{
+			"master",
+			"--listen", listenAddress,
+			"--token", bearerToken,
+			"--data-dir", masterDataDirectory,
+		},
+		masterEnvironment,
+	)
+	waitForMasterReady(t, masterBaseURL, masterProcess)
+
+	workerDataRoot := filepath.Join(t.TempDir(), "worker-data")
+	workerProcess := startManagedProcess(
+		t,
+		"slave-self-update",
+		workerBinaryPath,
+		[]string{
+			"slave",
+			"--endpoint", masterBaseURL,
+			"--token", bearerToken,
+			"--id", "worker-selfupdate",
+			"--name", "selfupdate-node",
+			"--kind", "home-server",
+			"--workspace-root", canonicalRoots[0],
+			"--concurrency", "2",
+			"--instance-capacity", "4",
+			"--approval-policy", "auto",
+			"--claude-acp-auth-mode", "local-subscription",
+			"--acp-adapter", fakeHarnesses.claudeACPArgument,
+			"--data-root", workerDataRoot,
+		},
+		workerEnvironment,
+	)
+	initialSlavePID := workerProcess.command.Process.Pid
+
+	mcpSession := startMCPStdioSession(t, binaries.orchestraPath, masterBaseURL, bearerToken, "self-update-orchestrator")
+	cliEnvironment := append(
+		slices.Clone(masterEnvironment),
+		"ORCHESTRA_ENDPOINT="+masterBaseURL,
+		"ORCHESTRA_TOKEN="+bearerToken,
+	)
+
+	require.Eventually(t, func() bool {
+		var inventory struct {
+			Nodes []protocol.NodeDetail `json:"nodes"`
+		}
+		mcpSession.callTool(t, "get_execution_inventory", map[string]any{}, &inventory)
+		for _, detail := range inventory.Nodes {
+			if detail.Node.ID == "worker-selfupdate" && detail.Connected && detail.Synced && detail.Node.Version == "0.1.0" {
+				return true
+			}
+		}
+		return false
+	}, 12*time.Second, 100*time.Millisecond, "master:\n%s\nslave:\n%s", masterProcess.logs(), workerProcess.logs())
+
+	var createdThread struct {
+		Thread protocol.Thread `json:"thread"`
+	}
+	mcpSession.callTool(t, "create_thread", map[string]any{
+		"title": "In-Place Slave Self-Update Verification",
+	}, &createdThread)
+	threadID := createdThread.Thread.ID
+
+	var drainThread struct {
+		Thread protocol.Thread `json:"thread"`
+	}
+	mcpSession.callTool(t, "create_thread", map[string]any{
+		"title": "Active Drain Thread",
+	}, &drainThread)
+	drainThreadID := drainThread.Thread.ID
+
+	var spawned protocol.InstanceLifecycleResult
+	mcpSession.callTool(t, "spawn_instance", map[string]any{
+		"threadId":       threadID,
+		"idempotencyKey": "spawn-warm-selfupdate",
+		"purpose": map[string]any{
+			"name":    "upgrader-specialist",
+			"summary": "Resident ACP session preserved across slave execve",
+		},
+		"requirements": map[string]any{
+			"harnessIds": []string{"claude-cli"},
+			"transports": []string{"acp-v1"},
+			"workspace": map[string]any{
+				"path":     repositoryPath,
+				"writable": true,
+			},
+		},
+		"idleTimeoutSeconds": 300,
+	}, &spawned)
+	residentInstanceID := spawned.Instance.ID
+
+	require.Eventually(t, func() bool {
+		var instanceState struct {
+			Instance protocol.AgentInstance `json:"instance"`
+		}
+		mcpSession.callTool(t, "get_instance", map[string]any{"instanceId": residentInstanceID}, &instanceState)
+		return instanceState.Instance.Status == "ready" || instanceState.Instance.Status == "idle"
+	}, 10*time.Second, 100*time.Millisecond)
+
+	// Run Turn 1 on the resident ACP instance on v0.1.0 so it establishes a providerSessionId.
+	turnOneScript := formatFakeScript(t,
+		map[string]any{
+			"message": "turn1-before-update session={{session}}",
+		},
+	)
+	var turnOneSubmit struct {
+		Tasks []protocol.Task `json:"tasks"`
+	}
+	mcpSession.callTool(t, "submit_tasks", map[string]any{
+		"threadId":       threadID,
+		"idempotencyKey": "selfupdate-turn-1",
+		"tasks": []map[string]any{{
+			"clientTaskId": "turn-1",
+			"title":        "Pre-update ACP Turn 1",
+			"instructions": "Establish resident ACP session\n" + turnOneScript,
+			"instanceId":   residentInstanceID,
+			"requirements": map[string]any{
+				"harnessIds": []string{"claude-cli"},
+				"transports": []string{"acp-v1"},
+				"workspace":  map[string]any{"path": repositoryPath, "writable": true},
+			},
+		}},
+	}, &turnOneSubmit)
+	turnOneTaskID := turnOneSubmit.Tasks[0].ID
+
+	require.Eventually(t, func() bool {
+		var snapshot struct {
+			Tasks []protocol.Task `json:"tasks"`
+		}
+		mcpSession.callTool(t, "get_thread_context", map[string]any{"threadId": threadID}, &snapshot)
+		for _, task := range snapshot.Tasks {
+			if task.ID == turnOneTaskID && task.Status == "completed" {
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 100*time.Millisecond, "master:\n%s\nslave:\n%s", masterProcess.logs(), workerProcess.logs())
+
+	require.Eventually(t, func() bool {
+		var instanceState struct {
+			Instance protocol.AgentInstance `json:"instance"`
+		}
+		mcpSession.callTool(t, "get_instance", map[string]any{"instanceId": residentInstanceID}, &instanceState)
+		return instanceState.Instance.Status == "idle"
+	}, 10*time.Second, 100*time.Millisecond)
+
+	// Start a separate gated task on drainThreadID so the slave has an active run that must drain cleanly.
+	drainingScript := formatFakeScript(t,
+		map[string]any{
+			"gate": "allow-slave-drain",
+		},
+		map[string]any{
+			"message": "drained-active-run-cleanly",
+		},
+	)
+	var drainingSubmit struct {
+		Tasks []protocol.Task `json:"tasks"`
+	}
+	mcpSession.callTool(t, "submit_tasks", map[string]any{
+		"threadId":       drainThreadID,
+		"idempotencyKey": "drain-task-submit",
+		"tasks": []map[string]any{{
+			"clientTaskId": "draining-task",
+			"title":        "In-flight work during update",
+			"instructions": "Hold until gate opens\n" + drainingScript,
+			"requirements": map[string]any{
+				"harnessIds": []string{"claude-cli"},
+				"transports": []string{"acp-v1"},
+				"workspace":  map[string]any{"path": repositoryPath, "writable": true},
+			},
+		}},
+	}, &drainingSubmit)
+	drainingTaskID := drainingSubmit.Tasks[0].ID
+
+	require.Eventually(t, func() bool {
+		var snapshot struct {
+			Tasks []protocol.Task `json:"tasks"`
+		}
+		mcpSession.callTool(t, "get_thread_context", map[string]any{"threadId": drainThreadID}, &snapshot)
+		for _, task := range snapshot.Tasks {
+			if task.ID == drainingTaskID && task.Status == "running" {
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 100*time.Millisecond)
+
+	// Trigger update via MCP tool `update_nodes`.
+	var mcpUpdateResponse orchestrator.UpdateNodesResponse
+	mcpSession.callTool(t, "update_nodes", map[string]any{
+		"version": "latest",
+		"nodeIds": []string{"worker-selfupdate"},
+	}, &mcpUpdateResponse)
+	require.Equal(t, "0.2.0", mcpUpdateResponse.TargetVersion)
+	require.Len(t, mcpUpdateResponse.Nodes, 1)
+	require.Equal(t, "queued", mcpUpdateResponse.Nodes[0].Status)
+
+	// Verify slave enters "draining" and node status shows "updating" while gated task is still running.
+	require.Eventually(t, func() bool {
+		nodesOut, _ := invokeOrchestraCLI(t, binaries.orchestraPath, cliEnvironment, "nodes", "--json")
+		var payload struct {
+			Nodes []protocol.NodeDetail `json:"nodes"`
+		}
+		if json.Unmarshal([]byte(nodesOut), &payload) != nil {
+			return false
+		}
+		for _, detail := range payload.Nodes {
+			if detail.Node.ID == "worker-selfupdate" {
+				return detail.Node.Status == "updating" &&
+					detail.UpdateStatus != nil &&
+					detail.UpdateStatus.Status == "draining"
+			}
+		}
+		return false
+	}, 15*time.Second, 100*time.Millisecond, "master:\n%s\nslave:\n%s", masterProcess.logs(), workerProcess.logs())
+
+	// Release the gate and run `orchestra nodes update --wait` to block until the slave finishes draining,
+	// execve's into 0.2.0, and reconnects synced!
+	fakeHarnesses.openGate(t, "allow-slave-drain")
+
+	waitOutput, _ := invokeOrchestraCLI(
+		t,
+		binaries.orchestraPath,
+		cliEnvironment,
+		"nodes", "update", "worker-selfupdate", "--version", "0.2.0", "--wait", "--timeout", "30s", "--json",
+	)
+	var waitedResponse orchestrator.UpdateNodesResponse
+	require.NoError(t, json.Unmarshal([]byte(waitOutput), &waitedResponse))
+	require.Len(t, waitedResponse.Nodes, 1)
+	assert.Equal(t, "succeeded", waitedResponse.Nodes[0].Status)
+	assert.Equal(t, "0.1.0", waitedResponse.Nodes[0].PreviousVersion)
+	assert.Equal(t, "0.2.0", waitedResponse.Nodes[0].CurrentVersion)
+
+	if runtime.GOOS != "windows" {
+		select {
+		case exitErr := <-workerProcess.exited:
+			require.FailNowf(t, "slave exited instead of execve in place", "exitErr=%v\nlogs:\n%s", exitErr, workerProcess.logs())
+		default:
+		}
+		assert.Equal(t, initialSlavePID, workerProcess.command.Process.Pid)
+	}
+
+	// Verify draining task completed cleanly before restart.
+	var drainDetail protocol.ThreadDetailResponse
+	drainDetailOut, _ := invokeOrchestraCLI(t, binaries.orchestraPath, cliEnvironment, "thread", drainThreadID, "--json")
+	require.NoError(t, json.Unmarshal([]byte(drainDetailOut), &drainDetail))
+	require.Len(t, drainDetail.Tasks, 1)
+	assert.Equal(t, "completed", drainDetail.Tasks[0].Status)
+
+	// Verify warm resident instance survived the binary upgrade and resumes the exact same ACP session on v0.2.0!
+	turnTwoScript := formatFakeScript(t,
+		map[string]any{
+			"message": "turn2-after-update session={{session}}",
+		},
+	)
+	var turnTwoSubmit struct {
+		Tasks []protocol.Task `json:"tasks"`
+	}
+	mcpSession.callTool(t, "submit_tasks", map[string]any{
+		"threadId":       threadID,
+		"idempotencyKey": "selfupdate-turn-2",
+		"tasks": []map[string]any{{
+			"clientTaskId": "turn-2",
+			"title":        "Post-update ACP Turn 2",
+			"instructions": "Resume resident ACP session after slave self-update\n" + turnTwoScript,
+			"instanceId":   residentInstanceID,
+			"requirements": map[string]any{
+				"harnessIds": []string{"claude-cli"},
+				"transports": []string{"acp-v1"},
+				"workspace":  map[string]any{"path": repositoryPath, "writable": true},
+			},
+		}},
+	}, &turnTwoSubmit)
+	turnTwoTaskID := turnTwoSubmit.Tasks[0].ID
+
+	require.Eventually(t, func() bool {
+		var snapshot struct {
+			Tasks []protocol.Task `json:"tasks"`
+		}
+		mcpSession.callTool(t, "get_thread_context", map[string]any{"threadId": threadID}, &snapshot)
+		for _, task := range snapshot.Tasks {
+			if task.ID == turnTwoTaskID && task.Status == "completed" {
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 100*time.Millisecond, "master:\n%s\nslave:\n%s", masterProcess.logs(), workerProcess.logs())
+
+	var residentDetail protocol.ThreadDetailResponse
+	residentDetailOut, _ := invokeOrchestraCLI(t, binaries.orchestraPath, cliEnvironment, "thread", threadID, "--json")
+	require.NoError(t, json.Unmarshal([]byte(residentDetailOut), &residentDetail))
+	require.Len(t, residentDetail.Runs, 2)
+	require.NotNil(t, residentDetail.Runs[0].ProviderSessionID)
+	require.NotNil(t, residentDetail.Runs[1].ProviderSessionID)
+	assert.Equal(
+		t,
+		*residentDetail.Runs[0].ProviderSessionID,
+		*residentDetail.Runs[1].ProviderSessionID,
+		"warm resident instance must resume exact ACP session after in-place 0.1.0 -> 0.2.0 slave self-update",
+	)
+
+	// Verify local `orchestra update` updates a real compiled v0.1.0 binary to v0.2.0 in place.
+	checkOut, _ := invokeOrchestraCLI(t, localCLIBinaryPath, cliEnvironment, "update", "--check", "--json")
+	var localCheck selfupdate.LocalUpdateResult
+	require.NoError(t, json.Unmarshal([]byte(checkOut), &localCheck))
+	assert.Equal(t, "0.1.0", localCheck.CurrentVersion)
+	assert.Equal(t, "0.2.0", localCheck.TargetVersion)
+	assert.True(t, localCheck.UpdateAvailable)
+	assert.False(t, localCheck.Updated)
+
+	localUpdateOut, _ := invokeOrchestraCLI(t, localCLIBinaryPath, cliEnvironment, "update", "--json")
+	var localUpdated selfupdate.LocalUpdateResult
+	require.NoError(t, json.Unmarshal([]byte(localUpdateOut), &localUpdated))
+	assert.True(t, localUpdated.Updated)
+	assert.Equal(t, "0.2.0", localUpdated.TargetVersion)
+
+	versionAfterOut, _ := invokeOrchestraCLI(t, localCLIBinaryPath, cliEnvironment, "version", "--json")
+	var buildInfo map[string]string
+	require.NoError(t, json.Unmarshal([]byte(versionAfterOut), &buildInfo))
+	assert.Equal(t, "0.2.0", buildInfo["version"])
 }

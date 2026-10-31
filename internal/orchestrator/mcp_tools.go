@@ -28,6 +28,15 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 			InputSchema: objectSchema(nil, nil),
 		},
 		{
+			Name:        "update_nodes",
+			Description: "Instruct connected slave nodes (or specified nodeIds) to download, verify, drain active runs, and self-update in place to a GitHub release version (defaults to latest).",
+			InputSchema: objectSchema(map[string]any{
+				"version": map[string]any{"type": "string"},
+				"nodeIds": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"force":   map[string]any{"type": "boolean"},
+			}, nil),
+		},
+		{
 			Name:        "create_thread",
 			Description: "Create a durable orchestration thread for coordinating tasks, resident agent instances, messages, approvals, and artifacts.",
 			InputSchema: objectSchema(map[string]any{
@@ -438,6 +447,12 @@ func (service *Service) ExecuteOrchestratorTool(
 	switch toolName {
 	case "get_execution_inventory":
 		responseValue, err = service.GetExecutionInventory()
+	case "update_nodes":
+		input, decodeErr := decodeToolArguments[UpdateNodesInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.UpdateNodes(operationContext, caller, input)
 	case "create_thread":
 		input, decodeErr := decodeToolArguments[CreateThreadInput](rawArguments)
 		if decodeErr != nil {

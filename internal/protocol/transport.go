@@ -54,7 +54,8 @@ var (
 	ACPAdapterSources        = []string{ACPAdapterSourceSetupLedger, ACPAdapterSourceAdministrator, ACPAdapterSourceBuiltIn}
 	ApprovalPolicies         = []string{ApprovalPolicyManual, ApprovalPolicyAuto, ApprovalPolicyBypass}
 	NodeKinds                = []string{"local", "home-server", "cloud"}
-	NodeStatuses             = []string{"online", "offline", "busy"}
+	NodeStatuses             = []string{"online", "offline", "busy", "updating"}
+	NodeUpdateStatuses       = []string{"queued", "downloading", "draining", "restarting", "succeeded", "up-to-date", "skipped", "failed"}
 	AuthModes                = []string{"local-subscription", "local-account", "api", "none"}
 )
 
@@ -190,19 +191,111 @@ func (profile HarnessProfile) Validate() error {
 }
 
 type ComputeNode struct {
-	ID               string           `json:"id"`
-	Name             string           `json:"name"`
-	Kind             string           `json:"kind"`
-	Platform         string           `json:"platform"`
-	Status           string           `json:"status"`
-	LastSeen         string           `json:"lastSeen"`
-	ActiveRuns       int              `json:"activeRuns"`
-	Concurrency      int              `json:"concurrency"`
-	InstanceCapacity *int             `json:"instanceCapacity,omitempty"`
-	ActiveInstances  *int             `json:"activeInstances,omitempty"`
-	WorkspaceRoots   []string         `json:"workspaceRoots"`
-	Version          string           `json:"version"`
-	Harnesses        []HarnessProfile `json:"harnesses"`
+	ID                 string           `json:"id"`
+	Name               string           `json:"name"`
+	Kind               string           `json:"kind"`
+	Platform           string           `json:"platform"`
+	Status             string           `json:"status"`
+	LastSeen           string           `json:"lastSeen"`
+	ActiveRuns         int              `json:"activeRuns"`
+	Concurrency        int              `json:"concurrency"`
+	InstanceCapacity   *int             `json:"instanceCapacity,omitempty"`
+	ActiveInstances    *int             `json:"activeInstances,omitempty"`
+	WorkspaceRoots     []string         `json:"workspaceRoots"`
+	Version            string           `json:"version"`
+	SelfUpdateDisabled bool             `json:"selfUpdateDisabled,omitempty"`
+	Harnesses          []HarnessProfile `json:"harnesses"`
+}
+
+func IsActiveNodeUpdateStatus(status string) bool {
+	switch status {
+	case "queued", "downloading", "draining", "restarting":
+		return true
+	default:
+		return false
+	}
+}
+
+type NodeUpdateDirective struct {
+	UpdateID        string `json:"updateId"`
+	TargetVersion   string `json:"targetVersion"`
+	ProtocolVersion string `json:"protocolVersion"`
+	DownloadPath    string `json:"downloadPath"`
+	ExpectedSHA256  string `json:"expectedSha256"`
+	SizeBytes       int64  `json:"sizeBytes"`
+	Force           bool   `json:"force,omitempty"`
+}
+
+func (directive NodeUpdateDirective) Validate() error {
+	if !IsIdentifier(directive.UpdateID) || !IsSafeReleaseVersion(directive.TargetVersion) || !IsIdentifier(directive.ProtocolVersion) {
+		return errors.New("node update directive identity or version is malformed")
+	}
+	if directive.DownloadPath == "" || !IsBoundedString(directive.DownloadPath, 1024) || LooksSecretLike(directive.DownloadPath) {
+		return errors.New("node update directive downloadPath is malformed")
+	}
+	if len(directive.ExpectedSHA256) != 64 || !isLowerHexDigest(directive.ExpectedSHA256) {
+		return errors.New("node update directive expectedSha256 must be 64 lowercase hex characters")
+	}
+	if directive.SizeBytes <= 0 {
+		return errors.New("node update directive sizeBytes must be positive")
+	}
+	return nil
+}
+
+type NodeUpdateReport struct {
+	UpdateID       string `json:"updateId"`
+	NodeID         string `json:"nodeId"`
+	Status         string `json:"status"`
+	CurrentVersion string `json:"currentVersion,omitempty"`
+	TargetVersion  string `json:"targetVersion,omitempty"`
+	Message        string `json:"message,omitempty"`
+	Error          string `json:"error,omitempty"`
+	ObservedAt     string `json:"observedAt"`
+}
+
+func (report NodeUpdateReport) Validate() error {
+	if !IsIdentifier(report.UpdateID) || !IsIdentifier(report.NodeID) {
+		return errors.New("node update report identity is malformed")
+	}
+	if !slices.Contains(NodeUpdateStatuses, report.Status) {
+		return errors.New("node update report status is unknown")
+	}
+	if report.CurrentVersion != "" && !IsIdentifier(report.CurrentVersion) {
+		return errors.New("node update report currentVersion is malformed")
+	}
+	if report.TargetVersion != "" && !IsSafeReleaseVersion(report.TargetVersion) {
+		return errors.New("node update report targetVersion is malformed")
+	}
+	if !IsBoundedString(report.Message, DiagnosticMaximumBytes) || !IsBoundedString(report.Error, DiagnosticMaximumBytes) {
+		return errors.New("node update report diagnostic exceeds bound")
+	}
+	if !IsTimestamp(report.ObservedAt) {
+		return errors.New("node update report observedAt is malformed")
+	}
+	return nil
+}
+
+type NodeUpdateState struct {
+	UpdateID        string `json:"updateId"`
+	NodeID          string `json:"nodeId"`
+	PreviousVersion string `json:"previousVersion"`
+	CurrentVersion  string `json:"currentVersion"`
+	TargetVersion   string `json:"targetVersion"`
+	Status          string `json:"status"`
+	Message         string `json:"message,omitempty"`
+	Error           string `json:"error,omitempty"`
+	RequestedAt     string `json:"requestedAt"`
+	UpdatedAt       string `json:"updatedAt"`
+	CompletedAt     string `json:"completedAt,omitempty"`
+}
+
+func isLowerHexDigest(value string) bool {
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return value != ""
 }
 
 func (node ComputeNode) Validate() error {
