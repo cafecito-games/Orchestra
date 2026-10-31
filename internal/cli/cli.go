@@ -103,7 +103,7 @@ Runtime Modes:
 
 Operator Commands:
   status      Inspect orchestrator health, connected nodes, and active workloads
-  nodes       List registered worker machines or trigger remote self-updates (nodes update)
+  nodes       List worker machines, refresh/clone repositories, or trigger self-updates (nodes refresh|clone|update)
   threads     List coordination threads on the orchestrator
   thread      Inspect a thread's task DAG, resident instances, runs, messages, and transcripts
   room        Read, post, nudge, or locate a thread's shared blackboard room
@@ -319,6 +319,7 @@ func runSlave(
 		activitylog.String("endpoint", configuration.ControlEndpoint),
 		activitylog.String("harnesses", strings.Join(availableLabels, "; ")),
 		activitylog.String("roots", strings.Join(runtimeWorker.Node.WorkspaceRoots, ",")),
+		activitylog.Int("repositories", len(runtimeWorker.RepositoryReport.Repositories)),
 	)
 	runtimeWorker.Client.SetLogger(func(message string) {
 		logger.Info("update", message)
@@ -342,7 +343,7 @@ Flags:
   --id string                   Stable node identifier (env ORCHESTRA_NODE_ID)
   --name string                 Display name for this slave node (env ORCHESTRA_NAME)
   --kind string                 Node kind: local, home-server, or cloud (default local, env ORCHESTRA_KIND)
-  --workspace-root value        Canonical workspace root directory (repeatable, env WORKSPACE_ROOTS)
+  --workspace-root value        Canonical workspace root directory (defaults to current working directory; repeatable, env WORKSPACE_ROOTS)
   --concurrency int             Maximum concurrent runs (default 2, env ORCHESTRA_CONCURRENCY)
   --instance-capacity int       Maximum resident instances (default 4, env ORCHESTRA_INSTANCE_CAPACITY)
   --label value                 Capability label (repeatable, env ORCHESTRA_LABELS)

@@ -24,8 +24,26 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 	return []MCPToolDefinition{
 		{
 			Name:        "get_execution_inventory",
-			Description: "Inspect all enrolled slave machines, live connectivity, harnesses, models, transports, workspace roots, capabilities, and project profiles.",
+			Description: "Inspect all enrolled slave machines, live connectivity, harnesses, models, transports, workspace roots, discovered Git repositories, capabilities, and project profiles.",
 			InputSchema: objectSchema(nil, nil),
+		},
+		{
+			Name:        "refresh_repositories",
+			Description: "Re-scan and refresh the discovered Git repositories beneath workspace roots on connected slave nodes (or specified nodeIds).",
+			InputSchema: objectSchema(map[string]any{
+				"nodeIds": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			}, nil),
+		},
+		{
+			Name:        "clone_repository",
+			Description: "Instruct a connected slave node to git clone a missing repository safely beneath one of its configured workspace roots and refresh its advertised repository inventory.",
+			InputSchema: objectSchema(map[string]any{
+				"nodeId":        map[string]any{"type": "string"},
+				"repositoryUrl": map[string]any{"type": "string"},
+				"workspaceRoot": map[string]any{"type": "string"},
+				"directory":     map[string]any{"type": "string"},
+				"branch":        map[string]any{"type": "string"},
+			}, []string{"nodeId", "repositoryUrl"}),
 		},
 		{
 			Name:        "update_nodes",
@@ -447,6 +465,18 @@ func (service *Service) ExecuteOrchestratorTool(
 	switch toolName {
 	case "get_execution_inventory":
 		responseValue, err = service.GetExecutionInventory()
+	case "refresh_repositories":
+		input, decodeErr := decodeToolArguments[RefreshRepositoriesInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.RefreshRepositories(operationContext, caller, input)
+	case "clone_repository":
+		input, decodeErr := decodeToolArguments[CloneRepositoryInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.CloneRepository(operationContext, caller, input)
 	case "update_nodes":
 		input, decodeErr := decodeToolArguments[UpdateNodesInput](rawArguments)
 		if decodeErr != nil {

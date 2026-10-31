@@ -493,6 +493,81 @@ func TestInUseAndRollbackInvariants(t *testing.T) {
 	assert.ErrorIs(t, notActivatedErr, ErrComponentNotActivated)
 }
 
+func TestRunDoctorAndAssessComponents_ExternalSymlinkedCodexACP(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("POSIX shell and symlink fixture")
+	}
+	manifest, err := LoadDefaultManifest()
+	require.NoError(t, err)
+
+	temporaryDirectory := t.TempDir()
+	binDirectory := filepath.Join(temporaryDirectory, "bin")
+	require.NoError(t, os.MkdirAll(binDirectory, 0o755))
+
+	fakeCodex := filepath.Join(binDirectory, "codex")
+	require.NoError(t, os.WriteFile(fakeCodex, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+
+	cellarScript := filepath.Join(temporaryDirectory, "Cellar", "codex-acp", "2.5.0", "dist", "index.js")
+	require.NoError(t, os.MkdirAll(filepath.Dir(cellarScript), 0o755))
+	require.NoError(t, os.WriteFile(cellarScript, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	symlinkCodexACP := filepath.Join(binDirectory, "codex-acp")
+	require.NoError(t, os.Symlink(cellarScript, symlinkCodexACP))
+
+	t.Setenv("PATH", binDirectory)
+
+	dataRoot := t.TempDir()
+	platform := CurrentPlatform()
+	ledger, err := LoadOwnershipLedger(dataRoot)
+	require.NoError(t, err)
+	activation := LoadActivationState(dataRoot)
+	harnesses := []protocol.HarnessProfile{{
+		ID:         protocol.HarnessCodexCLI,
+		Label:      "Codex",
+		Binary:     fakeCodex,
+		Available:  true,
+		AuthMode:   "local-account",
+		Transports: []string{protocol.TransportNativeCLI, protocol.TransportACP},
+	}}
+
+	report := RunDoctor(
+		t.Context(),
+		manifest,
+		ledger,
+		dataRoot,
+		platform,
+		activation,
+		harnesses,
+		"http://127.0.0.1:8787",
+		func(context.Context, string) error { return nil },
+	)
+
+	var codexAdapterEntry *ComponentDoctorEntry
+	for index := range report.Components {
+		if report.Components[index].Component.Kind == ComponentKindACPAdapter && report.Components[index].Component.ID == "codex-acp" {
+			codexAdapterEntry = &report.Components[index]
+			break
+		}
+	}
+	require.NotNil(t, codexAdapterEntry)
+	assert.Equal(t, ComponentProvenanceExternal, codexAdapterEntry.Provenance)
+	assert.True(t, codexAdapterEntry.ComponentInstalled)
+	assert.Equal(t, symlinkCodexACP, codexAdapterEntry.ComponentPath)
+	assert.True(t, codexAdapterEntry.ACPLaunchReady)
+
+	assessments := AssessComponents(
+		t.Context(),
+		manifest,
+		ledger,
+		dataRoot,
+		platform,
+		activation,
+		harnesses,
+		ComponentAssessmentOptions{ACPStartupEvidenceKnown: true},
+	)
+	inventoryReport := ComponentInventoryReport("fabrica", protocol.NowTimestamp(), assessments)
+	require.NoError(t, inventoryReport.Validate())
+}
+
 func createTestTarGzArchive(t *testing.T, entryPath string, content []byte) []byte {
 	t.Helper()
 	var buffer bytes.Buffer

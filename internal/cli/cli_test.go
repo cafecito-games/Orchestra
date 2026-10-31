@@ -1333,3 +1333,144 @@ exit 1
 	cancelAlpha()
 	assert.Equal(t, 0, <-alphaDone)
 }
+
+func TestOperatorCLI_NodesRepositoriesCloneAndRefresh(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell stub and canonical path test")
+	}
+
+	gitTool, err := workspace.FindGit()
+	require.NoError(t, err)
+
+	remoteHostingRoot, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	seedRepository := filepath.Join(remoteHostingRoot, "seed-cli")
+	require.NoError(t, os.MkdirAll(seedRepository, 0o755))
+	_, err = gitTool.Run(t.Context(), seedRepository, "init", "--initial-branch=main")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(seedRepository, "main.go"), []byte("package main\n"), 0o644))
+	_, err = gitTool.Run(t.Context(), seedRepository, "add", "main.go")
+	require.NoError(t, err)
+	_, err = gitTool.Run(t.Context(), seedRepository, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial")
+	require.NoError(t, err)
+
+	bareRepository := filepath.Join(remoteHostingRoot, "org", "cli-cloned-repo.git")
+	require.NoError(t, os.MkdirAll(filepath.Dir(bareRepository), 0o755))
+	_, err = gitTool.Run(t.Context(), remoteHostingRoot, "clone", "--bare", seedRepository, bareRepository)
+	require.NoError(t, err)
+	_, err = gitTool.Run(t.Context(), bareRepository, "update-server-info")
+	require.NoError(t, err)
+
+	gitHTTPServer := httptest.NewServer(http.FileServer(http.Dir(remoteHostingRoot)))
+	defer gitHTTPServer.Close()
+	cloneURL := gitHTTPServer.URL + "/org/cli-cloned-repo.git"
+
+	fakeBinDirectory := t.TempDir()
+	fakeClaude := filepath.Join(fakeBinDirectory, "claude")
+	require.NoError(t, os.WriteFile(fakeClaude, []byte("#!/bin/sh\necho 'claude 2.1.0'\n"), 0o755))
+
+	workspaceRoot, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	const bearerToken = "cli-repo-token"
+	service, err := orchestrator.NewService(orchestrator.ServiceOptions{
+		Store: openedStore,
+		Token: bearerToken,
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	masterServer := httptest.NewServer(service.Handler())
+	defer masterServer.Close()
+
+	profiles := []protocol.HarnessProfile{{
+		ID:          protocol.HarnessClaudeCLI,
+		Label:       "Claude Code",
+		Description: "2.1.0",
+		Binary:      fakeClaude,
+		Available:   true,
+		AuthMode:    "local-subscription",
+		Transports:  []string{protocol.TransportNativeCLI},
+	}}
+	workerClient := slave.NewClient(slave.ClientOptions{
+		Endpoint: masterServer.URL,
+		Token:    bearerToken,
+		Node: protocol.ComputeNode{
+			ID:             "worker-repo-cli",
+			Name:           "Worker Repo CLI",
+			Kind:           "home-server",
+			Platform:       runtime.GOOS + "-" + runtime.GOARCH,
+			Status:         "online",
+			Concurrency:    2,
+			WorkspaceRoots: []string{workspaceRoot},
+			Version:        "0.3.0",
+			Harnesses:      profiles,
+		},
+		Runner:           harness.NewRunner(profiles),
+		WorkspaceManager: workspace.NewManager([]string{workspaceRoot}, gitTool),
+	})
+
+	workerContext, cancelWorker := context.WithCancel(t.Context())
+	workerDone := make(chan error, 1)
+	go func() {
+		workerDone <- workerClient.Run(workerContext)
+	}()
+	defer func() {
+		cancelWorker()
+		require.NoError(t, <-workerDone)
+	}()
+
+	environment := map[string]string{
+		"ORCHESTRA_ENDPOINT": masterServer.URL,
+		"ORCHESTRA_TOKEN":    bearerToken,
+	}
+	lookupEnvironment := func(name string) (string, bool) {
+		value, found := environment[name]
+		return value, found
+	}
+	runCommand := func(arguments ...string) (int, string, string) {
+		var standardOutput, standardError bytes.Buffer
+		code := cli.Run(t.Context(), arguments, nil, &standardOutput, &standardError, lookupEnvironment)
+		return code, standardOutput.String(), standardError.String()
+	}
+
+	require.Eventually(t, func() bool {
+		code, output, _ := runCommand("nodes")
+		return code == 0 && strings.Contains(output, "worker-repo-cli") && strings.Contains(output, "synced=true")
+	}, 5*time.Second, 50*time.Millisecond)
+
+	// Help and argument validation for nodes refresh / clone.
+	code, output, _ := runCommand("nodes", "refresh", "--help")
+	assert.Equal(t, 0, code)
+	assert.Contains(t, output, "orchestra nodes refresh")
+
+	code, output, _ = runCommand("nodes", "clone", "--help")
+	assert.Equal(t, 0, code)
+	assert.Contains(t, output, "orchestra nodes clone")
+
+	code, _, errorText := runCommand("nodes", "clone", "--node", "worker-repo-cli")
+	assert.Equal(t, 2, code)
+	assert.Contains(t, errorText, "--node and --repo are required")
+
+	// Clone via CLI.
+	code, output, errorText = runCommand("nodes", "clone", "--node", "worker-repo-cli", "--repo", cloneURL)
+	require.Equal(t, 0, code, errorText)
+	assert.Contains(t, output, "cloned")
+	assert.Contains(t, output, filepath.Join(workspaceRoot, "cli-cloned-repo"))
+
+	// Refresh via CLI.
+	code, output, errorText = runCommand("nodes", "refresh", "--node", "worker-repo-cli")
+	require.Equal(t, 0, code, errorText)
+	assert.Contains(t, output, "worker-repo-cli: synced 1 repositories")
+	assert.Contains(t, output, "cli-cloned-repo")
+
+	// List nodes shows discovered repository.
+	code, output, errorText = runCommand("nodes")
+	require.Equal(t, 0, code, errorText)
+	assert.Contains(t, output, "Repositories:")
+	assert.Contains(t, output, "cli-cloned-repo")
+}

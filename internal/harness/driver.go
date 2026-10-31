@@ -309,6 +309,9 @@ func (runner *Runner) beginning(invocation Invocation, selection protocol.RunTra
 				capabilities := *details.capabilities
 				selection.ACP = &capabilities
 			}
+			if selection.Adapter == nil && runner.acp != nil {
+				selection.Adapter = runner.acp.provenance(invocation.Run.HarnessID)
+			}
 			if report != nil {
 				report(selection)
 			}

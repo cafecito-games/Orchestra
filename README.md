@@ -225,6 +225,11 @@ orchestra slave \
   --claude-acp-auth-mode local-subscription
 ```
 
+Point `--workspace-root` at your **parent projects directory** (for example `~/Projects` or `/srv/workspaces`; if omitted, `orchestra slave` defaults to the current working directory). On startup and reconnect, each slave automatically discovers Git repositories beneath its workspace roots and advertises them to `orchestra master`:
+- **Single-repository tasks** can set `requirements.workspace.repository` (for example `https://github.com/org/repo`) or a relative `requirements.workspace.path` (for example `repo`), and the scheduler automatically places and runs the task inside that repository checkout (or provisions a `git-worktree` lease from it).
+- **Cross-repository tasks** can omit `requirements.workspace`, running in the parent `--workspace-root` with access to sibling repositories beneath it.
+- **Missing repositories** can be cloned remotely onto a slave via the `clone_repository` MCP tool or `orchestra nodes clone`, and repository inventories can be re-scanned anytime via `refresh_repositories` or `orchestra nodes refresh`.
+
 You can also run `orchestra doctor` first or pin explicit node metadata, capabilities, and endpoints:
 
 ```bash
@@ -253,21 +258,42 @@ Both `orchestra master` and `orchestra slave` emit structured, secret-redacted o
 
 | Harness ID | CLI Binary | Default Transport | Zero-Download Ready? | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| `claude-cli` | `claude` | `acp-v1` (with adapter) or `native-cli` | Yes (`native-cli`) | Requires `--claude-acp-auth-mode local-subscription\|api` when using `acp-v1` so subscription sessions never silently bill API keys. |
-| `codex-cli` | `codex` | `acp-v1` (with adapter) or `native-cli` | Yes (`native-cli`) | Install `codex-acp` via `orchestra setup` for stateful ACP sessions. |
+| `claude-cli` | `claude` | `acp-v1` (with adapter) or `native-cli` | Yes (`native-cli`) | Auto-discovers `claude-agent-acp` on `PATH`; pass `--claude-acp-auth-mode local-subscription\|api` to enable `acp-v1`. |
+| `codex-cli` | `codex` | `acp-v1` (with adapter) or `native-cli` | Yes (`native-cli`) | Auto-discovers `codex-acp` on `PATH` (Homebrew/Linuxbrew/npm) for stateful ACP sessions. |
 | `opencode-cli` | `opencode` | `acp-v1` (built-in) | **Yes (`acp-v1`)** | Built-in ACP server with full `provider/model` pass-through (e.g., GLM + DeepSeek concurrently). |
 | `antigravity-cli` | `agy` | `acp-v1` (built-in bridge) | **Yes (`acp-v1`)** | Uses Orchestra's built-in Go bridge (`orchestra acp-bridge antigravity`) automatically whenever `agy` is on `PATH`. |
 
-<details>
-<summary><strong>Provisioning Managed ACP Adapters for Claude & Codex (`orchestra setup`)</strong></summary>
+#### Installing ACP Adapters for Codex & Claude (`codex-acp` & `claude-agent-acp`)
 
-While `opencode` and `agy` support `acp-v1` out of the box, `claude` and `codex` use external ACP adapters when you want resumable resident ACP sessions instead of `native-cli`. Orchestra includes a checksum-verified component manager to install, activate, and roll back adapters cleanly:
+While `opencode` and `agy` include built-in `acp-v1` support, `codex` and `claude` use companion ACP stdio adapters when you want stateful, resumable ACP resident sessions (and real-time MCP/permission callbacks) instead of headless `native-cli` execution.
+
+Install them directly onto `PATH` on any worker machine—`orchestra doctor` and `orchestra slave` automatically discover them at startup (including Homebrew, Linuxbrew, and global `npm` symlinks):
+
+```bash
+# Codex ACP adapter (via Homebrew/Linuxbrew or npm)
+brew install codex-acp
+# or: npm install -g @agentclientprotocol/codex-acp
+
+# Claude ACP adapter (via npm)
+npm install -g @agentclientprotocol/claude-agent-acp
+```
+
+Verify readiness with `orchestra doctor` (and **restart `orchestra slave`** if it was already running when you installed the adapter, since adapters are probed at worker startup):
+
+```bash
+orchestra doctor --claude-acp-auth-mode local-subscription
+```
+
+<details>
+<summary><strong>Optional: Checksum-Pinned ACP Adapters (`orchestra setup` or `--acp-adapter`)</strong></summary>
+
+For environments that require strict SHA-256 binary pinning instead of `PATH` auto-discovery, Orchestra includes a checksum-verified component manager to install, activate, and roll back standalone adapter binaries:
 
 ```bash
 # 1. Generate an installation plan
 orchestra setup plan --out plan.json
 
-# 2. Apply downloads or register local checksummed adapter binaries
+# 2. Apply downloads or register standalone checksummed adapter binaries
 orchestra setup apply --plan plan.json \
   --manual-artifact claude-acp=/path/to/claude-agent-acp \
   --manual-checksum claude-acp=<sha256> \
@@ -279,10 +305,10 @@ orchestra setup activate --kind acp-adapter --id claude-acp --version 0.79.0
 orchestra setup activate --kind acp-adapter --id codex-acp --version 1.12.0
 ```
 
-Alternatively, pin an adapter binary directly on startup without `orchestra setup`:
+Alternatively, pin a resolved regular-file executable directly on startup without `orchestra setup` (use `readlink -f "$(command -v codex-acp)"` if resolving a Homebrew/npm symlink):
 
 ```bash
---acp-adapter claude-cli=sha256:<hex>:/absolute/path/to/claude-agent-acp
+--acp-adapter codex-cli=sha256:<hex>:/absolute/path/to/resolved/entrypoint
 ```
 
 </details>
@@ -339,9 +365,11 @@ Every inspection and control command auto-discovers `~/.local/share/orchestra/co
 orchestra mcp install
 orchestra mcp status
 orchestra mcp uninstall
-# Cluster overview & worker inventory
+# Cluster overview, discovered repositories & remote repository management
 orchestra status
 orchestra nodes
+orchestra nodes refresh
+orchestra nodes clone --node build-linux-01 --repo git@github.com:org/service.git
 
 # Self-update local CLI/master binary or roll out a release to connected slaves
 orchestra update --check
@@ -443,7 +471,7 @@ Each worker run receives an isolated `127.0.0.1` Streamable HTTP MCP server expo
 | `--token` | `ORCHESTRA_TOKEN` | Shared bearer token when connecting to a `token`-mode master |
 | `--connection-file` | `ORCHESTRA_CONNECTION_FILE` | Local discovery file fallback path (`none` to disable) |
 | `--id`, `--name`, `--kind` | `ORCHESTRA_NODE_ID`, `ORCHESTRA_NAME`, `ORCHESTRA_KIND` | Node identity and kind (`local`, `home-server`, `cloud`) |
-| `--workspace-root` | `WORKSPACE_ROOTS` | Allowed parent directory for task workspaces (repeatable) |
+| `--workspace-root` | `WORKSPACE_ROOTS` | Allowed parent directory for task workspaces (defaults to current working directory; repeatable) |
 | `--concurrency`, `--instance-capacity` | `ORCHESTRA_CONCURRENCY`, `ORCHESTRA_INSTANCE_CAPACITY` | Max concurrent runs (`2`) and resident instances (`4`) |
 | `--label`, `--accelerator`, `--toolchain` | `ORCHESTRA_LABELS`, `ORCHESTRA_ACCELERATORS`, `ORCHESTRA_TOOLCHAINS` | Advertised scheduling capabilities (repeatable) |
 | `--approval-policy` | `ORCHESTRA_APPROVAL_POLICY` | `manual`, `auto`, `bypass`, or `<harness>=<policy>` (repeatable) |

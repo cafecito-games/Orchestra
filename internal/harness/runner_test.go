@@ -315,6 +315,23 @@ func TestPrepareNativeArguments_SessionResumeAndValidation(t *testing.T) {
 		require.Contains(t, arguments, "--mcp-config")
 	})
 
+	t.Run("codex-cli initial invocation skips git repo check", func(t *testing.T) {
+		arguments, cleanup, err := prepareNativeArguments(Invocation{
+			Run: protocol.Run{
+				HarnessID: protocol.HarnessCodexCLI,
+				Model:     "gpt-5.5",
+				Prompt:    "inspect multi-repo workspace",
+			},
+			Workspace:      workspaceDirectory,
+			MCP:            mcpConfig,
+			approvalPolicy: protocol.ApprovalPolicyAuto,
+		})
+		defer cleanup()
+		require.NoError(t, err)
+		require.Equal(t, []string{"exec", "--json", "--skip-git-repo-check", "--sandbox", "workspace-write", "--model", "gpt-5.5"}, arguments[:7])
+		require.Contains(t, arguments[len(arguments)-1], "inspect multi-repo workspace")
+	})
+
 	t.Run("codex-cli resume places options before resume subcommand", func(t *testing.T) {
 		arguments, cleanup, err := prepareNativeArguments(Invocation{
 			Run: protocol.Run{
@@ -329,7 +346,7 @@ func TestPrepareNativeArguments_SessionResumeAndValidation(t *testing.T) {
 		})
 		defer cleanup()
 		require.NoError(t, err)
-		require.Equal(t, []string{"exec", "--json", "--sandbox", "workspace-write", "--model", "gpt-5.5"}, arguments[:6])
+		require.Equal(t, []string{"exec", "--json", "--skip-git-repo-check", "--sandbox", "workspace-write", "--model", "gpt-5.5"}, arguments[:7])
 		require.Equal(t, "resume", arguments[len(arguments)-3])
 		require.Equal(t, "thread-codex-99", arguments[len(arguments)-2])
 		require.Contains(t, arguments[len(arguments)-1], "codex follow-up")

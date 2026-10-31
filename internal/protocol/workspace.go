@@ -19,6 +19,10 @@ const (
 	WorkspaceCleanupWhenUnchanged        = "when-unchanged"
 	WorkspaceCleanupModeReconcile        = "reconcile"
 	WorkspaceCleanupModeOperator         = "operator"
+	MaximumDiscoveredRepositories        = 256
+	MaximumRemotesPerRepository          = 16
+	MaximumWorkspaceSubpathBytes         = 256
+	RepositoryURLMaximumBytes            = 512
 )
 
 var (
@@ -270,6 +274,330 @@ func (update WorkspaceLeaseUpdate) Validate() error {
 	}
 	if !IsBoundedString(update.Detail, DiagnosticMaximumBytes) {
 		return errors.New("workspace lease detail exceeds its bound")
+	}
+	return nil
+}
+
+var scpRepositoryURLPattern = regexp.MustCompile(`^(?:([A-Za-z0-9._-]+)@)?([A-Za-z0-9.-]+):([A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*)$`)
+
+// CanonicalRepositoryKey produces a transport-agnostic `<host>/<path>` key so SSH, HTTPS,
+// and bare `<host>/<org>/<repo>` identifiers resolve to the same repository checkout.
+func CanonicalRepositoryKey(repositoryURL string) (string, bool) {
+	normalized, ok := NormalizeRepositoryIdentity(strings.TrimSpace(repositoryURL))
+	if !ok {
+		return "", false
+	}
+	var hostPart, repositoryPath string
+	if match := schemeRepositoryURLPattern.FindStringSubmatch(normalized); match != nil {
+		scheme := strings.ToLower(match[1])
+		if scheme == "file://" {
+			cleaned := path.Clean("/" + strings.TrimPrefix(match[3], "/"))
+			return "file://" + cleaned, true
+		}
+		hostPart = strings.ToLower(match[2])
+		repositoryPath = strings.TrimPrefix(match[3], "/")
+	} else if colonIndex := strings.IndexByte(normalized, ':'); colonIndex > 0 && !strings.Contains(normalized[:colonIndex], "/") {
+		hostPart = strings.ToLower(normalized[:colonIndex])
+		repositoryPath = strings.TrimPrefix(normalized[colonIndex+1:], "/")
+	} else {
+		slashIndex := strings.IndexByte(normalized, '/')
+		if slashIndex <= 0 {
+			return "", false
+		}
+		hostPart = strings.ToLower(normalized[:slashIndex])
+		repositoryPath = strings.TrimPrefix(normalized[slashIndex+1:], "/")
+	}
+	for _, defaultPort := range []string{":22", ":80", ":443"} {
+		hostPart = strings.TrimSuffix(hostPart, defaultPort)
+	}
+	cleanedPath := path.Clean(repositoryPath)
+	if hostPart == "" || cleanedPath == "" || cleanedPath == "." || strings.HasPrefix(cleanedPath, "../") || cleanedPath == ".." {
+		return "", false
+	}
+	return hostPart + "/" + strings.ToLower(cleanedPath), true
+}
+
+func RepositoriesMatch(firstRepository, secondRepository string) bool {
+	firstNormalized, firstOK := NormalizeRepositoryIdentity(strings.TrimSpace(firstRepository))
+	secondNormalized, secondOK := NormalizeRepositoryIdentity(strings.TrimSpace(secondRepository))
+	if !firstOK || !secondOK {
+		return false
+	}
+	if firstNormalized == secondNormalized {
+		return true
+	}
+	firstKey, firstKeyOK := CanonicalRepositoryKey(firstNormalized)
+	secondKey, secondKeyOK := CanonicalRepositoryKey(secondNormalized)
+	return firstKeyOK && secondKeyOK && firstKey == secondKey
+}
+
+// ValidateCloneRepositoryURL validates a remote Git clone URL, rejecting option-injection
+// prefixes, unsafe remote-helper transports, local file URLs, and embedded credentials.
+func ValidateCloneRepositoryURL(rawURL string) (string, string, error) {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" || !IsBoundedString(trimmed, RepositoryURLMaximumBytes) {
+		return "", "", errors.New("repository URL must be between 1 and 512 bytes")
+	}
+	if strings.HasPrefix(trimmed, "-") {
+		return "", "", errors.New("repository URL must not start with '-'")
+	}
+	for _, character := range trimmed {
+		if character <= 0x20 || character == 0x7f {
+			return "", "", errors.New("repository URL must not contain whitespace or control characters")
+		}
+	}
+	if strings.Contains(trimmed, "::") {
+		return "", "", errors.New("git remote helper transports are not allowed")
+	}
+	if LooksSecretLike(trimmed) {
+		return "", "", errors.New("repository URL appears to contain secret material")
+	}
+
+	if match := schemeRepositoryURLPattern.FindStringSubmatch(trimmed); match != nil {
+		scheme := strings.ToLower(match[1])
+		switch scheme {
+		case "https://", "http://", "ssh://", "git://":
+		default:
+			return "", "", fmt.Errorf("unsupported repository URL scheme %q (expected https, http, ssh, or git)", strings.TrimSuffix(scheme, "://"))
+		}
+		authority := match[2]
+		if atIndex := strings.LastIndexByte(authority, '@'); atIndex >= 0 {
+			userInfo := authority[:atIndex]
+			if userInfo == "" || strings.Contains(userInfo, ":") || strings.Contains(userInfo, "@") {
+				return "", "", errors.New("repository URL must not embed password or token credentials")
+			}
+		}
+		repositoryPath := strings.Trim(match[3], "/")
+		if repositoryPath == "" || strings.Contains(repositoryPath, "..") {
+			return "", "", errors.New("repository URL is missing a valid repository path")
+		}
+	} else {
+		match := scpRepositoryURLPattern.FindStringSubmatch(trimmed)
+		if match == nil {
+			return "", "", errors.New("repository URL must use https://, http://, ssh://, git://, or [user@]host:org/repo syntax")
+		}
+		if strings.Contains(match[3], "..") {
+			return "", "", errors.New("repository URL contains invalid path traversal")
+		}
+	}
+
+	normalizedIdentity, ok := NormalizeRepositoryIdentity(trimmed)
+	if !ok {
+		return "", "", errors.New("repository URL could not be normalized")
+	}
+	return trimmed, normalizedIdentity, nil
+}
+
+func ValidateRelativeWorkspaceSubpath(rawSubpath string) (string, error) {
+	trimmed := strings.TrimSpace(rawSubpath)
+	if trimmed == "" || !IsBoundedString(trimmed, MaximumWorkspaceSubpathBytes) {
+		return "", errors.New("directory must be between 1 and 256 bytes")
+	}
+	if strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "\\") || strings.ContainsRune(trimmed, 0) || strings.ContainsRune(trimmed, '\\') || strings.ContainsRune(trimmed, ':') {
+		return "", errors.New("directory must be a clean relative path beneath the workspace root")
+	}
+	for segment := range strings.SplitSeq(trimmed, "/") {
+		if segment == "" || segment == "." || segment == ".." || segment == ".git" || segment == ".orchestra" || strings.HasPrefix(segment, "-") {
+			return "", fmt.Errorf("directory contains disallowed path segment %q", segment)
+		}
+	}
+	cleaned := path.Clean(trimmed)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", errors.New("directory escapes workspace root")
+	}
+	return cleaned, nil
+}
+
+func DefaultCloneDirectoryName(repositoryURL string) (string, error) {
+	normalized, ok := NormalizeRepositoryIdentity(strings.TrimSpace(repositoryURL))
+	if !ok {
+		return "", errors.New("repository URL is invalid")
+	}
+	tail := normalized
+	if slashIndex := strings.LastIndexByte(tail, '/'); slashIndex >= 0 {
+		tail = tail[slashIndex+1:]
+	}
+	if colonIndex := strings.LastIndexByte(tail, ':'); colonIndex >= 0 {
+		tail = tail[colonIndex+1:]
+	}
+	tail = strings.TrimSuffix(tail, ".git")
+	return ValidateRelativeWorkspaceSubpath(tail)
+}
+
+type DiscoveredRepository struct {
+	Root          string   `json:"root"`
+	Path          string   `json:"path"`
+	RelativePath  string   `json:"relativePath"`
+	Repository    string   `json:"repository,omitempty"`
+	Remotes       []string `json:"remotes,omitempty"`
+	DefaultBranch string   `json:"defaultBranch,omitempty"`
+	HeadBranch    string   `json:"headBranch,omitempty"`
+}
+
+func (discovered DiscoveredRepository) MatchesRepository(requestedRepository string) bool {
+	if discovered.Repository != "" && RepositoriesMatch(discovered.Repository, requestedRepository) {
+		return true
+	}
+	for _, remote := range discovered.Remotes {
+		if RepositoriesMatch(remote, requestedRepository) {
+			return true
+		}
+	}
+	return false
+}
+
+func (discovered DiscoveredRepository) Validate() error {
+	for name, targetPath := range map[string]string{
+		"root": discovered.Root,
+		"path": discovered.Path,
+	} {
+		if !strings.HasPrefix(targetPath, "/") || !IsBoundedString(targetPath, TextMaximumBytes) || strings.ContainsRune(targetPath, 0) {
+			return fmt.Errorf("discovered repository %s must be an absolute path", name)
+		}
+	}
+	cleanRoot := path.Clean(discovered.Root)
+	cleanPath := path.Clean(discovered.Path)
+	if cleanPath == cleanRoot {
+		if discovered.RelativePath != "." {
+			return errors.New("discovered repository at workspace root must have relativePath '.'")
+		}
+	} else {
+		if !strings.HasPrefix(cleanPath, cleanRoot+"/") {
+			return errors.New("discovered repository path must reside within its workspace root")
+		}
+		validatedRelative, err := ValidateRelativeWorkspaceSubpath(discovered.RelativePath)
+		if err != nil || path.Join(cleanRoot, validatedRelative) != cleanPath {
+			return errors.New("discovered repository relativePath does not match path")
+		}
+	}
+	if discovered.Repository != "" {
+		normalized, ok := NormalizeRepositoryIdentity(discovered.Repository)
+		if !ok || !IsBoundedString(discovered.Repository, RepositoryURLMaximumBytes) || normalized != discovered.Repository {
+			return errors.New("discovered repository identity is not normalized")
+		}
+	}
+	if len(discovered.Remotes) > MaximumRemotesPerRepository {
+		return errors.New("discovered repository remotes exceed maximum count")
+	}
+	for _, remote := range discovered.Remotes {
+		normalized, ok := NormalizeRepositoryIdentity(remote)
+		if !ok || !IsBoundedString(remote, RepositoryURLMaximumBytes) || normalized != remote {
+			return errors.New("discovered repository remote is not normalized")
+		}
+	}
+	if discovered.DefaultBranch != "" && !IsWorkspaceLeaseBaseBranch(discovered.DefaultBranch) {
+		return errors.New("discovered repository defaultBranch is malformed")
+	}
+	if discovered.HeadBranch != "" && !IsWorkspaceLeaseBaseBranch(discovered.HeadBranch) {
+		return errors.New("discovered repository headBranch is malformed")
+	}
+	return nil
+}
+
+type NodeRepositoryReport struct {
+	NodeID       string                 `json:"nodeId"`
+	Roots        []string               `json:"roots"`
+	Repositories []DiscoveredRepository `json:"repositories"`
+	ObservedAt   string                 `json:"observedAt"`
+}
+
+func (report NodeRepositoryReport) Validate() error {
+	if !IsIdentifier(report.NodeID) {
+		return errors.New("repository report nodeId is invalid")
+	}
+	if len(report.Roots) > 32 {
+		return errors.New("repository report roots exceed maximum count")
+	}
+	cleanRoots := make([]string, 0, len(report.Roots))
+	for _, root := range report.Roots {
+		if !strings.HasPrefix(root, "/") || !IsBoundedString(root, TextMaximumBytes) || strings.ContainsRune(root, 0) {
+			return errors.New("repository report root must be an absolute path")
+		}
+		cleanRoots = append(cleanRoots, path.Clean(root))
+	}
+	if len(report.Repositories) > MaximumDiscoveredRepositories {
+		return errors.New("repository report exceeds maximum discovered repositories")
+	}
+	for _, repository := range report.Repositories {
+		if err := repository.Validate(); err != nil {
+			return err
+		}
+		if len(cleanRoots) > 0 && !slices.Contains(cleanRoots, path.Clean(repository.Root)) {
+			return errors.New("discovered repository root is not listed in report roots")
+		}
+	}
+	if strings.TrimSpace(report.ObservedAt) == "" || !IsBoundedString(report.ObservedAt, 64) {
+		return errors.New("repository report observedAt is required")
+	}
+	return nil
+}
+
+type RepositoryCloneDirective struct {
+	RequestID     string `json:"requestId"`
+	RepositoryURL string `json:"repositoryUrl"`
+	WorkspaceRoot string `json:"workspaceRoot,omitempty"`
+	Directory     string `json:"directory,omitempty"`
+	Branch        string `json:"branch,omitempty"`
+}
+
+func (directive RepositoryCloneDirective) Validate() error {
+	if !IsIdentifier(directive.RequestID) {
+		return errors.New("clone directive requestId is invalid")
+	}
+	if _, _, err := ValidateCloneRepositoryURL(directive.RepositoryURL); err != nil {
+		return err
+	}
+	if directive.WorkspaceRoot != "" {
+		if !strings.HasPrefix(directive.WorkspaceRoot, "/") || !IsBoundedString(directive.WorkspaceRoot, TextMaximumBytes) || strings.ContainsRune(directive.WorkspaceRoot, 0) {
+			return errors.New("clone directive workspaceRoot must be an absolute path")
+		}
+	}
+	if directive.Directory != "" {
+		if _, err := ValidateRelativeWorkspaceSubpath(directive.Directory); err != nil {
+			return err
+		}
+	}
+	if directive.Branch != "" && !IsWorkspaceLeaseBaseBranch(directive.Branch) {
+		return errors.New("clone directive branch is invalid")
+	}
+	return nil
+}
+
+type RepositoryCloneResult struct {
+	RequestID  string                `json:"requestId"`
+	NodeID     string                `json:"nodeId"`
+	Repository *DiscoveredRepository `json:"repository,omitempty"`
+	Report     *NodeRepositoryReport `json:"report,omitempty"`
+	Created    bool                  `json:"created,omitempty"`
+	Error      string                `json:"error,omitempty"`
+	ObservedAt string                `json:"observedAt"`
+}
+
+func (result RepositoryCloneResult) Validate() error {
+	if !IsIdentifier(result.RequestID) {
+		return errors.New("clone result requestId is invalid")
+	}
+	if !IsIdentifier(result.NodeID) {
+		return errors.New("clone result nodeId is invalid")
+	}
+	if result.Repository != nil {
+		if err := result.Repository.Validate(); err != nil {
+			return err
+		}
+	}
+	if result.Report != nil {
+		if result.Report.NodeID != result.NodeID {
+			return errors.New("clone result report nodeId mismatch")
+		}
+		if err := result.Report.Validate(); err != nil {
+			return err
+		}
+	}
+	if !IsBoundedString(result.Error, DiagnosticMaximumBytes) || LooksSecretLike(result.Error) {
+		return errors.New("clone result error is invalid")
+	}
+	if strings.TrimSpace(result.ObservedAt) == "" || !IsBoundedString(result.ObservedAt, 64) {
+		return errors.New("clone result observedAt is required")
 	}
 	return nil
 }

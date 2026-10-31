@@ -55,13 +55,19 @@ func AssessComponents(operationContext context.Context, manifest Manifest, ledge
 			Readiness:         "unavailable",
 		}
 		assessment.HarnessInstalled = assessment.HarnessApplicable && discovered && profile.Available
+		externalAdapterPath := ""
+		if entry.Kind == ComponentKindACPAdapter && activation.Rejection == nil {
+			if discoveredPath, found := DiscoverExternalACPAdapter(entry, platform); found {
+				externalAdapterPath = discoveredPath
+			}
+		}
 		activeInstalled, activeErr := ActiveInstalledComponent(dataRoot, manifest, platform, ledger, activation, entry.Reference().Identity())
 		if entry.Kind == ComponentKindACPAdapter && options.ACPStartupEvidenceKnown && activeErr == nil &&
 			!slices.Contains(profile.Transports, protocol.TransportACP) {
 			activeErr = errors.New("the selected ACP adapter did not pass the daemon startup probe")
 		}
 		doctorEntry := ComponentDoctorEntry{Component: entry.Reference(), Provenance: ComponentProvenanceNone}
-		describeActivation(&doctorEntry, activation, activeErr, assessment.HarnessInstalled)
+		describeActivation(&doctorEntry, activation, activeErr, assessment.HarnessInstalled, externalAdapterPath != "")
 		assessment.ActiveVersion, assessment.RollbackVersion, assessment.Provenance = doctorEntry.ActiveVersion, doctorEntry.RollbackVersion, doctorEntry.Provenance
 		assessment.Notes = append(assessment.Notes, doctorEntry.Notes...)
 
@@ -86,9 +92,10 @@ func AssessComponents(operationContext context.Context, manifest Manifest, ledge
 			}
 		}
 		slices.Sort(assessment.InstalledVersions)
-		assessment.ComponentInstalled = slices.Contains(assessment.InstalledVersions, entry.Version)
+		managedDeclaredInstalled := slices.Contains(assessment.InstalledVersions, entry.Version)
+		assessment.ComponentInstalled = managedDeclaredInstalled || (entry.Kind == ComponentKindACPAdapter && assessment.Provenance == ComponentProvenanceExternal)
 		assessment.RollbackAvailable = assessment.RollbackVersion != "" && slices.Contains(assessment.InstalledVersions, assessment.RollbackVersion)
-		if assessment.ActiveVersion != "" && assessment.ActiveVersion != entry.Version && assessment.ComponentInstalled {
+		if assessment.ActiveVersion != "" && assessment.ActiveVersion != entry.Version && managedDeclaredInstalled {
 			assessment.UpdateVersion = entry.Version
 			appendCode(&assessment, "update-available")
 		}
@@ -105,14 +112,31 @@ func AssessComponents(operationContext context.Context, manifest Manifest, ledge
 		} else {
 			assessment.Notes = append(assessment.Notes, "no install location for component kind "+string(entry.Kind))
 		}
-		if assessment.ComponentInstalled && assessment.ActiveVersion == "" && activation.Rejection == nil {
+		if entry.Kind == ComponentKindACPAdapter && assessment.Provenance == ComponentProvenanceExternal && externalAdapterPath != "" {
+			assessment.ComponentPath = externalAdapterPath
+			assessment.Notes = append(assessment.Notes, "discovered external ACP adapter at "+externalAdapterPath)
+		}
+		if managedDeclaredInstalled && assessment.ActiveVersion == "" && assessment.Provenance != ComponentProvenanceExternal && activation.Rejection == nil {
 			assessment.Notes = append(assessment.Notes, "installed but not activated; run `orchestra setup activate`")
 		}
 		if specification, allowed := AuthProbeAllowlist[entry.HarnessID]; allowed && assessment.HarnessInstalled {
 			assessment.AuthReadiness = RunAuthProbe(operationContext, profile.Binary, specification.Arguments, specification.SuccessExitCode)
 		}
-		assessment.ACPLaunchReady = (entry.Kind == ComponentKindACPAdapter && assessment.HarnessInstalled && activeErr == nil && assessment.AuthReadiness == AuthReadinessReady) ||
-			(entry.Kind == ComponentKindHarness && entry.HarnessID == protocol.HarnessAntigravityCLI && assessment.HarnessInstalled && assessment.AuthReadiness == AuthReadinessReady && (!options.ACPStartupEvidenceKnown || slices.Contains(profile.Transports, protocol.TransportACP)))
+		externalACPVerified := !options.ACPStartupEvidenceKnown || slices.Contains(profile.Transports, protocol.TransportACP)
+		if entry.Kind == ComponentKindACPAdapter && assessment.Provenance == ComponentProvenanceExternal && options.ACPStartupEvidenceKnown && !externalACPVerified {
+			assessment.Notes = append(assessment.Notes, "the external ACP adapter was not enabled or did not pass the daemon startup probe")
+		}
+		acpAdapterReady := entry.Kind == ComponentKindACPAdapter &&
+			assessment.HarnessInstalled &&
+			assessment.AuthReadiness == AuthReadinessReady &&
+			((assessment.ActiveVersion != "" && activeErr == nil) ||
+				(assessment.Provenance == ComponentProvenanceExternal && externalACPVerified))
+		antigravityBuiltInReady := entry.Kind == ComponentKindHarness &&
+			entry.HarnessID == protocol.HarnessAntigravityCLI &&
+			assessment.HarnessInstalled &&
+			assessment.AuthReadiness == AuthReadinessReady &&
+			(!options.ACPStartupEvidenceKnown || slices.Contains(profile.Transports, protocol.TransportACP))
+		assessment.ACPLaunchReady = acpAdapterReady || antigravityBuiltInReady
 		if entry.Kind == ComponentKindHarness && entry.HarnessID == protocol.HarnessAntigravityCLI && assessment.HarnessInstalled {
 			assessment.Notes = append(assessment.Notes, "built-in ACP bridge available via `orchestra acp-bridge antigravity`")
 		}
@@ -126,9 +150,9 @@ func AssessComponents(operationContext context.Context, manifest Manifest, ledge
 			appendCode(&assessment, "activation-rejected")
 		case assessment.ActiveVersion == "":
 			switch {
-			case assessment.Provenance == ComponentProvenanceExternal && assessment.HarnessInstalled:
+			case assessment.Provenance == ComponentProvenanceExternal && assessment.HarnessInstalled && (entry.Kind != ComponentKindACPAdapter || externalACPVerified):
 				assessment.Readiness = authComponentReadiness(assessment.AuthReadiness)
-			case assessment.ComponentInstalled:
+			case managedDeclaredInstalled:
 				assessment.Readiness = "inactive"
 				appendCode(&assessment, "not-activated")
 			default:

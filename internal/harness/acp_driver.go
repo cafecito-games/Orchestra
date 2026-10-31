@@ -119,12 +119,31 @@ func (driver *ACPDriver) Disable(harnessID string, reason error) {
 	driver.disabled[harnessID] = reason
 }
 
+func expectedAgentVersion(adapter ACPAdapter) string {
+	if adapter.Source == protocol.ACPAdapterSourceAdministrator || adapter.Source == protocol.ACPAdapterSourceExternal {
+		return ""
+	}
+	return adapter.Version
+}
+
 func (driver *ACPDriver) provenance(harnessID string) *protocol.ACPAdapterProvenance {
 	adapter, configured := driver.options.Adapters[harnessID]
-	if !configured || adapter.ID == "" || adapter.Version == "" || adapter.Source == "" {
+	if !configured || adapter.ID == "" || adapter.Source == "" {
 		return nil
 	}
-	return &protocol.ACPAdapterProvenance{ID: adapter.ID, Version: adapter.Version, Source: adapter.Source}
+	version := adapter.Version
+	if adapter.Source == protocol.ACPAdapterSourceExternal || adapter.Source == protocol.ACPAdapterSourceAdministrator || version == "" {
+		driver.mutex.Lock()
+		probedVersion := driver.probed[harnessID].AdapterVersion
+		driver.mutex.Unlock()
+		if probedVersion != "" {
+			version = probedVersion
+		}
+	}
+	if !protocol.IsNormalizedVersion(version) {
+		return nil
+	}
+	return &protocol.ACPAdapterProvenance{ID: adapter.ID, Version: version, Source: adapter.Source}
 }
 
 func (driver *ACPDriver) adapter(harnessID string) (ACPAdapter, ACPProvider, error) {
@@ -232,7 +251,7 @@ func (driver *ACPDriver) Probe(operationContext context.Context, harnessID strin
 	}
 	client := acp.NewClient(process.stdout, process.stdin, acp.Options{
 		ClientVersion:        driver.options.ClientVersion,
-		ExpectedAgentVersion: adapter.Version,
+		ExpectedAgentVersion: expectedAgentVersion(adapter),
 		RequestTimeout:       driver.options.RequestTimeout,
 	})
 	capabilities, probeErr := client.Probe(operationContext)
@@ -279,7 +298,7 @@ func (driver *ACPDriver) Execute(operationContext context.Context, invocation In
 	client := acp.NewClient(process.stdout, process.stdin, acp.Options{
 		RunID:                invocation.Run.ID,
 		ClientVersion:        driver.options.ClientVersion,
-		ExpectedAgentVersion: adapter.Version,
+		ExpectedAgentVersion: expectedAgentVersion(adapter),
 		Secrets:              secrets,
 		Permission:           permission,
 		Events: func(event protocol.HarnessEvent) {
@@ -320,6 +339,9 @@ func (driver *ACPDriver) Execute(operationContext context.Context, invocation In
 		}
 		details := transportDetails{}
 		if capabilities, negotiated := client.Negotiated(); negotiated {
+			driver.mutex.Lock()
+			driver.probed[invocation.Run.HarnessID] = capabilities
+			driver.mutex.Unlock()
 			details.capabilities = &capabilities
 		}
 		invocation.announce(details)

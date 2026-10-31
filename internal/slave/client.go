@@ -37,6 +37,7 @@ type ClientOptions struct {
 	WorkspaceManager   *workspace.Manager
 	CapabilityReport   *protocol.NodeCapabilityReport
 	ComponentReport    *protocol.ComponentInventoryReport
+	RepositoryReport   *protocol.NodeRepositoryReport
 	HTTPClient         *http.Client
 	DataRoot           string
 	ExecutablePath     string
@@ -56,8 +57,11 @@ type Client struct {
 	token              string
 	node               protocol.ComputeNode
 	runner             *harness.Runner
+	workspaceManager   *workspace.Manager
 	capabilityReport   *protocol.NodeCapabilityReport
 	componentReport    *protocol.ComponentInventoryReport
+	repositoryMutex    sync.Mutex
+	repositoryReport   *protocol.NodeRepositoryReport
 	httpClient         *http.Client
 	dataRoot           string
 	executablePath     string
@@ -126,8 +130,10 @@ func NewClient(options ClientOptions) *Client {
 		token:               options.Token,
 		node:                options.Node,
 		runner:              options.Runner,
+		workspaceManager:    options.WorkspaceManager,
 		capabilityReport:    options.CapabilityReport,
 		componentReport:     options.ComponentReport,
+		repositoryReport:    options.RepositoryReport,
 		httpClient:          options.HTTPClient,
 		dataRoot:            strings.TrimSpace(options.DataRoot),
 		executablePath:      strings.TrimSpace(options.ExecutablePath),
@@ -376,6 +382,17 @@ func (client *Client) completeAdmissionHandshake(
 
 	client.leases.replayPending()
 
+	if repositoryReport, hasReport := client.buildRepositoryReport(connectionContext); hasReport {
+		if err := client.writeMessage(connectionContext, connection, protocol.SlaveControlMessage{
+			Type:             "workspace.repositories",
+			NodeID:           client.node.ID,
+			RepositoryReport: &repositoryReport,
+			At:               repositoryReport.ObservedAt,
+		}); err != nil {
+			return err
+		}
+	}
+
 	activeRunIDs, activeInstanceIDs := client.activeIdentifiers()
 	activeRuns := len(activeRunIDs)
 	activeInstances := len(activeInstanceIDs)
@@ -468,7 +485,204 @@ func (client *Client) dispatchMasterMessage(message protocol.MasterControlMessag
 				client.handleNodeUpdate(directiveCopy)
 			})
 		}
+	case "workspace.repositories.refresh":
+		requestID := message.RequestID
+		client.waitGroup.Go(func() {
+			client.handleRepositoryRefresh(requestID)
+		})
+	case "workspace.repository.clone":
+		if message.Clone != nil {
+			directiveCopy := *message.Clone
+			client.waitGroup.Go(func() {
+				client.handleRepositoryClone(directiveCopy)
+			})
+		}
 	}
+}
+
+func (client *Client) buildRepositoryReport(operationContext context.Context) (protocol.NodeRepositoryReport, bool) {
+	observedAt := client.nowUTC()
+	if client.workspaceManager != nil && client.workspaceManager.Supports(protocol.WorkspaceIsolationGitWorktree) {
+		discovered, err := client.workspaceManager.DiscoverRepositories(operationContext)
+		if err == nil {
+			if discovered == nil {
+				discovered = []protocol.DiscoveredRepository{}
+			}
+			report := protocol.NodeRepositoryReport{
+				NodeID:       client.node.ID,
+				Roots:        slices.Clone(client.node.WorkspaceRoots),
+				Repositories: discovered,
+				ObservedAt:   observedAt,
+			}
+			if report.Validate() == nil {
+				client.repositoryMutex.Lock()
+				reportCopy := report
+				client.repositoryReport = &reportCopy
+				client.repositoryMutex.Unlock()
+				return report, true
+			}
+		}
+	}
+
+	client.repositoryMutex.Lock()
+	defer client.repositoryMutex.Unlock()
+	if client.repositoryReport != nil {
+		reportCopy := *client.repositoryReport
+		reportCopy.NodeID = client.node.ID
+		reportCopy.Roots = slices.Clone(reportCopy.Roots)
+		reportCopy.Repositories = slices.Clone(reportCopy.Repositories)
+		reportCopy.ObservedAt = observedAt
+		if reportCopy.Validate() == nil {
+			return reportCopy, true
+		}
+	}
+	if len(client.node.WorkspaceRoots) == 0 {
+		return protocol.NodeRepositoryReport{}, false
+	}
+	emptyReport := protocol.NodeRepositoryReport{
+		NodeID:       client.node.ID,
+		Roots:        slices.Clone(client.node.WorkspaceRoots),
+		Repositories: []protocol.DiscoveredRepository{},
+		ObservedAt:   observedAt,
+	}
+	if emptyReport.Validate() != nil {
+		return protocol.NodeRepositoryReport{}, false
+	}
+	return emptyReport, true
+}
+
+func (client *Client) handleRepositoryRefresh(requestID string) {
+	report, hasReport := client.buildRepositoryReport(client.rootContext)
+	if !hasReport {
+		report = protocol.NodeRepositoryReport{
+			NodeID:       client.node.ID,
+			Roots:        slices.Clone(client.node.WorkspaceRoots),
+			Repositories: []protocol.DiscoveredRepository{},
+			ObservedAt:   client.nowUTC(),
+		}
+	}
+	client.activityLogger.Info(
+		"workspace",
+		"repositories refreshed",
+		activitylog.String("node", client.node.ID),
+		activitylog.Int("repositories", len(report.Repositories)),
+	)
+	client.sendOrQueue(protocol.SlaveControlMessage{
+		Type:             "workspace.repositories",
+		NodeID:           client.node.ID,
+		RequestID:        requestID,
+		RepositoryReport: &report,
+		At:               report.ObservedAt,
+	})
+}
+
+func (client *Client) handleRepositoryClone(directive protocol.RepositoryCloneDirective) {
+	observedAt := client.nowUTC()
+	if err := directive.Validate(); err != nil {
+		failure := protocol.RepositoryCloneResult{
+			RequestID:  directive.RequestID,
+			NodeID:     client.node.ID,
+			Error:      protocol.BoundedDiagnostic(protocol.RedactText(err.Error())),
+			ObservedAt: observedAt,
+		}
+		client.sendOrQueue(protocol.SlaveControlMessage{
+			Type:        "workspace.repository.clone.result",
+			NodeID:      client.node.ID,
+			RequestID:   directive.RequestID,
+			CloneResult: &failure,
+			At:          observedAt,
+		})
+		return
+	}
+
+	if client.workspaceManager == nil {
+		failure := protocol.RepositoryCloneResult{
+			RequestID:  directive.RequestID,
+			NodeID:     client.node.ID,
+			Error:      "workspace manager is not configured on this worker node",
+			ObservedAt: observedAt,
+		}
+		client.sendOrQueue(protocol.SlaveControlMessage{
+			Type:        "workspace.repository.clone.result",
+			NodeID:      client.node.ID,
+			RequestID:   directive.RequestID,
+			CloneResult: &failure,
+			At:          observedAt,
+		})
+		return
+	}
+
+	outcome, err := client.workspaceManager.CloneRepository(client.rootContext, workspace.CloneRequest{
+		RepositoryURL: directive.RepositoryURL,
+		WorkspaceRoot: directive.WorkspaceRoot,
+		Directory:     directive.Directory,
+		Branch:        directive.Branch,
+	})
+	completedAt := client.nowUTC()
+	if err != nil {
+		diagnostic := protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))
+		client.activityLogger.Warn(
+			"workspace",
+			"repository clone failed",
+			activitylog.String("node", client.node.ID),
+			activitylog.String("error", diagnostic),
+		)
+		failure := protocol.RepositoryCloneResult{
+			RequestID:  directive.RequestID,
+			NodeID:     client.node.ID,
+			Error:      diagnostic,
+			ObservedAt: completedAt,
+		}
+		client.sendOrQueue(protocol.SlaveControlMessage{
+			Type:        "workspace.repository.clone.result",
+			NodeID:      client.node.ID,
+			RequestID:   directive.RequestID,
+			CloneResult: &failure,
+			At:          completedAt,
+		})
+		return
+	}
+
+	repositories := outcome.Repositories
+	if repositories == nil {
+		repositories = []protocol.DiscoveredRepository{outcome.Repository}
+	}
+	report := protocol.NodeRepositoryReport{
+		NodeID:       client.node.ID,
+		Roots:        slices.Clone(client.node.WorkspaceRoots),
+		Repositories: repositories,
+		ObservedAt:   completedAt,
+	}
+	client.repositoryMutex.Lock()
+	reportCopy := report
+	client.repositoryReport = &reportCopy
+	client.repositoryMutex.Unlock()
+
+	clonedCopy := outcome.Repository
+	result := protocol.RepositoryCloneResult{
+		RequestID:  directive.RequestID,
+		NodeID:     client.node.ID,
+		Repository: &clonedCopy,
+		Report:     &report,
+		Created:    outcome.Created,
+		ObservedAt: completedAt,
+	}
+	client.activityLogger.Info(
+		"workspace",
+		"repository cloned",
+		activitylog.String("node", client.node.ID),
+		activitylog.String("repository", clonedCopy.Repository),
+		activitylog.String("path", clonedCopy.Path),
+		activitylog.Bool("created", outcome.Created),
+	)
+	client.sendOrQueue(protocol.SlaveControlMessage{
+		Type:             "workspace.repository.clone.result",
+		NodeID:           client.node.ID,
+		RequestID:        directive.RequestID,
+		CloneResult:      &result,
+		RepositoryReport: &report,
+		At:               completedAt,
+	})
 }
 
 func (client *Client) sendHeartbeat() {

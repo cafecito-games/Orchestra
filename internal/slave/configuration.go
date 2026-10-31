@@ -82,6 +82,7 @@ type Runtime struct {
 	Client           *Client
 	CapabilityReport protocol.NodeCapabilityReport
 	ComponentReport  protocol.ComponentInventoryReport
+	RepositoryReport protocol.NodeRepositoryReport
 	Warnings         []string
 }
 
@@ -323,9 +324,19 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 			rawWorkspaceRoots = splitEnvironmentList(raw, string(os.PathListSeparator))
 		}
 	}
+	if len(rawWorkspaceRoots) == 0 {
+		workingDirectory, wdErr := os.Getwd()
+		if wdErr != nil {
+			return Configuration{}, fmt.Errorf("resolve default workspace root from working directory: %w", wdErr)
+		}
+		rawWorkspaceRoots = []string{workingDirectory}
+	}
 	canonicalRoots, err := canonicalizeWorkspaceRoots(rawWorkspaceRoots)
 	if err != nil {
 		return Configuration{}, err
+	}
+	if len(canonicalRoots) == 0 {
+		return Configuration{}, ErrMissingWorkspaceRoot
 	}
 	configuration.WorkspaceRoots = canonicalRoots
 
@@ -596,6 +607,17 @@ func BuildRuntime(operationContext context.Context, configuration Configuration)
 	)
 	componentReport := setup.ComponentInventoryReport(configuration.NodeID, observedAt, assessments)
 
+	discoveredRepositories, _ := workspaceManager.DiscoverRepositories(operationContext)
+	if discoveredRepositories == nil {
+		discoveredRepositories = []protocol.DiscoveredRepository{}
+	}
+	repositoryReport := protocol.NodeRepositoryReport{
+		NodeID:       configuration.NodeID,
+		Roots:        slices.Clone(configuration.WorkspaceRoots),
+		Repositories: discoveredRepositories,
+		ObservedAt:   observedAt,
+	}
+
 	client := NewClient(ClientOptions{
 		Endpoint:          configuration.ControlEndpoint,
 		Token:             configuration.Token,
@@ -604,6 +626,7 @@ func BuildRuntime(operationContext context.Context, configuration Configuration)
 		WorkspaceManager:  workspaceManager,
 		CapabilityReport:  &capabilityReport,
 		ComponentReport:   &componentReport,
+		RepositoryReport:  &repositoryReport,
 		ActivityLogger:    configuration.ActivityLogger,
 		HTTPClient:        configuration.HTTPClient,
 		DataRoot:          configuration.DataRoot,
@@ -618,6 +641,7 @@ func BuildRuntime(operationContext context.Context, configuration Configuration)
 		Client:           client,
 		CapabilityReport: capabilityReport,
 		ComponentReport:  componentReport,
+		RepositoryReport: repositoryReport,
 		Warnings:         warnings,
 	}, nil
 }

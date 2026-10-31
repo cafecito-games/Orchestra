@@ -311,21 +311,26 @@ func (service *Service) findReusableResident(
 		if len(requirements.Transports) > 0 && !slices.Contains(requirements.Transports, allocation.Transport) {
 			continue
 		}
-		if requirements.Workspace != nil && requirements.Workspace.Path != "" && allocation.Workspace != requirements.Workspace.Path {
-			continue
-		}
 
 		report := state.CapabilityReports[node.ID]
 		if reason := checkNodeCapabilities(node, report, requirements); reason != "" {
 			continue
 		}
-		_, resolvedSourcePath, ok := resolveWorkspaceOnNode(node, requirements)
-		if !ok {
+		repositoryReport := state.RepositoryReports[node.ID]
+		_, resolvedSourcePath, workspaceFailure := resolveWorkspaceOnNode(node, repositoryReport, requirements)
+		if workspaceFailure != "" {
+			continue
+		}
+		hasExplicitWorkspaceTarget := requirements.Workspace != nil && (requirements.Workspace.Path != "" || requirements.Workspace.Repository != "")
+		requiresResolvedWorkspace := hasExplicitWorkspaceTarget || (instance.AutoManaged && task.PlacementInstanceID == "")
+		if requiresResolvedWorkspace && allocation.Workspace != resolvedSourcePath {
 			continue
 		}
 
 		candidateWorkspace := allocation.Workspace
-		if resolvedSourcePath != "" {
+		if requiresResolvedWorkspace && resolvedSourcePath != "" {
+			candidateWorkspace = resolvedSourcePath
+		} else if candidateWorkspace == "" {
 			candidateWorkspace = resolvedSourcePath
 		}
 		hasBinding := false
@@ -410,9 +415,19 @@ func (service *Service) assignTaskToResident(
 
 	workspacePath := allocation.Workspace
 	node := state.Nodes[allocation.NodeID]
-	workspaceRoot, resolvedSourcePath, _ := resolveWorkspaceOnNode(node, requirements)
-	if resolvedSourcePath != "" {
+	repositoryReport := state.RepositoryReports[node.ID]
+	workspaceRoot, resolvedSourcePath, _ := resolveWorkspaceOnNode(node, repositoryReport, requirements)
+	hasExplicitWorkspaceTarget := requirements.Workspace != nil && (requirements.Workspace.Path != "" || requirements.Workspace.Repository != "")
+	requiresResolvedWorkspace := hasExplicitWorkspaceTarget || (instance.AutoManaged && task.PlacementInstanceID == "")
+	if requiresResolvedWorkspace && resolvedSourcePath != "" {
 		workspacePath = resolvedSourcePath
+	} else if workspacePath == "" {
+		workspacePath = resolvedSourcePath
+	}
+	if workspacePath != "" && (workspaceRoot == "" || (workspacePath != workspaceRoot && !strings.HasPrefix(workspacePath, workspaceRoot+"/"))) {
+		if matchedRoot := matchingWorkspaceRoot(node, workspacePath); matchedRoot != "" {
+			workspaceRoot = matchedRoot
+		}
 	}
 
 	var leaseGrantPtr *protocol.WorkspaceLeaseGrant
@@ -626,13 +641,22 @@ func (service *Service) selectOfferingForRequirements(
 			continue
 		}
 
-		workspaceRoot, workspacePath, workspaceOK := resolveWorkspaceOnNode(node, effectiveRequirements)
-		if !workspaceOK {
+		repositoryReport := state.RepositoryReports[nodeID]
+		workspaceRoot, workspacePath, workspaceFailure := resolveWorkspaceOnNode(node, repositoryReport, effectiveRequirements)
+		if workspaceFailure != "" {
+			requirementLabel := "workspace-root"
+			if effectiveRequirements.Workspace != nil {
+				if effectiveRequirements.Workspace.Path == "" && effectiveRequirements.Workspace.Repository != "" {
+					requirementLabel = "repository:" + effectiveRequirements.Workspace.Repository
+				} else if effectiveRequirements.Workspace.Path != "" {
+					requirementLabel = "path:" + effectiveRequirements.Workspace.Path
+				}
+			}
 			diagnostic.Unsatisfied = append(diagnostic.Unsatisfied, protocol.UnsatisfiedRequirement{
 				Kind:        "workspace",
-				Requirement: "workspace-root",
+				Requirement: requirementLabel,
 				NodeID:      nodeID,
-				Detail:      fmt.Sprintf("node %s has no workspace root matching requested path", nodeID),
+				Detail:      workspaceFailure,
 			})
 			continue
 		}
@@ -730,6 +754,15 @@ func (service *Service) hasProvisioningCompatibleInstance(
 		}
 		if len(requirements.Transports) > 0 && !slices.Contains(requirements.Transports, allocation.Transport) {
 			continue
+		}
+		requiresResolvedWorkspace := (requirements.Workspace != nil && (requirements.Workspace.Path != "" || requirements.Workspace.Repository != "")) || instance.AutoManaged
+		if requiresResolvedWorkspace {
+			if node, exists := state.Nodes[allocation.NodeID]; exists {
+				_, resolvedSourcePath, failure := resolveWorkspaceOnNode(node, state.RepositoryReports[node.ID], requirements)
+				if failure != "" || allocation.Workspace != resolvedSourcePath {
+					continue
+				}
+			}
 		}
 		return true
 	}
@@ -913,24 +946,86 @@ func checkNodeCapabilities(
 	return ""
 }
 
-func resolveWorkspaceOnNode(
-	node protocol.ComputeNode,
-	requirements protocol.ExecutionRequirements,
-) (string, string, bool) {
-	if len(node.WorkspaceRoots) == 0 {
-		return "", "", false
-	}
-	if requirements.Workspace == nil || requirements.Workspace.Path == "" {
-		return node.WorkspaceRoots[0], node.WorkspaceRoots[0], true
-	}
-	requestedPath := path.Clean(requirements.Workspace.Path)
+func matchingWorkspaceRoot(node protocol.ComputeNode, targetPath string) string {
+	cleanTarget := path.Clean(targetPath)
 	for _, root := range node.WorkspaceRoots {
 		cleanRoot := path.Clean(root)
-		if requestedPath == cleanRoot || strings.HasPrefix(requestedPath, cleanRoot+"/") {
-			return cleanRoot, requestedPath, true
+		if cleanTarget == cleanRoot || strings.HasPrefix(cleanTarget, cleanRoot+"/") {
+			return cleanRoot
 		}
 	}
-	return "", "", false
+	return ""
+}
+
+func resolveWorkspaceOnNode(
+	node protocol.ComputeNode,
+	repositoryReport protocol.NodeRepositoryReport,
+	requirements protocol.ExecutionRequirements,
+) (string, string, string) {
+	if len(node.WorkspaceRoots) == 0 {
+		return "", "", fmt.Sprintf("node %s has no configured workspace roots", node.ID)
+	}
+	if requirements.Workspace == nil || (requirements.Workspace.Path == "" && requirements.Workspace.Repository == "") {
+		return node.WorkspaceRoots[0], node.WorkspaceRoots[0], ""
+	}
+
+	if requirements.Workspace.Path != "" {
+		rawPath := strings.TrimSpace(requirements.Workspace.Path)
+		if strings.HasPrefix(rawPath, "/") {
+			requestedPath := path.Clean(rawPath)
+			if matchedRoot := matchingWorkspaceRoot(node, requestedPath); matchedRoot != "" {
+				return matchedRoot, requestedPath, ""
+			}
+			return "", "", fmt.Sprintf("node %s has no workspace root matching requested path %s", node.ID, requestedPath)
+		}
+
+		cleanRelativePath, subpathErr := protocol.ValidateRelativeWorkspaceSubpath(rawPath)
+		if subpathErr != nil {
+			return "", "", fmt.Sprintf("requested workspace path %q is invalid: %v", rawPath, subpathErr)
+		}
+		for _, discovered := range repositoryReport.Repositories {
+			if discovered.RelativePath != cleanRelativePath {
+				continue
+			}
+			if matchingWorkspaceRoot(node, discovered.Path) == "" {
+				continue
+			}
+			if requirements.Workspace.Repository != "" && !discovered.MatchesRepository(requirements.Workspace.Repository) {
+				continue
+			}
+			return path.Clean(discovered.Root), path.Clean(discovered.Path), ""
+		}
+		return "", "", fmt.Sprintf("node %s does not have discovered repository at relative path %s", node.ID, cleanRelativePath)
+	}
+
+	requestedRepository := strings.TrimSpace(requirements.Workspace.Repository)
+	normalizedRequested, ok := protocol.NormalizeRepositoryIdentity(requestedRepository)
+	if !ok {
+		return "", "", fmt.Sprintf("requested repository %q is invalid", requestedRepository)
+	}
+
+	for _, discovered := range repositoryReport.Repositories {
+		if matchingWorkspaceRoot(node, discovered.Path) == "" {
+			continue
+		}
+		if discovered.Repository == normalizedRequested || slices.Contains(discovered.Remotes, normalizedRequested) {
+			return path.Clean(discovered.Root), path.Clean(discovered.Path), ""
+		}
+	}
+	for _, discovered := range repositoryReport.Repositories {
+		if matchingWorkspaceRoot(node, discovered.Path) == "" {
+			continue
+		}
+		if discovered.MatchesRepository(requestedRepository) {
+			return path.Clean(discovered.Root), path.Clean(discovered.Path), ""
+		}
+	}
+
+	return "", "", fmt.Sprintf(
+		"node %s does not have repository %s under its workspace roots; clone it with clone_repository or refresh_repositories",
+		node.ID,
+		normalizedRequested,
+	)
 }
 
 func chooseModel(profile protocol.HarnessProfile, requirements protocol.ExecutionRequirements) string {

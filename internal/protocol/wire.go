@@ -44,6 +44,8 @@ var DelegationHubToolNames = []string{
 // OrchestratorToolNames are the tools exposed on the master's orchestrator MCP surface.
 var OrchestratorToolNames = []string{
 	"get_execution_inventory",
+	"refresh_repositories",
+	"clone_repository",
 	"update_nodes",
 	"create_thread",
 	"list_threads",
@@ -110,6 +112,8 @@ type SlaveControlMessage struct {
 	Lease             *WorkspaceLeaseUpdate     `json:"lease,omitempty"`
 	CapabilityReport  *NodeCapabilityReport     `json:"report,omitempty"`
 	ComponentReport   *ComponentInventoryReport `json:"componentReport,omitempty"`
+	RepositoryReport  *NodeRepositoryReport     `json:"repositoryReport,omitempty"`
+	CloneResult       *RepositoryCloneResult    `json:"cloneResult,omitempty"`
 	NodeUpdate        *NodeUpdateReport         `json:"nodeUpdate,omitempty"`
 	RequestID         string                    `json:"requestId,omitempty"`
 	Method            string                    `json:"method,omitempty"`
@@ -119,25 +123,26 @@ type SlaveControlMessage struct {
 
 // Control-plane messages sent from the master `/control-agent` endpoint to a slave node.
 type MasterControlMessage struct {
-	Type           string                  `json:"type"`
-	At             string                  `json:"at,omitempty"`
-	RunID          string                  `json:"runId,omitempty"`
-	LeaseID        string                  `json:"leaseId,omitempty"`
-	Status         string                  `json:"status,omitempty"`
-	Mode           string                  `json:"mode,omitempty"`
-	InstanceID     string                  `json:"instanceId,omitempty"`
-	AllocationID   string                  `json:"allocationId,omitempty"`
-	Instance       *AgentInstance          `json:"instance,omitempty"`
-	Allocation     *InstanceAllocation     `json:"allocation,omitempty"`
-	Run            *Run                    `json:"run,omitempty"`
-	SessionBinding *DispatchSessionBinding `json:"sessionBinding,omitempty"`
-	WorkspaceLease *WorkspaceLeaseGrant    `json:"workspaceLease,omitempty"`
-	Lease          *WorkspaceLeaseGrant    `json:"lease,omitempty"`
-	Decision       *ApprovalDecision       `json:"decision,omitempty"`
-	NodeUpdate     *NodeUpdateDirective    `json:"nodeUpdate,omitempty"`
-	RequestID      string                  `json:"requestId,omitempty"`
-	Result         json.RawMessage         `json:"result,omitempty"`
-	Error          *HubRPCError            `json:"error,omitempty"`
+	Type           string                    `json:"type"`
+	At             string                    `json:"at,omitempty"`
+	RunID          string                    `json:"runId,omitempty"`
+	LeaseID        string                    `json:"leaseId,omitempty"`
+	Status         string                    `json:"status,omitempty"`
+	Mode           string                    `json:"mode,omitempty"`
+	InstanceID     string                    `json:"instanceId,omitempty"`
+	AllocationID   string                    `json:"allocationId,omitempty"`
+	Instance       *AgentInstance            `json:"instance,omitempty"`
+	Allocation     *InstanceAllocation       `json:"allocation,omitempty"`
+	Run            *Run                      `json:"run,omitempty"`
+	SessionBinding *DispatchSessionBinding   `json:"sessionBinding,omitempty"`
+	WorkspaceLease *WorkspaceLeaseGrant      `json:"workspaceLease,omitempty"`
+	Lease          *WorkspaceLeaseGrant      `json:"lease,omitempty"`
+	Decision       *ApprovalDecision         `json:"decision,omitempty"`
+	NodeUpdate     *NodeUpdateDirective      `json:"nodeUpdate,omitempty"`
+	Clone          *RepositoryCloneDirective `json:"clone,omitempty"`
+	RequestID      string                    `json:"requestId,omitempty"`
+	Result         json.RawMessage           `json:"result,omitempty"`
+	Error          *HubRPCError              `json:"error,omitempty"`
 }
 
 type HubRPCError struct {
@@ -224,6 +229,7 @@ type NodeDetail struct {
 	Synced            bool                      `json:"synced"`
 	CapabilityReport  *NodeCapabilityReport     `json:"capabilityReport,omitempty"`
 	ComponentReport   *ComponentInventoryReport `json:"componentReport,omitempty"`
+	RepositoryReport  *NodeRepositoryReport     `json:"repositoryReport,omitempty"`
 	UpdateStatus      *NodeUpdateState          `json:"updateStatus,omitempty"`
 	ResidentInstances []string                  `json:"residentInstances,omitempty"`
 }

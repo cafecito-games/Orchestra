@@ -829,6 +829,7 @@ func appendClaudeACPAuthModeNote(entries []setup.ComponentDoctorEntry, claudeACP
 			continue
 		}
 		if resolvedMode, err := harness.ClaudeACPAuthGate(claudeACPAuthMode, os.Environ()); err != nil {
+			entries[index].ACPLaunchReady = false
 			entries[index].Notes = append(entries[index].Notes, "claude ACP: "+err.Error())
 		} else {
 			entries[index].Notes = append(entries[index].Notes, "claude ACP: auth mode "+resolvedMode)

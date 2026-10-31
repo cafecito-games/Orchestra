@@ -252,7 +252,9 @@ func harnessArgumentsForSession(
 		}
 		return arguments, nil
 	case protocol.HarnessCodexCLI:
-		arguments := append([]string{"exec", "--json"}, nativeCodexSandboxArguments(approvalPolicy)...)
+		// Orchestra confines execution beneath canonicalized workspace roots, which may be
+		// parent multi-repository directories rather than a single Git checkout.
+		arguments := append([]string{"exec", "--json", "--skip-git-repo-check"}, nativeCodexSandboxArguments(approvalPolicy)...)
 		if run.Model != "" && run.Model != "default" {
 			arguments = append(arguments, "--model", run.Model)
 		}

@@ -94,6 +94,12 @@ func Load(options Options) (Result, error) {
 		switch {
 		case result.Skipped[harnessID] != "":
 		case len(selected) == 0:
+			if len(candidates) == 1 {
+				if externalPath, found := setup.DiscoverExternalACPAdapter(candidates[0], options.Platform); found {
+					result.Adapters[harnessID] = externalAdapter(candidates[0], externalPath)
+					break
+				}
+			}
 			result.Skipped[harnessID] = "no adapter version is activated for this harness"
 		case len(selected) > 1:
 			result.Skipped[harnessID] = "more than one activated adapter matches the harness"
@@ -102,6 +108,16 @@ func Load(options Options) (Result, error) {
 		}
 	}
 	return result, nil
+}
+
+func externalAdapter(entry setup.ComponentManifestEntry, executablePath string) harness.ACPAdapter {
+	return harness.ACPAdapter{
+		Binary:      executablePath,
+		Arguments:   entry.Launch.Arguments,
+		Environment: entry.Launch.Environment,
+		ID:          entry.ID,
+		Source:      protocol.ACPAdapterSourceExternal,
+	}
 }
 
 func installedAdapter(installed setup.InstalledComponent) harness.ACPAdapter {
