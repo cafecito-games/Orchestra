@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -110,7 +109,7 @@ func New(caller Caller, uploader Uploader) *Server {
 }
 
 func (server *Server) Start(operationContext context.Context) error {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("start MCP listener: %w", err)
 	}
@@ -129,11 +128,7 @@ func (server *Server) Start(operationContext context.Context) error {
 }
 
 func (server *Server) Grant(runID, workspace string, canDelegate bool) (Configuration, error) {
-	tokenBytes := make([]byte, 32)
-	if _, err := rand.Read(tokenBytes); err != nil {
-		return Configuration{}, fmt.Errorf("create MCP capability: %w", err)
-	}
-	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
+	token := rand.Text()
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
 	connection := &connectionSignal{connected: make(chan struct{})}
@@ -193,11 +188,11 @@ func (server *Server) serveHTTP(writer http.ResponseWriter, request *http.Reques
 }
 
 func (server *Server) requestGrant(request *http.Request) (grant, bool) {
-	header := request.Header.Get("Authorization")
-	if !strings.HasPrefix(header, "Bearer ") {
+	token, ok := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
+	if !ok {
 		return grant{}, false
 	}
-	return server.lookupGrant(strings.TrimPrefix(header, "Bearer "))
+	return server.lookupGrant(token)
 }
 
 func validOrigin(raw string) bool {
@@ -237,7 +232,6 @@ func (server *Server) newProtocolServer(activeGrant grant) *mcp.Server {
 	})
 	for _, name := range ToolNames(activeGrant.canDelegate) {
 		definition := definitionForGrant(name, activeGrant.canDelegate)
-		destructive := false
 		protocolServer.AddTool(&mcp.Tool{
 			Name:         name,
 			Title:        definition.title,
@@ -246,7 +240,7 @@ func (server *Server) newProtocolServer(activeGrant grant) *mcp.Server {
 			OutputSchema: definition.output,
 			Annotations: &mcp.ToolAnnotations{
 				ReadOnlyHint:    definition.readOnly,
-				DestructiveHint: &destructive,
+				DestructiveHint: new(false),
 				IdempotentHint:  true,
 			},
 		}, func(operationContext context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -364,8 +358,7 @@ func (server *Server) postArtifact(operationContext context.Context, activeGrant
 		return nil, err
 	}
 	if err := server.uploader(operationContext, uploadPath, file, size); err != nil {
-		var uploadFailure *UploadError
-		if errors.As(err, &uploadFailure) && uploadFailure.Uncertain {
+		if uploadFailure, ok := errors.AsType[*UploadError](err); ok && uploadFailure.Uncertain {
 			return nil, &ToolError{Code: "upload_uncertain", Message: uploadFailure.Error(), Retryable: true}
 		}
 		return nil, fmt.Errorf("upload artifact: %w", err)
@@ -413,8 +406,7 @@ func openArtifact(workspace, requested string) (*os.File, string, int64, string,
 }
 
 func asToolError(err error) *ToolError {
-	var typed *ToolError
-	if errors.As(err, &typed) {
+	if typed, ok := errors.AsType[*ToolError](err); ok {
 		return typed
 	}
 	return &ToolError{Code: "tool_failed", Message: err.Error()}

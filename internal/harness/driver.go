@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -92,9 +93,7 @@ func NewRunner(profiles []protocol.HarnessProfile) *Runner {
 
 func (runner *Runner) WithManagedHarnesses(managed map[string]ManagedHarness) *Runner {
 	runner.managedHarnesses = map[string]ManagedHarness{}
-	for harnessID, entry := range managed {
-		runner.managedHarnesses[harnessID] = entry
-	}
+	maps.Copy(runner.managedHarnesses, managed)
 	return runner
 }
 
@@ -163,9 +162,7 @@ func (runner *Runner) WithNativeFallback(harnessIDs ...string) *Runner {
 
 func (runner *Runner) WithApprovalPolicies(policies ApprovalPolicies) *Runner {
 	runner.approvalPolicies = ApprovalPolicies{}
-	for harnessID, policy := range policies {
-		runner.approvalPolicies[harnessID] = policy
-	}
+	maps.Copy(runner.approvalPolicies, policies)
 	return runner
 }
 

@@ -61,11 +61,11 @@ func runProbeCapturingOutput(operationContext context.Context, binaryPath string
 	}
 	exitCode := 0
 	if runErr != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(runErr, &exitErr) {
+		exitError, ok := errors.AsType[*exec.ExitError](runErr)
+		if !ok {
 			return AuthReadinessUnknown, ""
 		}
-		exitCode = exitErr.ExitCode()
+		exitCode = exitError.ExitCode()
 	}
 	if exitCode == successExitCode {
 		return AuthReadinessReady, output

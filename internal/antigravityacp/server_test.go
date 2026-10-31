@@ -9,12 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/cafecito-games/Orchestra/internal/acp"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -126,6 +128,10 @@ case "$prompt_value" in
     sleep 30
     exit 0
     ;;
+  *TRIGGER_FAIL_NO_RESULT*)
+    echo "agy internal engine crashed unexpectedly" >&2
+    exit 1
+    ;;
 esac
 
 if [ -z "$conversation_id" ]; then
@@ -145,12 +151,12 @@ printf '%s\n' "{\"event\":\"result\",\"result\":{\"conversation_id\":\"${convers
 	var mcpMutex sync.Mutex
 	var mcpMethods []string
 	mcpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		require.Equal(t, "Bearer run-token-xyz", request.Header.Get("Authorization"))
+		assert.Equal(t, "Bearer run-token-xyz", request.Header.Get("Authorization"))
 		var envelope struct {
 			ID     any    `json:"id"`
 			Method string `json:"method"`
 		}
-		require.NoError(t, json.NewDecoder(request.Body).Decode(&envelope))
+		assert.NoError(t, json.NewDecoder(request.Body).Decode(&envelope))
 		mcpMutex.Lock()
 		mcpMethods = append(mcpMethods, envelope.Method)
 		mcpMutex.Unlock()
@@ -209,6 +215,7 @@ printf '%s\n' "{\"event\":\"result\",\"result\":{\"conversation_id\":\"${convers
 			Events:               eventSink,
 		})
 		cleanup := func() {
+			t.Helper()
 			client.Close()
 			_ = clientToServerWriter.Close()
 			cancelBridge()
@@ -253,34 +260,18 @@ printf '%s\n' "{\"event\":\"result\",\"result\":{\"conversation_id\":\"${convers
 	require.Contains(t, mcpMethods, "tools/list")
 	mcpMutex.Unlock()
 
-	hasThought := false
-	hasToolCompleted := false
-	hasDiff := false
-	hasUsage := false
-	for _, event := range recordedEvents {
-		switch event.Type {
-		case "thought.delta":
-			if event.Text == "Planning change" {
-				hasThought = true
-			}
-		case "tool.call":
-			if event.Status == "completed" && event.Kind == "edit" {
-				hasToolCompleted = true
-			}
-		case "diff":
-			if event.NewText == "new" {
-				hasDiff = true
-			}
-		case "usage":
-			if event.InputTokens != nil && *event.InputTokens == 120 {
-				hasUsage = true
-			}
-		}
-	}
-	require.True(t, hasThought)
-	require.True(t, hasToolCompleted)
-	require.True(t, hasDiff)
-	require.True(t, hasUsage)
+	assert.True(t, slices.ContainsFunc(recordedEvents, func(event protocol.HarnessEvent) bool {
+		return event.Type == "thought.delta" && event.Text == "Planning change"
+	}))
+	assert.True(t, slices.ContainsFunc(recordedEvents, func(event protocol.HarnessEvent) bool {
+		return event.Type == "tool.call" && event.Status == "completed" && event.Kind == "edit"
+	}))
+	assert.True(t, slices.ContainsFunc(recordedEvents, func(event protocol.HarnessEvent) bool {
+		return event.Type == "diff" && event.NewText == "new"
+	}))
+	assert.True(t, slices.ContainsFunc(recordedEvents, func(event protocol.HarnessEvent) bool {
+		return event.Type == "usage" && event.InputTokens != nil && *event.InputTokens == 120
+	}))
 
 	secondClient, closeSecond := startBridgeClient(nil)
 	var resumedFlag bool
@@ -350,6 +341,10 @@ case "$prompt_value" in
     printf '%s\n' '{"event":"init","conversation_id":"conv-err-1"}'
     printf '%s\n' '{"event":"result","result":{"conversation_id":"conv-err-1","status":"ERROR","response":"","error":"failed with run-secret-token-999","denied_actions":[{"action":"command","display_name":"Run shell"}]}}'
     exit 0
+    ;;
+  *TRIGGER_FAIL_NO_RESULT*)
+    echo "agy internal engine crashed unexpectedly" >&2
+    exit 1
     ;;
 esac
 printf '%s\n' '{"event":"init","conversation_id":"conv-recovered-1"}'
@@ -429,13 +424,9 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"conv-recovered-1",
 	})
 	require.NoError(t, err)
 	require.Equal(t, "Recovered OK", recovered.Text)
-	sawNotResumedWarning := false
-	for _, event := range events {
-		if event.Type == "warning" && event.Code == acp.WarningSessionNotResumed {
-			sawNotResumedWarning = true
-		}
-	}
-	require.True(t, sawNotResumedWarning)
+	assert.True(t, slices.ContainsFunc(events, func(event protocol.HarnessEvent) bool {
+		return event.Type == "warning" && event.Code == acp.WarningSessionNotResumed
+	}))
 
 	_, _, turnErr := runWithRequest(acp.SessionRequest{
 		WorkingDirectory: workspaceDirectory,
@@ -451,4 +442,14 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"conv-recovered-1",
 	})
 	require.Error(t, turnErr)
 	require.NotContains(t, turnErr.Error(), "run-secret-token-999")
+
+	_, _, failErr := runWithRequest(acp.SessionRequest{
+		WorkingDirectory: workspaceDirectory,
+		Prompt:           "TRIGGER_FAIL_NO_RESULT",
+		Configuration: []acp.ConfigurationSelection{
+			{ID: ModeOption, Value: ModeSandbox, Requirement: acp.ConfigurationPolicy},
+		},
+	})
+	require.Error(t, failErr)
+	assert.Contains(t, failErr.Error(), "agy internal engine crashed unexpectedly")
 }

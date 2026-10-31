@@ -314,10 +314,10 @@ func (coordinator *leaseCoordinator) handleCleanupCommand(grant protocol.Workspa
 }
 
 func runIDFromBranch(branch string) string {
-	if !strings.HasPrefix(branch, protocol.WorkspaceLeaseBranchPrefix) {
+	remainder, ok := strings.CutPrefix(branch, protocol.WorkspaceLeaseBranchPrefix)
+	if !ok {
 		return ""
 	}
-	remainder := strings.TrimPrefix(branch, protocol.WorkspaceLeaseBranchPrefix)
 	_, runID, found := strings.Cut(remainder, "/")
 	if !found {
 		return ""

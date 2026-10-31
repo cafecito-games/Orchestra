@@ -192,11 +192,14 @@ func (client *Client) runConnection(operationContext context.Context) (bool, err
 	}
 
 	dialContext, cancelDial := context.WithTimeout(operationContext, 10*time.Second)
-	connection, _, err := websocket.Dial(dialContext, controlAgentURL, &websocket.DialOptions{
+	connection, response, err := websocket.Dial(dialContext, controlAgentURL, &websocket.DialOptions{
 		HTTPHeader: headers,
 		HTTPClient: client.httpClient,
 	})
 	cancelDial()
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
 	if err != nil {
 		return false, err
 	}

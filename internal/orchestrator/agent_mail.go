@@ -1068,7 +1068,7 @@ func (service *Service) createMailWakeTaskInState(
 	}
 
 	first := messages[0]
-	title := fmt.Sprintf("Mail from %s", first.FromAddress)
+	title := "Mail from " + first.FromAddress
 	if len(messages) > 1 {
 		title = fmt.Sprintf("Mail (%d messages, latest from %s)", len(messages), messages[len(messages)-1].FromAddress)
 	} else if first.Subject != "" {
@@ -1076,19 +1076,19 @@ func (service *Service) createMailWakeTaskInState(
 	}
 
 	var promptBuilder strings.Builder
-	promptBuilder.WriteString(fmt.Sprintf("You received Orchestra mail addressed to %s.\n", recipientMailbox.Address))
+	fmt.Fprintf(&promptBuilder, "You received Orchestra mail addressed to %s.\n", recipientMailbox.Address)
 	for _, message := range messages {
-		promptBuilder.WriteString(fmt.Sprintf("\n--- Mail Message %s ---\n", message.ID))
-		promptBuilder.WriteString(fmt.Sprintf("From: %s\n", message.FromAddress))
-		promptBuilder.WriteString(fmt.Sprintf("To: %s\n", message.ToAddress))
+		fmt.Fprintf(&promptBuilder, "\n--- Mail Message %s ---\n", message.ID)
+		fmt.Fprintf(&promptBuilder, "From: %s\n", message.FromAddress)
+		fmt.Fprintf(&promptBuilder, "To: %s\n", message.ToAddress)
 		if message.Subject != "" {
-			promptBuilder.WriteString(fmt.Sprintf("Subject: %s\n", message.Subject))
+			fmt.Fprintf(&promptBuilder, "Subject: %s\n", message.Subject)
 		}
 		if message.ReplyToID != "" {
-			promptBuilder.WriteString(fmt.Sprintf("In-Reply-To: %s\n", message.ReplyToID))
+			fmt.Fprintf(&promptBuilder, "In-Reply-To: %s\n", message.ReplyToID)
 		}
 		if len(message.ArtifactIDs) > 0 {
-			promptBuilder.WriteString(fmt.Sprintf("Attached Artifacts: %s\n", strings.Join(message.ArtifactIDs, ", ")))
+			fmt.Fprintf(&promptBuilder, "Attached Artifacts: %s\n", strings.Join(message.ArtifactIDs, ", "))
 		}
 		promptBuilder.WriteString("\n")
 		promptBuilder.WriteString(message.Body)
@@ -1096,11 +1096,12 @@ func (service *Service) createMailWakeTaskInState(
 			promptBuilder.WriteByte('\n')
 		}
 	}
-	promptBuilder.WriteString(fmt.Sprintf(
+	fmt.Fprintf(
+		&promptBuilder,
 		"\nHandle the request above. If the sender expects a response or follow-up, reply using `send_mail` (`to: %q`, `replyToId: %q`), then finalize this turn with `update_task`.\n",
 		messages[len(messages)-1].FromAddress,
 		messages[len(messages)-1].ID,
-	))
+	)
 
 	taskID := protocol.NewIdentifier("task")
 	task := protocol.Task{

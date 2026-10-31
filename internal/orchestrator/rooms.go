@@ -223,7 +223,7 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 	}
 	kind := strings.TrimSpace(input.Kind)
 	if !slices.Contains(protocol.RoomMessageKinds, kind) {
-		return PostRoomMessageResult{}, invalidRequest(fmt.Sprintf("kind must be one of %s", strings.Join(protocol.RoomMessageKinds, ", ")))
+		return PostRoomMessageResult{}, invalidRequest("kind must be one of " + strings.Join(protocol.RoomMessageKinds, ", "))
 	}
 	topic := strings.TrimSpace(input.Topic)
 	if !protocol.IsBoundedString(topic, protocol.RoomTopicMaximumBytes) {
@@ -320,7 +320,7 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 				return invalidRequest(fmt.Sprintf("unknown task %q in thread %s", targetTaskID, threadID))
 			}
 			if caller.Kind == "run" && !isDelegatedDescendant(state, caller.TaskID, trimmedTaskID) {
-				return forbiddenError(fmt.Sprintf("delegating worker run cannot nudge non-delegated task %s", trimmedTaskID))
+				return forbiddenError("delegating worker run cannot nudge non-delegated task " + trimmedTaskID)
 			}
 			if !slices.Contains(validatedNudgeTaskIDs, trimmedTaskID) {
 				validatedNudgeTaskIDs = append(validatedNudgeTaskIDs, trimmedTaskID)

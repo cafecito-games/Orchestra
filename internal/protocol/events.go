@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"unicode/utf8"
@@ -80,16 +81,16 @@ type DispatchSessionBinding struct {
 
 func (binding DispatchSessionBinding) Validate() error {
 	if !IsIdentifier(binding.ID) || !IsIdentifier(binding.ProviderSessionID) {
-		return fmt.Errorf("session binding is missing identity")
+		return errors.New("session binding is missing identity")
 	}
 	if LooksSecretLike(binding.ID) || LooksSecretLike(binding.ProviderSessionID) {
-		return fmt.Errorf("session binding identity looks like a credential")
+		return errors.New("session binding identity looks like a credential")
 	}
 	if binding.Transport != "" && !slices.Contains(HarnessTransports, binding.Transport) {
-		return fmt.Errorf("session binding has an unknown transport")
+		return errors.New("session binding has an unknown transport")
 	}
 	if len(binding.ResumePrompt) > SessionResumePromptMaximumBytes || !utf8.ValidString(binding.ResumePrompt) {
-		return fmt.Errorf("session binding resume prompt exceeds its bound")
+		return errors.New("session binding resume prompt exceeds its bound")
 	}
 	return nil
 }
@@ -104,10 +105,10 @@ type SessionBindingUpdate struct {
 
 func (binding SessionBindingUpdate) Validate() error {
 	if (binding.BindingID != "" && !IsIdentifier(binding.BindingID)) || !IsIdentifier(binding.ProviderSessionID) {
-		return fmt.Errorf("session binding is missing identity")
+		return errors.New("session binding is missing identity")
 	}
 	if !slices.Contains(HarnessIDs, binding.HarnessID) || !slices.Contains(HarnessTransports, binding.Transport) || !slices.Contains(SessionBindingStatuses, binding.Status) {
-		return fmt.Errorf("session binding has an unknown harness, transport, or status")
+		return errors.New("session binding has an unknown harness, transport, or status")
 	}
 	return nil
 }
@@ -183,17 +184,17 @@ type ApprovalDecision struct {
 
 func (decision ApprovalDecision) Validate() error {
 	if !IsIdentifier(decision.ApprovalID) || !IsIdentifier(decision.RunID) {
-		return fmt.Errorf("approval decision is missing identity")
+		return errors.New("approval decision is missing identity")
 	}
 	if !slices.Contains(ApprovalStatuses, decision.Status) || decision.Status == "pending" {
-		return fmt.Errorf("approval decision status must be terminal")
+		return errors.New("approval decision status must be terminal")
 	}
 	selectsOption := decision.Status == "approved" || decision.Status == "rejected"
 	if selectsOption && !IsIdentifier(decision.SelectedOptionID) {
-		return fmt.Errorf("approval decision option does not match its status")
+		return errors.New("approval decision option does not match its status")
 	}
 	if !selectsOption && decision.SelectedOptionID != "" {
-		return fmt.Errorf("approval decision option does not match its status")
+		return errors.New("approval decision option does not match its status")
 	}
 	return nil
 }
@@ -249,57 +250,57 @@ func (event HarnessEvent) Validate() error {
 		}
 	case "plan.updated":
 		if len(event.Entries) > PlanEntryLimit {
-			return fmt.Errorf("plan.updated entries exceed their bound")
+			return errors.New("plan.updated entries exceed their bound")
 		}
 		for _, entry := range event.Entries {
 			if !IsBoundedString(entry.Content, TextMaximumBytes) || !slices.Contains(PlanEntryStatuses, entry.Status) || !slices.Contains(PlanEntryPriorities, entry.Priority) {
-				return fmt.Errorf("plan.updated entry is malformed")
+				return errors.New("plan.updated entry is malformed")
 			}
 		}
 	case "tool.call":
 		if !IsIdentifier(event.ToolCallID) || !slices.Contains(ToolCallStatuses, event.Status) || !slices.Contains(ToolCallKinds, event.Kind) || !IsBoundedString(event.Title, DiagnosticMaximumBytes) || !IsBoundedString(event.Detail, TextMaximumBytes) {
-			return fmt.Errorf("tool.call payload is malformed or exceeds its bounds")
+			return errors.New("tool.call payload is malformed or exceeds its bounds")
 		}
 	case "diff":
 		if !IsBoundedString(event.Path, TextMaximumBytes) || !IsBoundedString(event.OldText, DiffMaximumBytes) || !IsBoundedString(event.NewText, DiffMaximumBytes) || (event.ToolCallID != "" && !IsIdentifier(event.ToolCallID)) {
-			return fmt.Errorf("diff payload is malformed or exceeds its bounds")
+			return errors.New("diff payload is malformed or exceeds its bounds")
 		}
 	case "terminal.output":
 		if !IsIdentifier(event.TerminalID) || (event.Stream != "stdout" && event.Stream != "stderr") || !IsBoundedString(event.Text, TextMaximumBytes) {
-			return fmt.Errorf("terminal.output payload is malformed or exceeds its bounds")
+			return errors.New("terminal.output payload is malformed or exceeds its bounds")
 		}
 	case "usage":
 		if !isNonNegativeCount(event.InputTokens) || !isNonNegativeCount(event.OutputTokens) || !isNonNegativeCount(event.CachedInputTokens) || !isNonNegativeAmount(event.CostUSD) {
-			return fmt.Errorf("usage payload is malformed")
+			return errors.New("usage payload is malformed")
 		}
 	case "permission.requested":
 		if len(event.Options) == 0 || len(event.Options) > ApprovalOptionLimit {
-			return fmt.Errorf("permission.requested options are missing or exceed their bound")
+			return errors.New("permission.requested options are missing or exceed their bound")
 		}
 		seenIdentifiers := make(map[string]bool, len(event.Options))
 		for _, option := range event.Options {
 			if !IsIdentifier(option.ID) || !IsBoundedString(option.Label, DiagnosticMaximumBytes) || !slices.Contains(ApprovalOptionKinds, option.Kind) {
-				return fmt.Errorf("permission.requested option is malformed")
+				return errors.New("permission.requested option is malformed")
 			}
 			if seenIdentifiers[option.ID] {
-				return fmt.Errorf("permission.requested options contain a duplicate identifier")
+				return errors.New("permission.requested options contain a duplicate identifier")
 			}
 			seenIdentifiers[option.ID] = true
 		}
 		if !IsIdentifier(event.ApprovalID) || (event.ToolCallID != "" && !IsIdentifier(event.ToolCallID)) || !IsBoundedString(event.Title, DiagnosticMaximumBytes) || !IsBoundedString(event.Detail, TextMaximumBytes) {
-			return fmt.Errorf("permission.requested payload is malformed or exceeds its bounds")
+			return errors.New("permission.requested payload is malformed or exceeds its bounds")
 		}
 	case "permission.resolved":
 		if !IsIdentifier(event.ApprovalID) || !slices.Contains(ApprovalStatuses, event.Status) || event.Status == "pending" || (event.SelectedOptionID != "" && !IsIdentifier(event.SelectedOptionID)) {
-			return fmt.Errorf("permission.resolved payload is malformed")
+			return errors.New("permission.resolved payload is malformed")
 		}
 	case "warning":
 		if !IsIdentifier(event.Code) || !IsBoundedString(event.Message, DiagnosticMaximumBytes) {
-			return fmt.Errorf("warning payload is malformed or exceeds its bounds")
+			return errors.New("warning payload is malformed or exceeds its bounds")
 		}
 	case "unknown":
 		if !IsIdentifier(event.SourceType) || !IsBoundedString(event.Detail, DiagnosticMaximumBytes) {
-			return fmt.Errorf("unknown payload is malformed or exceeds its bounds")
+			return errors.New("unknown payload is malformed or exceeds its bounds")
 		}
 	}
 	return nil

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cafecito-games/Orchestra/internal/harness"
@@ -90,9 +91,9 @@ echo '{"type":"result","result":"completed cleanly"}'
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/artifacts/art-1/content", func(writer http.ResponseWriter, request *http.Request) {
-		require.Equal(t, "Bearer test-token", request.Header.Get("Authorization"))
+		assert.Equal(t, "Bearer test-token", request.Header.Get("Authorization"))
 		bodyBytes, readErr := io.ReadAll(request.Body)
-		require.NoError(t, readErr)
+		assert.NoError(t, readErr)
 		serverMutex.Lock()
 		uploadedArtifacts["art-1"] = bodyBytes
 		serverMutex.Unlock()
@@ -154,13 +155,14 @@ echo '{"type":"result","result":"completed cleanly"}'
 				}
 			case "hub.rpc.request":
 				var response protocol.MasterControlMessage
-				if message.Method == "get_task_context" {
+				switch message.Method {
+				case "get_task_context":
 					response = protocol.MasterControlMessage{
 						Type:      "hub.rpc.response",
 						RequestID: message.RequestID,
 						Result:    json.RawMessage(`{"task":{"id":"task-1"}}`),
 					}
-				} else if message.Method == "post_artifact" {
+				case "post_artifact":
 					response = protocol.MasterControlMessage{
 						Type:      "hub.rpc.response",
 						RequestID: message.RequestID,
@@ -201,14 +203,13 @@ echo '{"type":"result","result":"completed cleanly"}'
 		WorkspaceManager: workspaceManager,
 	})
 
-	queuedText := "buffered-before-admission"
 	client.sendOrQueue(protocol.SlaveControlMessage{
 		Type:  "run.output",
 		RunID: "run-buffered",
-		Chunk: &queuedText,
+		Chunk: new("buffered-before-admission"),
 	})
 
-	runContext, cancelClient := context.WithCancel(context.Background())
+	runContext, cancelClient := context.WithCancel(t.Context())
 	defer cancelClient()
 	done := make(chan error, 1)
 	go func() {
@@ -225,7 +226,8 @@ echo '{"type":"result","result":"completed cleanly"}'
 					return message
 				}
 			case <-deadline:
-				t.Fatalf("timed out waiting for message type %q", expectedType)
+				require.FailNowf(t, "timeout", "timed out waiting for message type %q", expectedType)
+				return protocol.SlaveControlMessage{}
 			}
 		}
 	}
@@ -243,7 +245,7 @@ echo '{"type":"result","result":"completed cleanly"}'
 		require.NotNil(t, socket)
 		encoded, marshalErr := json.Marshal(message)
 		require.NoError(t, marshalErr)
-		require.NoError(t, socket.Write(context.Background(), websocket.MessageText, encoded))
+		require.NoError(t, socket.Write(t.Context(), websocket.MessageText, encoded))
 	}
 
 	nowText := time.Now().UTC().Format(time.RFC3339Nano)
@@ -284,7 +286,7 @@ echo '{"type":"result","result":"completed cleanly"}'
 	mcpGrant, err := client.mcpServer.Grant("run-rpc", workspaceRoot, true)
 	require.NoError(t, err)
 	rpcPayload := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_task_context","arguments":{}}}`
-	httpRequest, err := http.NewRequest(http.MethodPost, mcpGrant.URL, strings.NewReader(rpcPayload))
+	httpRequest, err := http.NewRequestWithContext(t.Context(), http.MethodPost, mcpGrant.URL, strings.NewReader(rpcPayload))
 	require.NoError(t, err)
 	httpRequest.Header.Set("Authorization", "Bearer "+mcpGrant.Token)
 	httpRequest.Header.Set("Content-Type", "application/json")
@@ -297,7 +299,7 @@ echo '{"type":"result","result":"completed cleanly"}'
 	require.NoError(t, err)
 	require.Contains(t, string(bodyBytes), "task-1")
 
-	uploadErr := client.uploadArtifactContent(context.Background(), "/api/artifacts/art-1/content", bytes.NewReader([]byte("hello-artifact")), int64(len("hello-artifact")))
+	uploadErr := client.uploadArtifactContent(t.Context(), "/api/artifacts/art-1/content", bytes.NewReader([]byte("hello-artifact")), int64(len("hello-artifact")))
 	require.NoError(t, uploadErr)
 	serverMutex.Lock()
 	require.Equal(t, []byte("hello-artifact"), uploadedArtifacts["art-1"])
@@ -387,7 +389,7 @@ func TestParseConfiguration_RequireACPAndFallbackConflict(t *testing.T) {
 	)
 	require.Error(t, conflictErr)
 
-	_, runtimeConflictErr := BuildRuntime(context.Background(), Configuration{
+	_, runtimeConflictErr := BuildRuntime(t.Context(), Configuration{
 		Name:              "conflict-node",
 		WorkspaceRoots:    []string{workspaceRoot},
 		DataRoot:          filepath.Join(t.TempDir(), "data"),
@@ -542,7 +544,7 @@ esac
 		WorkspaceManager: workspace.NewManager(canonicalRoots, nil),
 	})
 
-	runContext, cancelClient := context.WithCancel(context.Background())
+	runContext, cancelClient := context.WithCancel(t.Context())
 	defer cancelClient()
 	done := make(chan error, 1)
 	go func() { done <- client.Run(runContext) }()
@@ -557,7 +559,8 @@ esac
 					return message
 				}
 			case <-deadline:
-				t.Fatalf("timed out waiting for %s", description)
+				require.FailNowf(t, "timeout", "timed out waiting for %s", description)
+				return protocol.SlaveControlMessage{}
 			}
 		}
 	}
@@ -572,7 +575,7 @@ esac
 		require.NotNil(t, socket)
 		encoded, marshalErr := json.Marshal(message)
 		require.NoError(t, marshalErr)
-		require.NoError(t, socket.Write(context.Background(), websocket.MessageText, encoded))
+		require.NoError(t, socket.Write(t.Context(), websocket.MessageText, encoded))
 	}
 
 	nowText := time.Now().UTC().Format(time.RFC3339Nano)

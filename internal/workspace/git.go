@@ -70,8 +70,8 @@ func (err *GitError) Error() string {
 }
 
 func exitedWith(err error, code int) bool {
-	var gitError *GitError
-	return errors.As(err, &gitError) && gitError.Kind == GitErrorExit && gitError.ExitCode == code
+	gitError, ok := errors.AsType[*GitError](err)
+	return ok && gitError.Kind == GitErrorExit && gitError.ExitCode == code
 }
 
 type boundedBuffer struct {
@@ -135,8 +135,7 @@ func (git *Git) Run(operationContext context.Context, directory string, argument
 	case err == nil:
 		return output.buffer.Bytes(), nil
 	}
-	var exitError *exec.ExitError
-	if errors.As(err, &exitError) && exitError.ExitCode() >= 0 {
+	if exitError, ok := errors.AsType[*exec.ExitError](err); ok && exitError.ExitCode() >= 0 {
 		return output.buffer.Bytes(), &GitError{Kind: GitErrorExit, ExitCode: exitError.ExitCode()}
 	}
 	if operationContext.Err() != nil {

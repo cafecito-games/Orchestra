@@ -166,8 +166,8 @@ func parseNodeVersion(rawOutput string) (string, bool) {
 func parseGCCVersion(rawOutput string) (string, bool) {
 	firstLine, _, _ := strings.Cut(rawOutput, "\n")
 	afterFirstParen := firstLine
-	if closingParen := strings.IndexByte(firstLine, ')'); closingParen >= 0 {
-		afterFirstParen = firstLine[closingParen+1:]
+	if _, after, ok := strings.Cut(firstLine, ")"); ok {
+		afterFirstParen = after
 	}
 	return firstNormalizedVersion(afterFirstParen)
 }

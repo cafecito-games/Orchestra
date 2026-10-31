@@ -1,13 +1,14 @@
 package harness
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 )
 
 func AuthorizeWorkspace(workspace string, roots []string) (string, error) {
 	if !filepath.IsAbs(workspace) {
-		return "", fmt.Errorf("workspace must be an absolute path")
+		return "", errors.New("workspace must be an absolute path")
 	}
 	actual, err := filepath.EvalSymlinks(workspace)
 	if err != nil {

@@ -2,6 +2,7 @@ package acp
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -127,12 +128,8 @@ func NewClient(stdout io.Reader, stdin io.WriteCloser, options Options) *Client 
 	if options.Now == nil {
 		options.Now = time.Now
 	}
-	if options.ClientName == "" {
-		options.ClientName = "orchestra-slave"
-	}
-	if options.ClientVersion == "" {
-		options.ClientVersion = protocol.BuildVersion
-	}
+	options.ClientName = cmp.Or(options.ClientName, "orchestra-slave")
+	options.ClientVersion = cmp.Or(options.ClientVersion, protocol.BuildVersion)
 	client := &Client{
 		options:       options,
 		redaction:     newSecretRedactor(options.Secrets),
@@ -219,7 +216,7 @@ func (client *Client) Session() (string, bool) {
 
 func (client *Client) run(operationContext context.Context, request SessionRequest) (Result, error) {
 	if !filepath.IsAbs(request.WorkingDirectory) {
-		return Result{}, fmt.Errorf("acp session working directory must be absolute")
+		return Result{}, errors.New("acp session working directory must be absolute")
 	}
 	initialized, err := client.initialize(operationContext)
 	if err != nil {
@@ -337,7 +334,7 @@ func negotiatedCapabilities(response initializeResponse) protocol.AcpAgentCapabi
 func (client *Client) establishSession(operationContext context.Context, request SessionRequest, servers []mcpServerHTTP, initialized initializeResponse) (string, configurationState, bool, error) {
 	if resume := request.Resume; resume != nil {
 		if resume.SessionID == "" || len(resume.SessionID) > eventIdentifierBytes {
-			return "", nil, false, fmt.Errorf("acp resume session identity is invalid")
+			return "", nil, false, errors.New("acp resume session identity is invalid")
 		}
 		capabilities := initialized.AgentCapabilities
 		method := ""
@@ -354,8 +351,7 @@ func (client *Client) establishSession(operationContext context.Context, request
 			if err == nil {
 				return resume.SessionID, configuration, true, nil
 			}
-			var responseError *ResponseError
-			if !errors.As(err, &responseError) {
+			if _, ok := errors.AsType[*ResponseError](err); !ok {
 				return "", nil, false, err
 			}
 			client.emit(warningEvent(WarningSessionNotResumed, method+" was refused; a new session received the durable context"))
@@ -381,8 +377,7 @@ func (client *Client) resumeSession(operationContext context.Context, method, se
 		client.sessionID = ""
 	}
 	client.stateMutex.Unlock()
-	var responseError *ResponseError
-	if errors.As(err, &responseError) {
+	if responseError, ok := errors.AsType[*ResponseError](err); ok {
 		if responseError.Code == CodeAuthenticationRequired {
 			return nil, authenticationRequired(methods)
 		}
@@ -407,8 +402,7 @@ func (client *Client) newSession(operationContext context.Context, workingDirect
 	defer cancel()
 	var response newSessionResponse
 	err := client.peer.call(requestContext, methodSessionNew, newSessionRequest{WorkingDirectory: workingDirectory, McpServers: servers}, &response)
-	var responseError *ResponseError
-	if errors.As(err, &responseError) && responseError.Code == CodeAuthenticationRequired {
+	if responseError, ok := errors.AsType[*ResponseError](err); ok && responseError.Code == CodeAuthenticationRequired {
 		return "", nil, authenticationRequired(methods)
 	}
 	if err != nil {
@@ -498,9 +492,9 @@ func (client *Client) requestCancellation(sessionID string) {
 	})
 }
 
-func (client *Client) handleNotification(method string, params json.RawMessage) error {
+func (client *Client) handleNotification(method string, parameters json.RawMessage) error {
 	if method == methodSessionUpdate {
-		return client.sessionUpdate(params)
+		return client.sessionUpdate(parameters)
 	}
 	if strings.HasPrefix(method, "_") {
 		return nil
@@ -509,9 +503,9 @@ func (client *Client) handleNotification(method string, params json.RawMessage) 
 	return nil
 }
 
-func (client *Client) sessionUpdate(params json.RawMessage) error {
+func (client *Client) sessionUpdate(parameters json.RawMessage) error {
 	var notification sessionNotification
-	if err := decodeStrict(params, &notification); err != nil || notification.SessionID == "" || notification.Update == nil {
+	if err := decodeStrict(parameters, &notification); err != nil || notification.SessionID == "" || notification.Update == nil {
 		return fmt.Errorf("%w: session/update is missing sessionId or update", ErrMalformedUpdate)
 	}
 	client.stateMutex.Lock()
@@ -542,9 +536,9 @@ func (client *Client) sessionUpdate(params json.RawMessage) error {
 	return nil
 }
 
-func (client *Client) handleRequest(requestContext context.Context, method string, params json.RawMessage) (any, *ResponseError) {
+func (client *Client) handleRequest(requestContext context.Context, method string, parameters json.RawMessage) (any, *ResponseError) {
 	if method == methodRequestPermission {
-		return client.requestPermission(requestContext, params), nil
+		return client.requestPermission(requestContext, parameters), nil
 	}
 	return nil, &ResponseError{Code: CodeMethodNotFound, Message: "method not supported by Orchestra"}
 }
@@ -560,9 +554,9 @@ func cancelledPermission() requestPermissionResponse {
 	return requestPermissionResponse{Outcome: permissionOutcome{Outcome: "cancelled"}}
 }
 
-func (client *Client) requestPermission(requestContext context.Context, params json.RawMessage) requestPermissionResponse {
+func (client *Client) requestPermission(requestContext context.Context, parameters json.RawMessage) requestPermissionResponse {
 	var request requestPermissionRequest
-	if err := decodeStrict(params, &request); err != nil {
+	if err := decodeStrict(parameters, &request); err != nil {
 		client.emit(warningEvent(WarningPermissionMalformed, "permission request is malformed and was cancelled"))
 		return cancelledPermission()
 	}

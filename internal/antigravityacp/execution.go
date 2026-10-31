@@ -3,6 +3,7 @@ package antigravityacp
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -696,10 +697,7 @@ func convertUsage(usage *agyTokenUsage) *turnUsage {
 func formatDeniedActions(denied []agyDeniedAction) string {
 	descriptions := make([]string, 0, len(denied))
 	for _, item := range denied {
-		label := strings.TrimSpace(item.DisplayName)
-		if label == "" {
-			label = strings.TrimSpace(item.Action)
-		}
+		label := cmp.Or(strings.TrimSpace(item.DisplayName), strings.TrimSpace(item.Action))
 		if label != "" {
 			descriptions = append(descriptions, label)
 		}

@@ -373,7 +373,7 @@ func Activate(operationContext context.Context, activationContext ActivationCont
 		return ActivationOutcome{}, errors.New("activate: a candidate probe is required")
 	}
 	identity := selector.Identity()
-	reference := ComponentReference{Kind: selector.Kind, ID: selector.ID, Version: selector.Version}
+	reference := ComponentReference(selector)
 	if _, declared := manifestEntryFor(activationContext.Manifest, reference); !declared {
 		return ActivationOutcome{}, fmt.Errorf("activate %s: the component manifest does not declare this version", reference)
 	}

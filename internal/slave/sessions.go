@@ -74,11 +74,10 @@ func (client *Client) handleDispatch(message protocol.MasterControlMessage) {
 
 	resident, err := client.acquireResidentForRun(run, message.Instance, message.Allocation)
 	if err != nil {
-		errorMessage := protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))
 		client.sendOrQueue(protocol.SlaveControlMessage{
 			Type:  "run.failed",
 			RunID: run.ID,
-			Error: &errorMessage,
+			Error: new(protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))),
 			At:    client.nowUTC(),
 		})
 		return
@@ -417,11 +416,10 @@ func (session *runSession) emitTerminalFailureWithSession(err error, providerSes
 		})
 		return
 	}
-	errorMessage := protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))
 	session.client.sendOrQueue(protocol.SlaveControlMessage{
 		Type:              "run.failed",
 		RunID:             session.run.ID,
-		Error:             &errorMessage,
+		Error:             new(protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))),
 		ProviderSessionID: providerSessionID,
 		At:                session.client.nowUTC(),
 	})

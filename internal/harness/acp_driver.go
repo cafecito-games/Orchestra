@@ -99,7 +99,7 @@ func (driver *ACPDriver) SupportsResume(harnessID string) error {
 	driver.mutex.Lock()
 	capabilities, probed := driver.probed[harnessID]
 	driver.mutex.Unlock()
-	if !probed || !(capabilities.ResumeSession || capabilities.LoadSession) {
+	if !probed || (!capabilities.ResumeSession && !capabilities.LoadSession) {
 		return fmt.Errorf("%w for harness %s", ErrResumeUnsupported, harnessID)
 	}
 	return nil

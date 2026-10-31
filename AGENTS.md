@@ -6,13 +6,13 @@
 
 ## Build, Test, and Development Commands
 
-The project requires Go 1.26+ and optionally [Task](https://taskfile.dev/).
+The project requires Go 1.26+, golangci-lint (v2), and optionally [Task](https://taskfile.dev/).
 
 - `task build`: compile the local, CGo-free binary to `bin/orchestra`.
 - `task run:master -- --help`: run the master from source and pass CLI flags after `--`.
 - `task unit:test`: run all package tests with the race detector.
 - `task system:test`: run build-tagged, real-process system tests (timeout: 10 minutes).
-- `task lint`: check `gofmt`, `go vet`, and whitespace errors.
+- `task lint`: check `gofmt`, `go vet`, `go fix`, `golangci-lint`, and whitespace checks.
 - `task ci`: run the complete verification and cross-platform build pipeline.
 
 Use `go test -race ./internal/store/...` for a focused package test.
@@ -23,7 +23,7 @@ Format Go code with `gofmt` (`task fmt`) and keep `task lint` clean. Follow stan
 
 ## Testing Guidelines
 
-Write table-driven tests where multiple inputs share behavior, and name tests `TestFeature` or `TestFeature_Scenario`. Use `testify` only where it improves clarity. Changes involving concurrency, persistence, transport, process lifecycle, or authentication should include regression coverage and pass the race detector. Run `task test` before submitting; use `task ci` for release-sensitive changes.
+Write table-driven tests where multiple inputs share behavior, and name tests `TestFeature` or `TestFeature_Scenario`. Use testify (require for preconditions/errors and assert for value checks) across all tests, and ensure tests verify core business logic. Changes involving concurrency, persistence, transport, process lifecycle, or authentication should include regression coverage and pass the race detector. Run `task test` before submitting; use `task ci` for release-sensitive changes.
 
 ## Commit & Pull Request Guidelines
 

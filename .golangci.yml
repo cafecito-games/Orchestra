@@ -1,0 +1,41 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - copyloopvar
+    - durationcheck
+    - errorlint
+    - gocheckcompilerdirectives
+    - gochecknoinits
+    - gocritic
+    - goprintffuncname
+    - govet
+    - ineffassign
+    - intrange
+    - makezero
+    - mirror
+    - misspell
+    - modernize
+    - nakedret
+    - noctx
+    - perfsprint
+    - predeclared
+    - reassign
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - testifylint
+    - tparallel
+    - unconvert
+    - unused
+    - usestdlibvars
+    - usetesting
+    - whitespace
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

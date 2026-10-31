@@ -5,6 +5,7 @@ package systemtest
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -14,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -27,7 +29,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -68,7 +69,7 @@ func ensureCompiledBinaries(t *testing.T) builtBinaries {
 	compileOnce.Do(func() {
 		_, currentFile, _, ok := runtime.Caller(0)
 		if !ok {
-			compileError = fmt.Errorf("locate current source file")
+			compileError = errors.New("locate current source file")
 			return
 		}
 		repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", ".."))
@@ -79,7 +80,7 @@ func ensureCompiledBinaries(t *testing.T) builtBinaries {
 		orchestraBinary := filepath.Join(compileRoot, "orchestra"+extension)
 		fakeHarnessBinary := filepath.Join(compileRoot, "fakeharness"+extension)
 
-		buildOrchestra := exec.Command("go", "build", "-trimpath", "-o", orchestraBinary, "./cmd/orchestra")
+		buildOrchestra := exec.CommandContext(t.Context(), "go", "build", "-trimpath", "-o", orchestraBinary, "./cmd/orchestra")
 		buildOrchestra.Dir = repositoryRoot
 		buildOrchestra.Env = append(os.Environ(), "CGO_ENABLED=0")
 		if output, err := buildOrchestra.CombinedOutput(); err != nil {
@@ -87,7 +88,7 @@ func ensureCompiledBinaries(t *testing.T) builtBinaries {
 			return
 		}
 
-		buildFakeHarness := exec.Command("go", "build", "-trimpath", "-o", fakeHarnessBinary, "./internal/systemtest/fakeharness")
+		buildFakeHarness := exec.CommandContext(t.Context(), "go", "build", "-trimpath", "-o", fakeHarnessBinary, "./internal/systemtest/fakeharness")
 		buildFakeHarness.Dir = repositoryRoot
 		buildFakeHarness.Env = append(os.Environ(), "CGO_ENABLED=0")
 		if output, err := buildFakeHarness.CombinedOutput(); err != nil {
@@ -138,6 +139,7 @@ func installFakeHarnesses(t *testing.T, sourceBinary string) fakeHarnessInstalla
 		extension = ".exe"
 	}
 	copyRole := func(name string) string {
+		t.Helper()
 		destination := filepath.Join(binDirectory, name+extension)
 		require.NoError(t, os.WriteFile(destination, binaryBytes, 0o755))
 		return destination
@@ -223,9 +225,10 @@ func (writer lockedLogWriter) Write(chunk []byte) (int, error) {
 
 func startManagedProcess(t *testing.T, name string, binaryPath string, arguments []string, environment []string) *managedProcess {
 	t.Helper()
-	command := exec.Command(binaryPath, arguments...)
+	processContext, cancelProcess := context.WithCancel(context.Background())
+	command := exec.CommandContext(processContext, binaryPath, arguments...)
 	command.Env = environment
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	configureManagedProcess(command)
 	command.WaitDelay = 2 * time.Second
 	process := &managedProcess{
 		name:    name,
@@ -243,6 +246,7 @@ func startManagedProcess(t *testing.T, name string, binaryPath string, arguments
 
 	t.Cleanup(func() {
 		process.stop()
+		cancelProcess()
 	})
 	return process
 }
@@ -254,31 +258,16 @@ func (process *managedProcess) logs() string {
 }
 
 func (process *managedProcess) stop() {
-	if process == nil || process.command == nil || process.command.Process == nil {
+	if process == nil {
 		return
 	}
-	select {
-	case <-process.exited:
-		return
-	default:
-	}
-	processID := process.command.Process.Pid
-	_ = syscall.Kill(-processID, syscall.SIGTERM)
-	select {
-	case <-process.exited:
-		return
-	case <-time.After(3 * time.Second):
-		_ = syscall.Kill(-processID, syscall.SIGKILL)
-		select {
-		case <-process.exited:
-		case <-time.After(3 * time.Second):
-		}
-	}
+	terminateManagedProcess(process.command, process.exited)
 }
 
 func allocateFreeLoopbackAddress(t *testing.T) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	var listenConfiguration net.ListenConfig
+	listener, err := listenConfiguration.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	address := listener.Addr().String()
 	require.NoError(t, listener.Close())
@@ -289,14 +278,18 @@ func waitForMasterReady(t *testing.T, baseURL string, masterProcess *managedProc
 	t.Helper()
 	httpClient := &http.Client{Timeout: 1 * time.Second}
 	if !assert.Eventually(t, func() bool {
-		response, err := httpClient.Get(baseURL + "/healthz")
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, baseURL+"/healthz", nil)
+		if err != nil {
+			return false
+		}
+		response, err := httpClient.Do(request)
 		if err != nil {
 			return false
 		}
 		defer response.Body.Close()
 		return response.StatusCode == http.StatusOK
 	}, 10*time.Second, 50*time.Millisecond) {
-		t.Fatalf("master failed to become healthy; logs:\n%s", masterProcess.logs())
+		require.FailNowf(t, "timed out", "master failed to become healthy; logs:\n%s", masterProcess.logs())
 	}
 }
 
@@ -304,7 +297,8 @@ func initializeGitRepository(t *testing.T, repositoryPath string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(repositoryPath, 0o755))
 	runGit := func(arguments ...string) {
-		command := exec.Command("git", arguments...)
+		t.Helper()
+		command := exec.CommandContext(t.Context(), "git", arguments...)
 		command.Dir = repositoryPath
 		output, err := command.CombinedOutput()
 		require.NoError(t, err, "git %s failed: %s", strings.Join(arguments, " "), string(output))
@@ -333,8 +327,9 @@ type mcpStdioSession struct {
 
 func startMCPStdioSession(t *testing.T, orchestraBinary string, endpoint string, token string, clientID string, extraArguments ...string) *mcpStdioSession {
 	t.Helper()
+	sessionContext, cancelSession := context.WithCancel(context.Background())
 	commandArguments := append([]string{"mcp", "--endpoint", endpoint, "--token", token, "--client-id", clientID}, extraArguments...)
-	command := exec.Command(orchestraBinary, commandArguments...)
+	command := exec.CommandContext(sessionContext, orchestraBinary, commandArguments...)
 	stdinPipe, err := command.StdinPipe()
 	require.NoError(t, err)
 	stdoutPipe, err := command.StdoutPipe()
@@ -397,6 +392,7 @@ func startMCPStdioSession(t *testing.T, orchestraBinary string, endpoint string,
 			}
 			<-session.closed
 		}
+		cancelSession()
 	})
 
 	initResponse := session.callRPC(t, "initialize", map[string]any{
@@ -443,7 +439,7 @@ func (session *mcpStdioSession) callRPC(t *testing.T, method string, parameters 
 		session.stderrMutex.Lock()
 		stderrText := session.stderrBuffer.String()
 		session.stderrMutex.Unlock()
-		t.Fatalf("timed out waiting for MCP stdio %s response; stderr:\n%s", method, stderrText)
+		require.FailNowf(t, "timed out", "timed out waiting for MCP stdio %s response; stderr:\n%s", method, stderrText)
 		return nil
 	}
 }
@@ -476,7 +472,7 @@ func (session *mcpStdioSession) notificationsSnapshot() []map[string]any {
 
 func invokeOrchestraCLI(t *testing.T, orchestraBinary string, environment []string, arguments ...string) (string, string) {
 	t.Helper()
-	command := exec.Command(orchestraBinary, arguments...)
+	command := exec.CommandContext(t.Context(), orchestraBinary, arguments...)
 	command.Env = environment
 	var stdout, stderr bytes.Buffer
 	command.Stdout = &stdout
@@ -607,6 +603,7 @@ func TestMultiNodeEndToEndSystem(t *testing.T) {
 
 	masterEnvironment := buildWorkerEnvironment(fakeHarnesses)
 	startMasterProcess := func() *managedProcess {
+		t.Helper()
 		process := startManagedProcess(t, "orchestra-master", binaries.orchestraPath, []string{
 			"master",
 			"--listen", listenAddress,
@@ -630,6 +627,7 @@ func TestMultiNodeEndToEndSystem(t *testing.T) {
 	require.Contains(t, doctorOutput, "reachable")
 
 	startWorkerMac := func() *managedProcess {
+		t.Helper()
 		return startManagedProcess(t, "slave-mac", binaries.orchestraPath, []string{
 			"slave",
 			"--endpoint", masterBaseURL,
@@ -650,6 +648,7 @@ func TestMultiNodeEndToEndSystem(t *testing.T) {
 	}
 
 	startWorkerLinux := func() *managedProcess {
+		t.Helper()
 		return startManagedProcess(t, "slave-linux", binaries.orchestraPath, []string{
 			"slave",
 			"--endpoint", masterBaseURL,
@@ -672,8 +671,7 @@ func TestMultiNodeEndToEndSystem(t *testing.T) {
 
 	mcpSession := startMCPStdioSession(t, binaries.orchestraPath, masterBaseURL, bearerToken, "main-orchestrator")
 
-	var toolsListResponse map[string]any
-	toolsListResponse = mcpSession.callRPC(t, "tools/list", map[string]any{})
+	toolsListResponse := mcpSession.callRPC(t, "tools/list", map[string]any{})
 	toolsResult, _ := toolsListResponse["result"].(map[string]any)
 	listedTools, _ := toolsResult["tools"].([]any)
 	require.Len(t, listedTools, len(protocol.OrchestratorToolNames))
@@ -694,7 +692,7 @@ func TestMultiNodeEndToEndSystem(t *testing.T) {
 		}
 		return readyCount == 2
 	}, 12*time.Second, 100*time.Millisecond) {
-		t.Fatalf("workers failed to register and sync;\nmac:\n%s\nlinux:\n%s", workerMac.logs(), workerLinux.logs())
+		require.FailNowf(t, "timed out", "workers failed to register and sync;\nmac:\n%s\nlinux:\n%s", workerMac.logs(), workerLinux.logs())
 	}
 
 	statusOutput, _ := invokeOrchestraCLI(t, binaries.orchestraPath, cliEnvironment, "status")
@@ -717,7 +715,7 @@ func TestMultiNodeEndToEndSystem(t *testing.T) {
 		duplicateLogs := fencingDuplicate.logs()
 		return strings.Contains(duplicateLogs, "StatusPolicyViolation") && strings.Contains(duplicateLogs, "node already has a live connection")
 	}, 8*time.Second, 100*time.Millisecond) {
-		t.Fatalf("expected single-live-connection fencing for duplicate node ID; logs:\n%s", fencingDuplicate.logs())
+		require.FailNowf(t, "timed out", "expected single-live-connection fencing for duplicate node ID; logs:\n%s", fencingDuplicate.logs())
 	}
 	fencingDuplicate.stop()
 
@@ -813,7 +811,9 @@ func TestMultiNodeEndToEndSystem(t *testing.T) {
 			return false
 		}, 15*time.Second, 100*time.Millisecond) {
 			snapshotBytes, _ := json.MarshalIndent(lastSnapshot, "", "  ")
-			t.Fatalf(
+			require.FailNowf(
+				t,
+				"timed out",
 				"task %s did not reach status %s;\nthreadContext:\n%s\nmaster logs:\n%s\nmac logs:\n%s\nlinux logs:\n%s",
 				targetTaskID,
 				expectedStatus,
@@ -1002,7 +1002,8 @@ func TestMultiNodeEndToEndSystem(t *testing.T) {
 	require.True(t, orchestratorArtifactResult.Artifact.Uploaded)
 
 	downloadArtifact := func(artifactID string) string {
-		request, requestErr := http.NewRequest(http.MethodGet, masterBaseURL+"/api/artifacts/"+artifactID+"/content", nil)
+		t.Helper()
+		request, requestErr := http.NewRequestWithContext(t.Context(), http.MethodGet, masterBaseURL+"/api/artifacts/"+artifactID+"/content", nil)
 		require.NoError(t, requestErr)
 		request.Header.Set("Authorization", "Bearer "+bearerToken)
 		response, executeErr := http.DefaultClient.Do(request)
@@ -1099,6 +1100,7 @@ func TestMultiNodeEndToEndSystem(t *testing.T) {
 	waitForTaskTerminalStatus(mailboxTaskID, "completed")
 
 	approvalScript := func(title string) string {
+		t.Helper()
 		return formatFakeScript(t,
 			map[string]any{
 				"permission": map[string]any{
@@ -1449,14 +1451,18 @@ func TestTLSEndToEndWithEmbeddedLocalWorker(t *testing.T) {
 	tlsHTTPClient, err := protocol.BuildHTTPClient(certificatePath, false, 2*time.Second)
 	require.NoError(t, err)
 	if !assert.Eventually(t, func() bool {
-		response, requestErr := tlsHTTPClient.Get(masterHTTPSURL + "/healthz")
+		request, requestErr := http.NewRequestWithContext(t.Context(), http.MethodGet, masterHTTPSURL+"/healthz", nil)
+		if requestErr != nil {
+			return false
+		}
+		response, requestErr := tlsHTTPClient.Do(request)
 		if requestErr != nil {
 			return false
 		}
 		defer response.Body.Close()
 		return response.StatusCode == http.StatusOK
 	}, 10*time.Second, 50*time.Millisecond) {
-		t.Fatalf("TLS master failed to become healthy; logs:\n%s", masterProcess.logs())
+		require.FailNowf(t, "timed out", "TLS master failed to become healthy; logs:\n%s", masterProcess.logs())
 	}
 
 	remoteSlave := startManagedProcess(t, "tls-remote-slave", binaries.orchestraPath, []string{
@@ -1488,7 +1494,7 @@ func TestTLSEndToEndWithEmbeddedLocalWorker(t *testing.T) {
 		}
 		return readyNodes == 2
 	}, 12*time.Second, 100*time.Millisecond) {
-		t.Fatalf("TLS workers failed to sync;\nmaster:\n%s\nremote:\n%s", masterProcess.logs(), remoteSlave.logs())
+		require.FailNowf(t, "timed out", "TLS workers failed to sync;\nmaster:\n%s\nremote:\n%s", masterProcess.logs(), remoteSlave.logs())
 	}
 
 	cliEnvironment := buildWorkerEnvironment(
@@ -1623,7 +1629,7 @@ func TestAntigravityBuiltInACPAndNativeEndToEnd(t *testing.T) {
 		}
 		return false
 	}, 12*time.Second, 100*time.Millisecond) {
-		t.Fatalf("antigravity worker failed to register;\nmaster:\n%s\nworker:\n%s", masterProcess.logs(), workerProcess.logs())
+		require.FailNowf(t, "timed out", "antigravity worker failed to register;\nmaster:\n%s\nworker:\n%s", masterProcess.logs(), workerProcess.logs())
 	}
 
 	require.Contains(t, antigravityProfile.Transports, protocol.TransportACP)

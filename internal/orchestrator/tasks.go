@@ -22,7 +22,7 @@ type SubmittedTaskSpec struct {
 	Instructions      string                         `json:"instructions"`
 	MaxAttempts       int                            `json:"maxAttempts,omitempty"`
 	Dependencies      []SubmittedDependency          `json:"dependencies,omitempty"`
-	Requirements      protocol.ExecutionRequirements `json:"requirements,omitempty"`
+	Requirements      protocol.ExecutionRequirements `json:"requirements"`
 	PlacementOverride *protocol.PlacementOverride    `json:"placementOverride,omitempty"`
 	InstanceID        string                         `json:"instanceId,omitempty"`
 }
@@ -47,7 +47,7 @@ type DelegateTaskInput struct {
 	Instructions      string                         `json:"instructions"`
 	MaxAttempts       int                            `json:"maxAttempts,omitempty"`
 	Dependencies      []SubmittedDependency          `json:"dependencies,omitempty"`
-	Requirements      protocol.ExecutionRequirements `json:"requirements,omitempty"`
+	Requirements      protocol.ExecutionRequirements `json:"requirements"`
 	PlacementOverride *protocol.PlacementOverride    `json:"placementOverride,omitempty"`
 	InstanceID        string                         `json:"instanceId,omitempty"`
 }
@@ -90,7 +90,7 @@ type UpdateTaskInput struct {
 	Summary        *string              `json:"summary,omitempty"`
 	Progress       *string              `json:"progress,omitempty"`
 	BlockerReason  *string              `json:"blockerReason,omitempty"`
-	BlockedReason  NullableString       `json:"blockedReason,omitempty"`
+	BlockedReason  NullableString       `json:"blockedReason"`
 	ArtifactIDs    []string             `json:"artifactIds,omitempty"`
 	Completion     *TaskCompletionInput `json:"completion,omitempty"`
 }
@@ -196,9 +196,9 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 		clientTaskMap := map[string]string{}
 		provisionalIDs := make([]string, len(input.Tasks))
 
-		for index, spec := range input.Tasks {
-			title := strings.TrimSpace(spec.Title)
-			instructions := strings.TrimSpace(spec.Instructions)
+		for index, taskSpecification := range input.Tasks {
+			title := strings.TrimSpace(taskSpecification.Title)
+			instructions := strings.TrimSpace(taskSpecification.Instructions)
 			if title == "" || !protocol.IsBoundedString(title, 512) {
 				return invalidRequest(fmt.Sprintf("task[%d] title must be between 1 and 512 bytes", index))
 			}
@@ -207,14 +207,14 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 			}
 			taskID := protocol.NewIdentifier("task")
 			provisionalIDs[index] = taskID
-			if spec.ClientTaskID != "" {
-				if !protocol.IsIdentifier(spec.ClientTaskID) {
+			if taskSpecification.ClientTaskID != "" {
+				if !protocol.IsIdentifier(taskSpecification.ClientTaskID) {
 					return invalidRequest(fmt.Sprintf("task[%d] clientTaskId is malformed", index))
 				}
-				if _, duplicate := clientTaskMap[spec.ClientTaskID]; duplicate {
-					return invalidRequest(fmt.Sprintf("duplicate clientTaskId %q in batch", spec.ClientTaskID))
+				if _, duplicate := clientTaskMap[taskSpecification.ClientTaskID]; duplicate {
+					return invalidRequest(fmt.Sprintf("duplicate clientTaskId %q in batch", taskSpecification.ClientTaskID))
 				}
-				clientTaskMap[spec.ClientTaskID] = taskID
+				clientTaskMap[taskSpecification.ClientTaskID] = taskID
 			}
 		}
 
@@ -231,12 +231,12 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 		}
 
 		proposedTasks := make([]protocol.Task, len(input.Tasks))
-		for index, spec := range input.Tasks {
+		for index, taskSpecification := range input.Tasks {
 			taskID := provisionalIDs[index]
-			dependencies := make([]protocol.TaskDependency, 0, len(spec.Dependencies))
+			dependencies := make([]protocol.TaskDependency, 0, len(taskSpecification.Dependencies))
 			seenDependencies := map[string]bool{}
 
-			for _, dependencySpec := range spec.Dependencies {
+			for _, dependencySpec := range taskSpecification.Dependencies {
 				hasTaskID := dependencySpec.TaskID != ""
 				hasClientTaskID := dependencySpec.ClientTaskID != ""
 				if hasTaskID == hasClientTaskID {
@@ -277,7 +277,7 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 				})
 			}
 
-			maxAttempts := spec.MaxAttempts
+			maxAttempts := taskSpecification.MaxAttempts
 			if maxAttempts <= 0 {
 				maxAttempts = protocol.MaximumTaskAttempts
 			}
@@ -285,9 +285,9 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 				maxAttempts = protocol.MaximumTaskAttempts
 			}
 
-			placementInstanceID := spec.InstanceID
-			if placementInstanceID == "" && spec.PlacementOverride != nil && spec.PlacementOverride.InstanceID != "" {
-				placementInstanceID = spec.PlacementOverride.InstanceID
+			placementInstanceID := taskSpecification.InstanceID
+			if placementInstanceID == "" && taskSpecification.PlacementOverride != nil && taskSpecification.PlacementOverride.InstanceID != "" {
+				placementInstanceID = taskSpecification.PlacementOverride.InstanceID
 			}
 			if placementInstanceID != "" {
 				pinnedInstance, instanceExists := state.Instances[placementInstanceID]
@@ -299,13 +299,13 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 				}
 			}
 
-			if spec.Requirements.ProjectProfileID != "" {
-				if _, profileExists := state.ProjectProfiles[spec.Requirements.ProjectProfileID]; !profileExists {
-					return invalidRequest(fmt.Sprintf("task[%d] references unknown projectProfileId %q", index, spec.Requirements.ProjectProfileID))
+			if taskSpecification.Requirements.ProjectProfileID != "" {
+				if _, profileExists := state.ProjectProfiles[taskSpecification.Requirements.ProjectProfileID]; !profileExists {
+					return invalidRequest(fmt.Sprintf("task[%d] references unknown projectProfileId %q", index, taskSpecification.Requirements.ProjectProfileID))
 				}
 			}
 
-			for toolID, constraintRaw := range spec.Requirements.Toolchains {
+			for toolID, constraintRaw := range taskSpecification.Requirements.Toolchains {
 				if !protocol.LabelOrAcceleratorPattern.MatchString(toolID) {
 					return invalidRequest(fmt.Sprintf("task[%d] toolchain id %q is invalid", index, toolID))
 				}
@@ -317,18 +317,18 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 			proposedTasks[index] = protocol.Task{
 				ID:                  taskID,
 				ThreadID:            threadID,
-				ClientTaskID:        spec.ClientTaskID,
+				ClientTaskID:        taskSpecification.ClientTaskID,
 				ParentTaskID:        parentTaskID,
 				CreatedByRunID:      caller.RunID,
 				Origin:              origin,
-				Title:               strings.TrimSpace(spec.Title),
-				Instructions:        strings.TrimSpace(spec.Instructions),
+				Title:               strings.TrimSpace(taskSpecification.Title),
+				Instructions:        strings.TrimSpace(taskSpecification.Instructions),
 				Status:              "pending",
 				AttemptCount:        0,
 				MaxAttempts:         maxAttempts,
 				Dependencies:        dependencies,
-				Requirements:        spec.Requirements,
-				PlacementOverride:   spec.PlacementOverride,
+				Requirements:        taskSpecification.Requirements,
+				PlacementOverride:   taskSpecification.PlacementOverride,
 				PlacementInstanceID: placementInstanceID,
 				CreatedAt:           nowText,
 				UpdatedAt:           nowText,
@@ -550,11 +550,12 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 		}
 
 		if input.Status != "" && input.Status != task.Status {
-			if input.Status == "cancelled" {
+			switch {
+			case input.Status == "cancelled":
 				service.cancelTaskInState(state, mutation, &task, nowText)
-			} else if protocol.IsTerminalTaskStatus(task.Status) {
+			case protocol.IsTerminalTaskStatus(task.Status):
 				return conflictError("invalid_transition", fmt.Sprintf("task %s is already %s", task.ID, task.Status))
-			} else {
+			default:
 				allowed := protocol.CanTransitionTask(task.Status, input.Status) ||
 					(task.Status == "running" && input.Status == "blocked")
 				if !allowed {
@@ -617,14 +618,14 @@ func (service *Service) GetTaskContext(caller CallerIdentity) (TaskContextRespon
 				response.Task = task
 				response.Room = buildTaskRoomSummary(state, runRecord.ThreadID, task)
 				for _, dependency := range task.Dependencies {
-					if depTask, depExists := state.Tasks[dependency.TaskID]; depExists {
+					if dependencyTask, depExists := state.Tasks[dependency.TaskID]; depExists {
 						response.Dependencies = append(response.Dependencies, DependencyTaskSummary{
-							ID:          depTask.ID,
-							Title:       depTask.Title,
-							Status:      depTask.Status,
+							ID:          dependencyTask.ID,
+							Title:       dependencyTask.Title,
+							Status:      dependencyTask.Status,
 							Policy:      dependency.Policy,
-							Summary:     depTask.Summary,
-							ArtifactIDs: depTask.ArtifactIDs,
+							Summary:     dependencyTask.Summary,
+							ArtifactIDs: dependencyTask.ArtifactIDs,
 						})
 					}
 				}
@@ -847,24 +848,24 @@ func recomputeThreadTaskReadiness(state *store.State, threadID string, nowText s
 			blockedReason := ""
 
 			for _, dependency := range task.Dependencies {
-				depTask, exists := state.Tasks[dependency.TaskID]
+				dependencyTask, exists := state.Tasks[dependency.TaskID]
 				if !exists {
 					allSatisfied = false
-					blockedReason = fmt.Sprintf("missing dependency %s", dependency.TaskID)
+					blockedReason = "missing dependency " + dependency.TaskID
 					break
 				}
 				switch dependency.Policy {
 				case "allow-failure":
-					if !protocol.IsTerminalTaskStatus(depTask.Status) && depTask.Status != "blocked" {
+					if !protocol.IsTerminalTaskStatus(dependencyTask.Status) && dependencyTask.Status != "blocked" {
 						allSatisfied = false
 					}
 				default:
-					if depTask.Status == "completed" {
+					if dependencyTask.Status == "completed" {
 						continue
 					}
 					allSatisfied = false
-					if depTask.Status == "failed" || depTask.Status == "cancelled" || depTask.Status == "blocked" {
-						blockedReason = fmt.Sprintf("dependency %s (%s) %s", depTask.ID, depTask.Title, depTask.Status)
+					if dependencyTask.Status == "failed" || dependencyTask.Status == "cancelled" || dependencyTask.Status == "blocked" {
+						blockedReason = fmt.Sprintf("dependency %s (%s) %s", dependencyTask.ID, dependencyTask.Title, dependencyTask.Status)
 					}
 				}
 				if blockedReason != "" {

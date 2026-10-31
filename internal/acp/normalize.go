@@ -199,11 +199,12 @@ func (normalization *normalizer) toolCall(raw json.RawMessage, created bool) ([]
 			switch item.Type {
 			case "content":
 				var block receivedContent
-				if decodeStrict(item.Content, &block) != nil || block.Type == "" {
+				switch {
+				case decodeStrict(item.Content, &block) != nil || block.Type == "":
 					skipped++
-				} else if block.Type == "text" && block.Text != nil {
+				case block.Type == "text" && block.Text != nil:
 					details = append(details, *block.Text)
-				} else {
+				default:
 					events = append(events, unknownEvent("tool_call_content/"+block.Type, "non-text tool content is not rendered"))
 				}
 			case "diff":

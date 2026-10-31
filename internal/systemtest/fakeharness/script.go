@@ -32,10 +32,52 @@ type Step struct {
 	Permission      *Permission     `json:"permission,omitempty"`
 	Gate            string          `json:"gate,omitempty"`
 	WriteFile       *WriteFile      `json:"writeFile,omitempty"`
+	ReadFile        *ReadFile       `json:"readFile,omitempty"`
 	RemoveFile      string          `json:"removeFile,omitempty"`
 	Raw             string          `json:"raw,omitempty"`
 	Crash           int             `json:"crash,omitempty"`
 	Hang            bool            `json:"hang,omitempty"`
+	FailTurn        *FailTurn       `json:"failTurn,omitempty"`
+}
+
+type ReadFile struct {
+	Path string `json:"path"`
+	As   string `json:"as,omitempty"`
+}
+
+func (readFile *ReadFile) UnmarshalJSON(data []byte) error {
+	var asString string
+	if err := json.Unmarshal(data, &asString); err == nil {
+		readFile.Path = asString
+		return nil
+	}
+	type rawReadFile ReadFile
+	var raw rawReadFile
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*readFile = ReadFile(raw)
+	return nil
+}
+
+type FailTurn struct {
+	Reason string
+}
+
+func (failTurn *FailTurn) UnmarshalJSON(data []byte) error {
+	var asBool bool
+	if err := json.Unmarshal(data, &asBool); err == nil {
+		if asBool {
+			failTurn.Reason = "scripted turn failure"
+		}
+		return nil
+	}
+	var asString string
+	if err := json.Unmarshal(data, &asString); err == nil {
+		failTurn.Reason = asString
+		return nil
+	}
+	return errors.New("failTurn must be a boolean or string")
 }
 
 type Condition struct {
@@ -113,6 +155,10 @@ func newScriptEngine(
 	workingDirectory string,
 	sessionID string,
 ) *scriptEngine {
+	runID := os.Getenv("ORCHESTRA_RUN_ID")
+	if runID == "" {
+		runID = sessionID
+	}
 	return &scriptEngine{
 		host:             host,
 		mcpClient:        mcpClient,
@@ -121,6 +167,8 @@ func newScriptEngine(
 		variables: map[string]any{
 			"cwd":     workingDirectory,
 			"session": sessionID,
+			"run_id":  runID,
+			"runId":   runID,
 		},
 	}
 }
@@ -145,9 +193,8 @@ func (engine *scriptEngine) run(operationContext context.Context, script Script)
 			if errors.Is(err, errRunCancelled) {
 				return err
 			}
-			var crashError scriptedCrash
-			if errors.As(err, &crashError) {
-				return err
+			if crashError, ok := errors.AsType[scriptedCrash](err); ok {
+				return crashError
 			}
 			return fmt.Errorf("step %d: %w", index, err)
 		}
@@ -200,6 +247,29 @@ func (engine *scriptEngine) executeStep(operationContext context.Context, step S
 			return err
 		}
 		return os.WriteFile(localPath, []byte(contentText), 0o644)
+	case step.ReadFile != nil:
+		relativePath, err := engine.renderText(step.ReadFile.Path)
+		if err != nil {
+			return err
+		}
+		localPath, err := engine.resolveLocalPath(relativePath)
+		if err != nil {
+			return err
+		}
+		contentBytes, err := os.ReadFile(localPath)
+		if err != nil {
+			return err
+		}
+		destinationVariable := step.ReadFile.As
+		if destinationVariable == "" {
+			destinationVariable = step.As
+		}
+		if destinationVariable != "" {
+			engine.variables[destinationVariable] = string(contentBytes)
+		}
+		return nil
+	case step.FailTurn != nil && step.FailTurn.Reason != "":
+		return errors.New(step.FailTurn.Reason)
 	case step.RemoveFile != "":
 		localPath, err := engine.resolveLocalPath(step.RemoveFile)
 		if err != nil {

@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -644,11 +645,14 @@ func (bridge *Bridge) runSingleWebSocketSession(operationContext context.Context
 	}
 
 	dialContext, cancelDial := context.WithTimeout(operationContext, 10*time.Second)
-	connection, _, err := websocket.Dial(dialContext, wsURL, &websocket.DialOptions{
+	connection, httpResponse, err := websocket.Dial(dialContext, wsURL, &websocket.DialOptions{
 		HTTPHeader: headers,
 		HTTPClient: bridge.configuration.HTTPClient,
 	})
 	cancelDial()
+	if httpResponse != nil && httpResponse.Body != nil {
+		_ = httpResponse.Body.Close()
+	}
 	if err != nil {
 		return false
 	}
@@ -839,12 +843,12 @@ func (bridge *Bridge) emitMailNotification(notification protocol.MailNotificatio
 	}
 
 	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf(
+	fmt.Fprintf(&builder,
 		"[Orchestra Mail from %s -> %s | id=%s]",
 		notification.Message.FromAddress,
 		notification.MailboxAddress,
 		notification.Message.ID,
-	))
+	)
 	if notification.Message.Subject != "" {
 		builder.WriteString(" Subject: " + notification.Message.Subject)
 	}
@@ -853,11 +857,11 @@ func (bridge *Bridge) emitMailNotification(notification protocol.MailNotificatio
 	if !strings.HasSuffix(notification.Message.Body, "\n") {
 		builder.WriteByte('\n')
 	}
-	builder.WriteString(fmt.Sprintf(
+	fmt.Fprintf(&builder,
 		"(Reply via `send_mail` with `to: %q` and `replyToId: %q`, or mark handled with `read_mail`.)",
 		notification.Message.FromAddress,
 		notification.Message.ID,
-	))
+	)
 
 	parameters, err := json.Marshal(map[string]any{
 		"content": builder.String(),
@@ -884,8 +888,8 @@ func (bridge *Bridge) emitDoorbellNotification(doorbell protocol.DoorbellNotific
 	meta := map[string]string{
 		"thread_id":        doorbell.ThreadID,
 		"thread_title":     doorbell.ThreadTitle,
-		"through_sequence": fmt.Sprintf("%d", doorbell.ThroughSequence),
-		"urgent":           fmt.Sprintf("%t", doorbell.Urgent),
+		"through_sequence": strconv.FormatInt(doorbell.ThroughSequence, 10),
+		"urgent":           strconv.FormatBool(doorbell.Urgent),
 		"occurred_at":      doorbell.OccurredAt,
 	}
 	if len(doorbell.ApprovalIDs) > 0 {

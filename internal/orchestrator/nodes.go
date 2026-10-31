@@ -90,23 +90,24 @@ func (service *Service) ListNodeDetails() ([]protocol.NodeDetail, error) {
 			occupyingInstances := countOccupyingAllocationsOnNode(state, nodeID)
 			node.ActiveRuns = activeRuns
 			node.ActiveInstances = &occupyingInstances
-			if !connected {
+			switch {
+			case !connected:
 				node.Status = "offline"
-			} else if activeRuns >= node.Concurrency {
+			case activeRuns >= node.Concurrency:
 				node.Status = "busy"
-			} else {
+			default:
 				node.Status = "online"
 			}
 
-			var capReportPtr *protocol.NodeCapabilityReport
-			if capReport, exists := state.CapabilityReports[nodeID]; exists {
-				copyReport := capReport
-				capReportPtr = &copyReport
+			var capabilityReport *protocol.NodeCapabilityReport
+			if report, exists := state.CapabilityReports[nodeID]; exists {
+				reportCopy := report
+				capabilityReport = &reportCopy
 			}
-			var compReportPtr *protocol.ComponentInventoryReport
-			if compReport, exists := state.ComponentReports[nodeID]; exists {
-				copyReport := compReport
-				compReportPtr = &copyReport
+			var componentReport *protocol.ComponentInventoryReport
+			if report, exists := state.ComponentReports[nodeID]; exists {
+				reportCopy := report
+				componentReport = &reportCopy
 			}
 
 			var residentIDs []string
@@ -121,8 +122,8 @@ func (service *Service) ListNodeDetails() ([]protocol.NodeDetail, error) {
 				Node:              node,
 				Connected:         connected,
 				Synced:            synced,
-				CapabilityReport:  capReportPtr,
-				ComponentReport:   compReportPtr,
+				CapabilityReport:  capabilityReport,
+				ComponentReport:   componentReport,
 				ResidentInstances: residentIDs,
 			})
 		}
@@ -212,15 +213,16 @@ func (service *Service) sendToSlave(nodeID string, message protocol.MasterContro
 	if !connected {
 		return errors.New("slave node is not connected")
 	}
-	return session.send(context.Background(), message)
+	baseContext := cmp.Or[context.Context](service.baseContext, context.Background())
+	return session.send(baseContext, message)
 }
 
 func (service *Service) serveSlaveConnection(requestContext context.Context, connection *websocket.Conn) {
 	connection.SetReadLimit(16 * 1024 * 1024)
 
-	regContext, cancelReg := context.WithTimeout(requestContext, 15*time.Second)
-	_, firstPayload, err := connection.Read(regContext)
-	cancelReg()
+	registrationContext, cancelRegistration := context.WithTimeout(requestContext, 15*time.Second)
+	defer cancelRegistration()
+	_, firstPayload, err := connection.Read(registrationContext)
 	if err != nil {
 		_ = connection.Close(websocket.StatusProtocolError, "expected registration message")
 		return

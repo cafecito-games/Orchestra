@@ -167,8 +167,7 @@ func ParseVersionConstraint(raw string) (VersionConstraint, error) {
 		return VersionConstraint{}, fmt.Errorf("version constraint exceeds its bound: %q", raw)
 	}
 	for _, comparator := range VersionComparators {
-		if strings.HasPrefix(raw, comparator) {
-			version := strings.TrimPrefix(raw, comparator)
+		if version, ok := strings.CutPrefix(raw, comparator); ok {
 			if !IsNormalizedVersion(version) {
 				return VersionConstraint{}, fmt.Errorf("version constraint has an invalid version: %q", raw)
 			}

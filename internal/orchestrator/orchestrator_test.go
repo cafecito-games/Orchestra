@@ -41,9 +41,11 @@ func TestNodeFencingTaskDAGSchedulerMailboxApprovalsArtifactsAndMCP(t *testing.T
 	httpServer := httptest.NewServer(service.Handler())
 	defer httpServer.Close()
 
-	unauthorizedResponse, err := http.Get(httpServer.URL + "/api/status")
+	unauthorizedRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+"/api/status", nil)
 	require.NoError(t, err)
-	unauthorizedResponse.Body.Close()
+	unauthorizedResponse, err := http.DefaultClient.Do(unauthorizedRequest)
+	require.NoError(t, err)
+	_ = unauthorizedResponse.Body.Close()
 	require.Equal(t, http.StatusUnauthorized, unauthorizedResponse.StatusCode)
 
 	rawWorkspace := t.TempDir()
@@ -116,9 +118,12 @@ echo '{"type":"result","result":"step succeeded"}'
 	}, 5*time.Second, 25*time.Millisecond)
 
 	wsURL := strings.Replace(httpServer.URL, "http://", "ws://", 1) + "/control-agent"
-	duplicateConnection, _, err := websocket.Dial(context.Background(), wsURL, &websocket.DialOptions{
+	duplicateConnection, duplicateResponse, err := websocket.Dial(context.Background(), wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": []string{"Bearer master-secret-token"}},
 	})
+	if duplicateResponse != nil && duplicateResponse.Body != nil {
+		_ = duplicateResponse.Body.Close()
+	}
 	require.NoError(t, err)
 	registrationBytes, _ := json.Marshal(protocol.SlaveControlMessage{
 		Type:            "register",
@@ -142,9 +147,12 @@ echo '{"type":"result","result":"step succeeded"}'
 	require.True(t, service.isNodeLiveAndSynced("worker-alpha"))
 
 	orchestratorWSURL := strings.Replace(httpServer.URL, "http://", "ws://", 1) + "/orchestrator-client"
-	orchestratorConnection, _, err := websocket.Dial(context.Background(), orchestratorWSURL, &websocket.DialOptions{
+	orchestratorConnection, orchestratorResponse, err := websocket.Dial(context.Background(), orchestratorWSURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": []string{"Bearer master-secret-token"}},
 	})
+	if orchestratorResponse != nil && orchestratorResponse.Body != nil {
+		_ = orchestratorResponse.Body.Close()
+	}
 	require.NoError(t, err)
 	defer orchestratorConnection.Close(websocket.StatusNormalClosure, "done")
 
@@ -275,14 +283,14 @@ echo '{"type":"result","result":"step succeeded"}'
 	})
 	require.NoError(t, err)
 
-	putRequest, err := http.NewRequest(http.MethodPut, httpServer.URL+postedArtifact.Upload.Path, bytes.NewReader(artifactBytes))
+	putRequest, err := http.NewRequestWithContext(t.Context(), http.MethodPut, httpServer.URL+postedArtifact.Upload.Path, bytes.NewReader(artifactBytes))
 	require.NoError(t, err)
 	putResponse, err := http.DefaultClient.Do(putRequest)
 	require.NoError(t, err)
 	putResponse.Body.Close()
 	require.Equal(t, http.StatusOK, putResponse.StatusCode)
 
-	getRequest, err := http.NewRequest(http.MethodGet, httpServer.URL+postedArtifact.Artifact.DownloadPath, nil)
+	getRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+postedArtifact.Artifact.DownloadPath, nil)
 	require.NoError(t, err)
 	getRequest.Header.Set("Authorization", "Bearer master-secret-token")
 	getResponse, err := http.DefaultClient.Do(getRequest)
@@ -293,7 +301,7 @@ echo '{"type":"result","result":"step succeeded"}'
 	require.Equal(t, artifactBytes, downloaded)
 
 	mcpInitializeBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"orchestrator-test","version":"1.0.0"}}}`
-	mcpRequest, err := http.NewRequest(http.MethodPost, httpServer.URL+"/mcp", strings.NewReader(mcpInitializeBody))
+	mcpRequest, err := http.NewRequestWithContext(t.Context(), http.MethodPost, httpServer.URL+"/mcp", strings.NewReader(mcpInitializeBody))
 	require.NoError(t, err)
 	mcpRequest.Header.Set("Authorization", "Bearer master-secret-token")
 	mcpRequest.Header.Set("Content-Type", "application/json")
@@ -305,7 +313,7 @@ echo '{"type":"result","result":"step succeeded"}'
 	require.NotEmpty(t, mcpSession)
 
 	mcpListBody := `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`
-	listRequest, err := http.NewRequest(http.MethodPost, httpServer.URL+"/mcp", strings.NewReader(mcpListBody))
+	listRequest, err := http.NewRequestWithContext(t.Context(), http.MethodPost, httpServer.URL+"/mcp", strings.NewReader(mcpListBody))
 	require.NoError(t, err)
 	listRequest.Header.Set("Authorization", "Bearer master-secret-token")
 	listRequest.Header.Set("Content-Type", "application/json")
@@ -622,7 +630,7 @@ esac
 				return nil
 			}
 		}
-		t.Fatal("expected idle native-cli binding for workspaceB")
+		require.FailNow(t, "expected idle native-cli binding for workspaceB")
 		return nil
 	})
 	require.NoError(t, err)

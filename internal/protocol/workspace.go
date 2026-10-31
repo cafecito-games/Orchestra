@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
@@ -193,16 +194,16 @@ type WorkspaceLeaseGrant struct {
 
 func (grant WorkspaceLeaseGrant) Validate() error {
 	if !IsWorkspaceLeaseIdentity(grant.ID) {
-		return fmt.Errorf("workspace lease id is malformed")
+		return errors.New("workspace lease id is malformed")
 	}
 	if !slices.Contains(WorkspaceLeaseStatuses, grant.Status) {
-		return fmt.Errorf("workspace lease status is missing or unknown")
+		return errors.New("workspace lease status is missing or unknown")
 	}
 	if !slices.Contains(WorkspaceIsolationPolicies, grant.Policy) {
-		return fmt.Errorf("workspace lease policy is missing or unknown")
+		return errors.New("workspace lease policy is missing or unknown")
 	}
 	if !slices.Contains(WorkspaceCleanupPolicies, grant.Cleanup) {
-		return fmt.Errorf("workspace lease cleanup policy is missing or unknown")
+		return errors.New("workspace lease cleanup policy is missing or unknown")
 	}
 	for name, targetPath := range map[string]string{
 		"root":         grant.Root,
@@ -214,29 +215,30 @@ func (grant WorkspaceLeaseGrant) Validate() error {
 		}
 	}
 	if grant.ResolvedBaseRevision != "" && !IsResolvedRevision(grant.ResolvedBaseRevision) {
-		return fmt.Errorf("workspace lease resolved base revision is malformed")
+		return errors.New("workspace lease resolved base revision is malformed")
 	}
 	if grant.Policy == WorkspaceIsolationExclusiveExisting {
 		if grant.Repository != "" || grant.BaseRevision != "" || grant.ResolvedBaseRevision != "" || grant.Branch != "" {
-			return fmt.Errorf("exclusive-existing workspace lease must not name a repository, base, or branch")
+			return errors.New("exclusive-existing workspace lease must not name a repository, base, or branch")
 		}
 		if grant.WorktreePath != grant.SourcePath {
-			return fmt.Errorf("exclusive-existing workspace lease must use its source path")
+			return errors.New("exclusive-existing workspace lease must use its source path")
 		}
 		return nil
 	}
 	if grant.Repository != "" {
 		if identity, ok := NormalizeRepositoryIdentity(grant.Repository); !ok || !IsBoundedString(grant.Repository, 512) || identity != grant.Repository {
-			return fmt.Errorf("workspace lease repository identity is not normalized")
+			return errors.New("workspace lease repository identity is not normalized")
 		}
 	}
 	if grant.BaseRevision != "HEAD" {
-		if !strings.HasPrefix(grant.BaseRevision, "refs/heads/") || !IsWorkspaceLeaseBaseBranch(strings.TrimPrefix(grant.BaseRevision, "refs/heads/")) {
-			return fmt.Errorf("workspace lease base revision is malformed")
+		branchName, ok := strings.CutPrefix(grant.BaseRevision, "refs/heads/")
+		if !ok || !IsWorkspaceLeaseBaseBranch(branchName) {
+			return errors.New("workspace lease base revision is malformed")
 		}
 	}
 	if !strings.HasPrefix(grant.Branch, WorkspaceLeaseBranchPrefix) {
-		return fmt.Errorf("workspace lease branch is malformed")
+		return errors.New("workspace lease branch is malformed")
 	}
 	return nil
 }
@@ -251,23 +253,23 @@ type WorkspaceLeaseUpdate struct {
 
 func (update WorkspaceLeaseUpdate) Validate() error {
 	if !IsIdentifier(update.LeaseID) {
-		return fmt.Errorf("workspace lease update is missing identity")
+		return errors.New("workspace lease update is missing identity")
 	}
 	if !slices.Contains(WorkspaceLeaseStatuses, update.Status) {
-		return fmt.Errorf("workspace lease status is missing or unknown")
+		return errors.New("workspace lease status is missing or unknown")
 	}
 	if update.Status == "retained" {
 		if !slices.Contains(WorkspaceRetentionReasons, update.RetentionReason) {
-			return fmt.Errorf("workspace lease retention reason does not match its status")
+			return errors.New("workspace lease retention reason does not match its status")
 		}
 	} else if update.RetentionReason != "" {
-		return fmt.Errorf("workspace lease retention reason does not match its status")
+		return errors.New("workspace lease retention reason does not match its status")
 	}
 	if update.ResolvedBaseRevision != "" && !IsResolvedRevision(update.ResolvedBaseRevision) {
-		return fmt.Errorf("workspace lease resolved base revision is malformed")
+		return errors.New("workspace lease resolved base revision is malformed")
 	}
 	if !IsBoundedString(update.Detail, DiagnosticMaximumBytes) {
-		return fmt.Errorf("workspace lease detail exceeds its bound")
+		return errors.New("workspace lease detail exceeds its bound")
 	}
 	return nil
 }

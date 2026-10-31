@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -828,10 +827,6 @@ func (service *Service) ResolveApproval(
 		if !exists {
 			return notFound(fmt.Sprintf("approval %s does not exist", input.ApprovalID))
 		}
-		if approval.Status != "pending" {
-			resolved = approval
-			return nil
-		}
 
 		selectedOptionID := strings.TrimSpace(input.OptionID)
 		targetStatus := strings.TrimSpace(input.Status)
@@ -874,6 +869,20 @@ func (service *Service) ResolveApproval(
 					selectedOptionID = approval.Options[0].ID
 				}
 			}
+		}
+
+		if approval.Status != "pending" {
+			sameDecision := approval.Status == targetStatus
+			if trimmedOptionID := strings.TrimSpace(input.OptionID); trimmedOptionID != "" {
+				if approval.SelectedOptionID != trimmedOptionID {
+					sameDecision = false
+				}
+			}
+			if sameDecision {
+				resolved = approval
+				return nil
+			}
+			return conflictError("already_resolved", fmt.Sprintf("approval %s is already %s", approval.ID, approval.Status))
 		}
 
 		nowText := service.nowUTC()
@@ -1092,7 +1101,7 @@ func (service *Service) PostArtifact(
 		return PostArtifactResult{}, invalidRequest("sha256 must be a 64-character lowercase hex digest")
 	}
 	for _, character := range normalizedDigest {
-		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
 			return PostArtifactResult{}, invalidRequest("sha256 must be a valid hex digest")
 		}
 	}
@@ -1101,9 +1110,7 @@ func (service *Service) PostArtifact(
 		mediaType = "application/octet-stream"
 	}
 
-	var tokenBytes [24]byte
-	_, _ = rand.Read(tokenBytes[:])
-	grantToken := base64.RawURLEncoding.EncodeToString(tokenBytes[:])
+	grantToken := rand.Text()
 	tokenDigestBytes := sha256.Sum256([]byte(grantToken))
 	tokenDigest := hex.EncodeToString(tokenDigestBytes[:])
 

@@ -57,12 +57,11 @@ func (client *Client) handleInstanceProvision(instance *protocol.AgentInstance, 
 	capacity := client.instanceCapacity()
 	if capacity >= 0 && len(client.instances) >= capacity {
 		client.mutex.Unlock()
-		errorMessage := "instance capacity on this slave node is exhausted"
 		client.sendOrQueue(protocol.SlaveControlMessage{
 			Type:         "instance.failed",
 			InstanceID:   instance.ID,
 			AllocationID: allocation.ID,
-			Error:        &errorMessage,
+			Error:        new("instance capacity on this slave node is exhausted"),
 			At:           client.nowUTC(),
 		})
 		return
@@ -70,12 +69,11 @@ func (client *Client) handleInstanceProvision(instance *protocol.AgentInstance, 
 	client.mutex.Unlock()
 
 	if err := client.validateProvision(*instance, *allocation); err != nil {
-		errorMessage := protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))
 		client.sendOrQueue(protocol.SlaveControlMessage{
 			Type:         "instance.failed",
 			InstanceID:   instance.ID,
 			AllocationID: allocation.ID,
-			Error:        &errorMessage,
+			Error:        new(protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))),
 			At:           client.nowUTC(),
 		})
 		return

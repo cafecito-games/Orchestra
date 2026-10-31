@@ -115,8 +115,7 @@ func runACP(recorder *eventRecorder, flavor acpAdapterFlavor) int {
 	go agent.readStdinLoop()
 	for request := range agent.requests {
 		if err := agent.handleRequest(request); err != nil {
-			var crashResult scriptedCrash
-			if errors.As(err, &crashResult) {
+			if crashResult, ok := errors.AsType[scriptedCrash](err); ok {
 				return crashResult.code
 			}
 			fmt.Fprintf(os.Stderr, "fakeharness: %v\n", err)

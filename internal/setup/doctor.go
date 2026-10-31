@@ -126,8 +126,7 @@ func activationStatus(activation ActivationState) ActivationLedgerStatus {
 	}
 	status.Rejection = screenedActivationDetail(activation.Rejection.Error())
 	status.Repair = ActivationRepairGuidance
-	var rejection *ActivationRejectionError
-	if errors.As(activation.Rejection, &rejection) {
+	if rejection, ok := errors.AsType[*ActivationRejectionError](activation.Rejection); ok {
 		status.Generation = rejection.SourceGeneration
 	}
 	return status
