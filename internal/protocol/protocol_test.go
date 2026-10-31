@@ -128,3 +128,58 @@ func TestStateTransitions(t *testing.T) {
 	require.True(t, protocol.CanTransitionAllocation("active", "lost"))
 	require.False(t, protocol.CanTransitionAllocation("released", "active"))
 }
+
+func TestDispatchSessionBinding_TransportValidation(t *testing.T) {
+	cases := []struct {
+		name      string
+		binding   protocol.DispatchSessionBinding
+		expectErr bool
+	}{
+		{
+			name: "empty transport allowed for compatibility",
+			binding: protocol.DispatchSessionBinding{
+				ID:                "sbind-1",
+				ProviderSessionID: "sess-123",
+			},
+			expectErr: false,
+		},
+		{
+			name: "acp transport valid",
+			binding: protocol.DispatchSessionBinding{
+				ID:                "sbind-1",
+				ProviderSessionID: "sess-acp-1",
+				Transport:         protocol.TransportACP,
+			},
+			expectErr: false,
+		},
+		{
+			name: "native transport valid",
+			binding: protocol.DispatchSessionBinding{
+				ID:                "sbind-1",
+				ProviderSessionID: "sess-native-1",
+				Transport:         protocol.TransportNativeCLI,
+			},
+			expectErr: false,
+		},
+		{
+			name: "unknown transport rejected",
+			binding: protocol.DispatchSessionBinding{
+				ID:                "sbind-1",
+				ProviderSessionID: "sess-1",
+				Transport:         "stdio-raw",
+			},
+			expectErr: true,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := testCase.binding.Validate()
+			if testCase.expectErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

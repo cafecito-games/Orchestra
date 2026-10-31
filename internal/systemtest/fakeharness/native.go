@@ -89,19 +89,26 @@ func runNative(recorder *eventRecorder, role string, arguments []string) int {
 
 	conversationID := parsed.conversationID
 	resumedConversation := false
-	if role == "agy" {
-		sessionDirectory := os.Getenv(sessionDirectoryVariable)
-		if conversationID != "" {
-			if sessionDirectory != "" {
-				if _, statErr := os.Stat(filepath.Join(sessionDirectory, "agy-"+conversationID+".json")); statErr == nil {
-					resumedConversation = true
-				}
+	sessionDirectory := os.Getenv(sessionDirectoryVariable)
+	if conversationID != "" {
+		if sessionDirectory != "" {
+			if _, statErr := os.Stat(filepath.Join(sessionDirectory, role+"-"+conversationID+".json")); statErr == nil {
+				resumedConversation = true
 			}
 		} else {
-			conversationID = "agy-conv-" + strconv.Itoa(os.Getpid())
-			if sessionDirectory != "" {
-				_ = os.WriteFile(filepath.Join(sessionDirectory, "agy-"+conversationID+".json"), []byte(`{"active":true}`), 0o600)
-			}
+			resumedConversation = true
+		}
+	} else {
+		prefix := "native-claude-"
+		switch role {
+		case "agy":
+			prefix = "agy-conv-"
+		case "codex":
+			prefix = "native-codex-"
+		}
+		conversationID = prefix + strconv.Itoa(os.Getpid())
+		if sessionDirectory != "" {
+			_ = os.WriteFile(filepath.Join(sessionDirectory, role+"-"+conversationID+".json"), []byte(`{"active":true}`), 0o600)
 		}
 	}
 
@@ -137,11 +144,11 @@ func runNative(recorder *eventRecorder, role string, arguments []string) int {
 	}
 	switch role {
 	case "codex":
-		host.emit(map[string]any{"type": "thread.started", "thread_id": "native-codex-" + strconv.Itoa(os.Getpid())})
+		host.emit(map[string]any{"type": "thread.started", "thread_id": conversationID})
 	case "agy":
 		host.emit(map[string]any{"event": "init", "conversation_id": conversationID})
 	default:
-		host.emit(map[string]any{"type": "system", "session_id": "native-claude-" + strconv.Itoa(os.Getpid())})
+		host.emit(map[string]any{"type": "system", "session_id": conversationID})
 	}
 
 	runErr := newScriptEngine(host, mcpClient, parsed.prompt, workingDirectory, conversationID).run(context.Background(), script)
@@ -186,17 +193,24 @@ func parseNativeInvocation(role string, arguments []string) (parsedNativeArgumen
 			return parsed, errors.New("expected codex exec")
 		}
 		parsed.prompt = arguments[len(arguments)-1]
-		for index := 0; index+1 < len(arguments)-1; index++ {
-			if arguments[index] != "-c" {
-				continue
-			}
-			key, value, found := strings.Cut(arguments[index+1], "=")
-			if found && key == "mcp_servers.orchestra_hub.url" {
-				unquoted, unquoteErr := strconv.Unquote(value)
-				if unquoteErr != nil {
-					return parsed, errors.New("MCP URL configuration is not quoted")
+		for index := 1; index+1 < len(arguments)-1; index++ {
+			switch arguments[index] {
+			case "-c":
+				key, value, found := strings.Cut(arguments[index+1], "=")
+				if found && key == "mcp_servers.orchestra_hub.url" {
+					unquoted, unquoteErr := strconv.Unquote(value)
+					if unquoteErr != nil {
+						return parsed, errors.New("MCP URL configuration is not quoted")
+					}
+					parsed.mcpEndpoint = unquoted
 				}
-				parsed.mcpEndpoint = unquoted
+				index++
+			case "--model":
+				parsed.modelID = arguments[index+1]
+				index++
+			case "resume":
+				parsed.conversationID = arguments[index+1]
+				index++
 			}
 		}
 		return parsed, nil
@@ -249,6 +263,10 @@ func parseNativeInvocation(role string, arguments []string) (parsedNativeArgumen
 		switch arguments[index] {
 		case "-p":
 			parsed.prompt = arguments[index+1]
+		case "--resume":
+			parsed.conversationID = arguments[index+1]
+		case "--model":
+			parsed.modelID = arguments[index+1]
 		case "--mcp-config":
 			var configuration struct {
 				MCPServers map[string]struct {

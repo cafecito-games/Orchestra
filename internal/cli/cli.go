@@ -239,7 +239,11 @@ func runSlave(
 		}
 	}
 	if len(availableLabels) == 0 {
-		fmt.Fprintln(standardError, "orchestra slave: no available harnesses discovered; install and authenticate Claude Code, Codex, OpenCode, or Antigravity")
+		if configuration.RequireACP {
+			fmt.Fprintln(standardError, "orchestra slave: no ACP-ready harnesses discovered (--require-acp is enabled); install and configure an ACP adapter or ACP-native harness")
+		} else {
+			fmt.Fprintln(standardError, "orchestra slave: no available harnesses discovered; install and authenticate Claude Code, Codex, OpenCode, or Antigravity")
+		}
 		return 1
 	}
 	fmt.Fprintf(
@@ -283,6 +287,7 @@ Flags:
   --approval-policy value       Approval policy manual|auto|bypass or harness=policy (repeatable, env ORCHESTRA_APPROVAL_POLICY)
   --acp-adapter value           ACP adapter override harness=sha256:digest:/abs/path (repeatable, env ORCHESTRA_ACP_ADAPTERS)
   --acp-native-fallback value   Harness ID allowed to fall back from acp-v1 to native-cli (repeatable)
+  --require-acp                 Require acp-v1 transport and withhold native-cli harnesses (env ORCHESTRA_REQUIRE_ACP)
   --claude-acp-auth-mode string Claude ACP auth mode: local-subscription or api (env ORCHESTRA_CLAUDE_ACP_AUTH_MODE)
   --data-root string            Managed component data root (env ORCHESTRA_DATA_ROOT)
   --adapter-manifest string     Optional component manifest override path (env ORCHESTRA_ADAPTER_MANIFEST)

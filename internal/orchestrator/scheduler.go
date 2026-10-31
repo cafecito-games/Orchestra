@@ -286,16 +286,25 @@ func (service *Service) findReusableResident(
 		if reason := checkNodeCapabilities(node, report, requirements); reason != "" {
 			continue
 		}
-		if _, _, ok := resolveWorkspaceOnNode(node, requirements); !ok {
+		_, resolvedSourcePath, ok := resolveWorkspaceOnNode(node, requirements)
+		if !ok {
 			continue
 		}
 
+		candidateWorkspace := allocation.Workspace
+		if resolvedSourcePath != "" {
+			candidateWorkspace = resolvedSourcePath
+		}
 		hasBinding := false
-		for _, binding := range state.SessionBindings {
-			if binding.InstanceID == instance.ID && binding.AllocationID == allocation.ID && binding.Status == "idle" {
-				hasBinding = true
-				break
-			}
+		if requirements.Workspace == nil || requirements.Workspace.Isolation == "" {
+			_, hasBinding = findIdleSessionBinding(
+				state,
+				instance.ID,
+				allocation.ID,
+				allocation.HarnessID,
+				allocation.Transport,
+				candidateWorkspace,
+			)
 		}
 
 		candidates = append(candidates, candidate{
@@ -391,22 +400,22 @@ func (service *Service) assignTaskToResident(
 
 	var dispatchBindingPtr *protocol.DispatchSessionBinding
 	var bindingIDPtr *string
-	if allocation.Transport == protocol.TransportACP {
-		for _, binding := range state.SessionBindings {
-			if binding.InstanceID == instance.ID &&
-				binding.AllocationID == allocation.ID &&
-				binding.HarnessID == allocation.HarnessID &&
-				binding.Transport == protocol.TransportACP &&
-				binding.Workspace == workspacePath &&
-				binding.Status == "idle" {
-				bindingIDCopy := binding.ID
-				bindingIDPtr = &bindingIDCopy
-				dispatchBindingPtr = &protocol.DispatchSessionBinding{
-					ID:                binding.ID,
-					ProviderSessionID: binding.ProviderSessionID,
-					ResumePrompt:      protocol.TruncateUTF8Head(prompt, protocol.SessionResumePromptMaximumBytes),
-				}
-				break
+	if leaseIDPtr == nil {
+		if foundBinding, exists := findIdleSessionBinding(
+			state,
+			instance.ID,
+			allocation.ID,
+			allocation.HarnessID,
+			allocation.Transport,
+			workspacePath,
+		); exists {
+			bindingIDCopy := foundBinding.ID
+			bindingIDPtr = &bindingIDCopy
+			dispatchBindingPtr = &protocol.DispatchSessionBinding{
+				ID:                foundBinding.ID,
+				ProviderSessionID: foundBinding.ProviderSessionID,
+				Transport:         foundBinding.Transport,
+				ResumePrompt:      protocol.TruncateUTF8Head(prompt, protocol.SessionResumePromptMaximumBytes),
 			}
 		}
 	}
@@ -467,6 +476,38 @@ func (service *Service) assignTaskToResident(
 		SessionBinding: dispatchBindingPtr,
 		WorkspaceLease: leaseGrantPtr,
 	}
+}
+
+func findIdleSessionBinding(
+	state *store.State,
+	instanceID string,
+	allocationID string,
+	harnessID string,
+	transport string,
+	workspacePath string,
+) (protocol.HarnessSessionBinding, bool) {
+	if !slices.Contains(protocol.HarnessTransports, transport) {
+		return protocol.HarnessSessionBinding{}, false
+	}
+	var best protocol.HarnessSessionBinding
+	found := false
+	for _, binding := range state.SessionBindings {
+		if binding.InstanceID != instanceID ||
+			binding.AllocationID != allocationID ||
+			binding.HarnessID != harnessID ||
+			binding.Transport != transport ||
+			binding.Workspace != workspacePath ||
+			binding.Status != "idle" {
+			continue
+		}
+		if !found ||
+			binding.UpdatedAt > best.UpdatedAt ||
+			(binding.UpdatedAt == best.UpdatedAt && binding.ID < best.ID) {
+			best = binding
+			found = true
+		}
+	}
+	return best, found
 }
 
 func (service *Service) selectOfferingForRequirements(

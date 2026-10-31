@@ -40,15 +40,16 @@ type runSession struct {
 
 	sequence atomic.Int64
 
-	mutex             sync.Mutex
-	providerSessionID string
-	sessionBindingID  string
-	selectedTransport string
-	pendingApprovals  map[string]*pendingApprovalWaiter
-	bufferedDecisions map[string]protocol.ApprovalDecision
-	droppedEvents     int
-	bufferedBytes     int
-	bufferedEvents    int
+	mutex                sync.Mutex
+	providerSessionID    string
+	sessionBindingID     string
+	selectedTransport    string
+	activeBindingEmitted bool
+	pendingApprovals     map[string]*pendingApprovalWaiter
+	bufferedDecisions    map[string]protocol.ApprovalDecision
+	droppedEvents        int
+	bufferedBytes        int
+	bufferedEvents       int
 }
 
 func (client *Client) handleDispatch(message protocol.MasterControlMessage) {
@@ -178,13 +179,22 @@ func (session *runSession) execute(
 		return
 	}
 
+	effectiveTransport := session.run.Transport
+	if effectiveTransport == "" {
+		effectiveTransport = protocol.TransportNativeCLI
+	}
+
 	var resume *harness.SessionResume
 	if dispatchedBinding != nil {
 		if err := dispatchedBinding.Validate(); err != nil {
 			session.emitTerminalFailure(err)
 			return
 		}
-		if err := session.client.runner.AdmitResume(session.run.HarnessID); err != nil {
+		if dispatchedBinding.Transport != "" && dispatchedBinding.Transport != effectiveTransport {
+			session.emitTerminalFailure(errors.New(protocol.SessionResumeUnavailableReason))
+			return
+		}
+		if err := session.client.runner.AdmitResume(session.run.HarnessID, effectiveTransport); err != nil {
 			session.emitTerminalFailure(errors.New(protocol.SessionResumeUnavailableReason))
 			return
 		}
@@ -240,11 +250,12 @@ func (session *runSession) execute(
 				return
 			}
 			session.mutex.Lock()
+			session.activeBindingEmitted = true
 			session.providerSessionID = established.ProviderSessionID
-			bindingID := session.sessionBindingID
-			if !established.Resumed {
-				bindingID = ""
+			if !established.Resumed || dispatchedBinding == nil || established.ProviderSessionID != dispatchedBinding.ProviderSessionID {
+				session.sessionBindingID = ""
 			}
+			bindingID := session.sessionBindingID
 			session.mutex.Unlock()
 
 			bindingUpdate := protocol.SessionBindingUpdate{
@@ -266,8 +277,34 @@ func (session *runSession) execute(
 				return
 			}
 			session.mutex.Lock()
+			alreadyEmitted := session.activeBindingEmitted
+			session.activeBindingEmitted = true
 			session.providerSessionID = providerSessionID
+			if dispatchedBinding == nil || providerSessionID != dispatchedBinding.ProviderSessionID {
+				session.sessionBindingID = ""
+			}
+			bindingID := session.sessionBindingID
+			selectedTransport := session.selectedTransport
+			if selectedTransport == "" {
+				selectedTransport = effectiveTransport
+			}
 			session.mutex.Unlock()
+
+			if !alreadyEmitted && selectedTransport == protocol.TransportNativeCLI {
+				bindingUpdate := protocol.SessionBindingUpdate{
+					BindingID:         bindingID,
+					ProviderSessionID: providerSessionID,
+					HarnessID:         session.run.HarnessID,
+					Transport:         protocol.TransportNativeCLI,
+					Status:            "active",
+				}
+				session.client.sendOrQueue(protocol.SlaveControlMessage{
+					Type:    "session.binding",
+					RunID:   session.run.ID,
+					Binding: &bindingUpdate,
+					At:      session.client.nowUTC(),
+				})
+			}
 		},
 		Output: func(chunk string) {
 			if chunk == "" {
@@ -299,7 +336,7 @@ func (session *runSession) execute(
 	session.mutex.Unlock()
 
 	wasCancelled := session.cancelled.Load() || errors.Is(executeErr, context.Canceled)
-	if providerSessionID != "" && selectedTransport == protocol.TransportACP {
+	if providerSessionID != "" && (selectedTransport == protocol.TransportACP || selectedTransport == protocol.TransportNativeCLI) {
 		nextBindingStatus := "idle"
 		if executeErr != nil && !wasCancelled {
 			nextBindingStatus = "failed"
@@ -308,7 +345,7 @@ func (session *runSession) execute(
 			BindingID:         bindingID,
 			ProviderSessionID: providerSessionID,
 			HarnessID:         session.run.HarnessID,
-			Transport:         protocol.TransportACP,
+			Transport:         selectedTransport,
 			Status:            nextBindingStatus,
 		}
 		session.client.sendOrQueue(protocol.SlaveControlMessage{

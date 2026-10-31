@@ -41,6 +41,18 @@ func TestCLIVersionAndHelp(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
+	exitCode = cli.Run(context.Background(), []string{"slave", "--help"}, nil, &stdout, &stderr, nil)
+	require.Equal(t, 0, exitCode)
+	require.Contains(t, stdout.String(), "--require-acp")
+
+	stdout.Reset()
+	stderr.Reset()
+	exitCode = cli.Run(context.Background(), []string{"slave", "--workspace-root", t.TempDir(), "--require-acp", "--acp-native-fallback", "claude-cli"}, nil, &stdout, &stderr, nil)
+	require.Equal(t, 2, exitCode)
+	require.Contains(t, stderr.String(), "--require-acp cannot be combined with --acp-native-fallback")
+
+	stdout.Reset()
+	stderr.Reset()
 	exitCode = cli.Run(context.Background(), []string{"nonexistent"}, nil, &stdout, &stderr, nil)
 	require.Equal(t, 2, exitCode)
 	require.Contains(t, stderr.String(), "unknown subcommand")

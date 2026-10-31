@@ -323,3 +323,302 @@ echo '{"type":"result","result":"step succeeded"}'
 	cancelWorker()
 	require.NoError(t, <-workerDone)
 }
+
+func TestSchedulerNativeSessionBindingReuseWorkspaceAndTransportIsolation(t *testing.T) {
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	service, err := NewService(ServiceOptions{
+		Store:            openedStore,
+		Token:            "master-secret-token",
+		DoorbellDebounce: 25 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	httpServer := httptest.NewServer(service.Handler())
+	defer httpServer.Close()
+
+	rawWorkspaceA := t.TempDir()
+	rawWorkspaceB := t.TempDir()
+	canonicalRoots, err := slave.CanonicalizeWorkspaceRoots([]string{rawWorkspaceA, rawWorkspaceB})
+	require.NoError(t, err)
+	workspaceA := canonicalRoots[0]
+	workspaceB := canonicalRoots[1]
+
+	invocationsPath := filepath.Join(t.TempDir(), "invocations.log")
+	fakeClaude := filepath.Join(t.TempDir(), "claude")
+	script := `#!/bin/sh
+printf '%s\n===INVOCATION===\n' "$*" >> "` + invocationsPath + `"
+case "$*" in
+  *"ROTATE_NATIVE_SESSION"*)
+    echo '{"type":"assistant","session_id":"sess-native-rotated","message":{"content":[{"type":"text","text":"rotated turn"}]}}'
+    echo '{"type":"result","result":"rotated completed"}'
+    ;;
+  *"WORKSPACE_B_TASK"*)
+    echo '{"type":"assistant","session_id":"sess-workspace-b","message":{"content":[{"type":"text","text":"workspace b turn"}]}}'
+    echo '{"type":"result","result":"workspace b completed"}'
+    ;;
+  *)
+    echo '{"type":"assistant","session_id":"sess-native-1","message":{"content":[{"type":"text","text":"standard turn"}]}}'
+    echo '{"type":"result","result":"standard completed"}'
+    ;;
+esac
+`
+	require.NoError(t, os.WriteFile(fakeClaude, []byte(script), 0o755))
+
+	profiles := []protocol.HarnessProfile{{
+		ID:          protocol.HarnessClaudeCLI,
+		Label:       "Claude Code",
+		Description: "2.1.231",
+		Binary:      fakeClaude,
+		Available:   true,
+		AuthMode:    "local-subscription",
+		Models:      []string{"sonnet"},
+		Transports:  []string{protocol.TransportNativeCLI},
+	}}
+	nowText := time.Now().UTC().Format(time.RFC3339Nano)
+	instanceCapacity := 4
+	activeInstances := 0
+	workerClient := slave.NewClient(slave.ClientOptions{
+		Endpoint: httpServer.URL,
+		Token:    "master-secret-token",
+		Node: protocol.ComputeNode{
+			ID:               "worker-resume",
+			Name:             "worker-resume",
+			Kind:             "local",
+			Platform:         "darwin-arm64",
+			Status:           "online",
+			LastSeen:         nowText,
+			Concurrency:      2,
+			InstanceCapacity: &instanceCapacity,
+			ActiveInstances:  &activeInstances,
+			WorkspaceRoots:   canonicalRoots,
+			Version:          "1.0.0",
+			Harnesses:        profiles,
+		},
+		Runner:           harness.NewRunner(profiles),
+		WorkspaceManager: workspace.NewManager(canonicalRoots, nil),
+	})
+
+	workerContext, cancelWorker := context.WithCancel(context.Background())
+	defer cancelWorker()
+	workerDone := make(chan error, 1)
+	go func() {
+		workerDone <- workerClient.Run(workerContext)
+	}()
+
+	require.Eventually(t, func() bool {
+		return service.isNodeLiveAndSynced("worker-resume")
+	}, 5*time.Second, 25*time.Millisecond)
+
+	caller := CallerIdentity{Kind: "orchestrator-client", ClientID: "agent-main", SessionID: "session-main"}
+	thread, _, err := service.CreateThread(caller, CreateThreadInput{
+		Title:  "Native Session Resume Thread",
+		Attach: true,
+	})
+	require.NoError(t, err)
+
+	waitForTaskCompleted := func(taskID string) protocol.ThreadDetailResponse {
+		t.Helper()
+		var detail protocol.ThreadDetailResponse
+		require.Eventually(t, func() bool {
+			snapshot, snapshotErr := service.GetThreadDetail(thread.ID)
+			if snapshotErr != nil {
+				return false
+			}
+			for _, task := range snapshot.Tasks {
+				if task.ID == taskID && task.Status == "completed" {
+					detail = snapshot
+					return true
+				}
+			}
+			return false
+		}, 6*time.Second, 25*time.Millisecond)
+		return detail
+	}
+
+	batch1, err := service.SubmitTasks(caller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "resume-batch-1",
+		Tasks: []SubmittedTaskSpec{{
+			ClientTaskID: "task-1",
+			Title:        "First native turn",
+			Instructions: "FIRST_NATIVE_TURN",
+			Requirements: protocol.ExecutionRequirements{
+				Workspace: &protocol.WorkspaceRequirements{Path: workspaceA},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	task1ID := batch1.ClientTaskMap["task-1"]
+	detail1 := waitForTaskCompleted(task1ID)
+
+	var firstBinding protocol.HarnessSessionBinding
+	require.Eventually(t, func() bool {
+		snapshot, snapshotErr := service.GetThreadDetail(thread.ID)
+		if snapshotErr != nil {
+			return false
+		}
+		for _, binding := range snapshot.SessionBindings {
+			if binding.ProviderSessionID == "sess-native-1" && binding.Status == "idle" {
+				firstBinding = binding
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second, 20*time.Millisecond)
+	require.Equal(t, protocol.TransportNativeCLI, firstBinding.Transport)
+	require.Equal(t, workspaceA, firstBinding.Workspace)
+	require.Len(t, detail1.Instances, 1)
+	residentInstanceID := detail1.Instances[0].ID
+
+	// Seed a synthetic idle ACP binding on the same resident instance/allocation to verify transport isolation:
+	// the native-cli scheduler must ignore the acp-v1 binding and select firstBinding (native-cli).
+	_, err = openedStore.Mutate(func(state *store.State, _ *store.Mutation) error {
+		state.SessionBindings["sbind-synthetic-acp"] = protocol.HarnessSessionBinding{
+			ID:                "sbind-synthetic-acp",
+			ThreadID:          thread.ID,
+			InstanceID:        firstBinding.InstanceID,
+			AllocationID:      firstBinding.AllocationID,
+			NodeID:            firstBinding.NodeID,
+			HarnessID:         firstBinding.HarnessID,
+			Transport:         protocol.TransportACP,
+			Workspace:         workspaceA,
+			ProviderSessionID: "sess-acp-never-use",
+			Status:            "idle",
+			CreatedByRunID:    firstBinding.CreatedByRunID,
+			LastRunID:         firstBinding.LastRunID,
+			CreatedAt:         "9999-12-31T23:59:59Z",
+			UpdatedAt:         "9999-12-31T23:59:59Z",
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	batch2, err := service.SubmitTasks(caller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "resume-batch-2",
+		Tasks: []SubmittedTaskSpec{{
+			ClientTaskID: "task-2",
+			Title:        "Second native turn",
+			Instructions: "SECOND_NATIVE_TURN",
+			InstanceID:   residentInstanceID,
+			Requirements: protocol.ExecutionRequirements{
+				Workspace: &protocol.WorkspaceRequirements{Path: workspaceA},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	task2ID := batch2.ClientTaskMap["task-2"]
+	detail2 := waitForTaskCompleted(task2ID)
+
+	var task2Run protocol.Run
+	for _, runRecord := range detail2.Runs {
+		if runRecord.TaskID != nil && *runRecord.TaskID == task2ID {
+			task2Run = runRecord
+			break
+		}
+	}
+	require.NotNil(t, task2Run.SessionBindingID, "second task on same resident instance and workspace must reuse idle native-cli session binding")
+	require.Equal(t, firstBinding.ID, *task2Run.SessionBindingID)
+
+	readInvocations := func() []string {
+		t.Helper()
+		rawBytes, readErr := os.ReadFile(invocationsPath)
+		require.NoError(t, readErr)
+		trimmed := strings.TrimSuffix(string(rawBytes), "\n===INVOCATION===\n")
+		if trimmed == "" {
+			return nil
+		}
+		return strings.Split(trimmed, "\n===INVOCATION===\n")
+	}
+
+	invocationLines := readInvocations()
+	require.Len(t, invocationLines, 2)
+	require.NotContains(t, invocationLines[0], "--resume")
+	require.Contains(t, invocationLines[1], "--resume sess-native-1")
+	require.NotContains(t, invocationLines[1], "sess-acp-never-use")
+
+	// Provider session rotation marks the previous binding replaced and records a new idle binding.
+	batch3, err := service.SubmitTasks(caller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "resume-batch-3",
+		Tasks: []SubmittedTaskSpec{{
+			ClientTaskID: "task-3",
+			Title:        "Rotated native turn",
+			Instructions: "ROTATE_NATIVE_SESSION",
+			InstanceID:   residentInstanceID,
+			Requirements: protocol.ExecutionRequirements{
+				Workspace: &protocol.WorkspaceRequirements{Path: workspaceA},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	task3ID := batch3.ClientTaskMap["task-3"]
+	_ = waitForTaskCompleted(task3ID)
+
+	require.Eventually(t, func() bool {
+		snapshot, snapshotErr := service.GetThreadDetail(thread.ID)
+		if snapshotErr != nil {
+			return false
+		}
+		replacedFound := false
+		rotatedIdleFound := false
+		for _, binding := range snapshot.SessionBindings {
+			if binding.ID == firstBinding.ID && binding.Status == "replaced" && binding.ReplacedByBindingID != "" {
+				replacedFound = true
+			}
+			if binding.ProviderSessionID == "sess-native-rotated" && binding.Status == "idle" {
+				rotatedIdleFound = true
+			}
+		}
+		return replacedFound && rotatedIdleFound
+	}, 3*time.Second, 20*time.Millisecond)
+
+	// Workspace isolation: a task targeting workspaceB must not resume workspaceA's session binding.
+	batch4, err := service.SubmitTasks(caller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "resume-batch-4",
+		Tasks: []SubmittedTaskSpec{{
+			ClientTaskID: "task-4",
+			Title:        "Workspace B turn",
+			Instructions: "WORKSPACE_B_TASK",
+			Requirements: protocol.ExecutionRequirements{
+				Workspace: &protocol.WorkspaceRequirements{Path: workspaceB},
+			},
+		}},
+	})
+	require.NoError(t, err)
+	task4ID := batch4.ClientTaskMap["task-4"]
+	_ = waitForTaskCompleted(task4ID)
+
+	invocationLines = readInvocations()
+	require.Len(t, invocationLines, 4)
+	require.NotContains(t, invocationLines[3], "--resume")
+
+	// Verify reverse transport isolation as well: querying acp-v1 on workspaceB (where only a native-cli binding exists) returns false.
+	err = openedStore.Read(func(state *store.State) error {
+		for _, binding := range state.SessionBindings {
+			if binding.Workspace == workspaceB && binding.Transport == protocol.TransportNativeCLI && binding.Status == "idle" {
+				_, foundCross := findIdleSessionBinding(
+					state,
+					binding.InstanceID,
+					binding.AllocationID,
+					binding.HarnessID,
+					protocol.TransportACP,
+					workspaceB,
+				)
+				require.False(t, foundCross)
+				return nil
+			}
+		}
+		t.Fatal("expected idle native-cli binding for workspaceB")
+		return nil
+	})
+	require.NoError(t, err)
+
+	cancelWorker()
+	require.NoError(t, <-workerDone)
+}

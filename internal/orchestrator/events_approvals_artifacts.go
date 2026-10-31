@@ -674,7 +674,9 @@ func (service *Service) handleSessionBinding(nodeID string, message protocol.Sla
 
 		var existingID string
 		if update.BindingID != "" {
-			if candidate, found := state.SessionBindings[update.BindingID]; found && candidate.NodeID == nodeID {
+			if candidate, found := state.SessionBindings[update.BindingID]; found &&
+				candidate.NodeID == nodeID &&
+				candidate.Transport == update.Transport {
 				existingID = candidate.ID
 			}
 		}
@@ -682,7 +684,10 @@ func (service *Service) handleSessionBinding(nodeID string, message protocol.Sla
 			for bindingID, candidate := range state.SessionBindings {
 				if candidate.NodeID == nodeID &&
 					candidate.InstanceID == runRecord.InstanceID &&
-					candidate.ProviderSessionID == update.ProviderSessionID {
+					candidate.AllocationID == runRecord.AllocationID &&
+					candidate.Transport == update.Transport &&
+					candidate.ProviderSessionID == update.ProviderSessionID &&
+					!protocol.IsTerminalSessionBindingStatus(candidate.Status) {
 					existingID = bindingID
 					break
 				}
@@ -697,6 +702,11 @@ func (service *Service) handleSessionBinding(nodeID string, message protocol.Sla
 				binding.UpdatedAt = nowText
 				state.SessionBindings[existingID] = binding
 			}
+			if runRecord.ProviderSessionID == nil && update.ProviderSessionID != "" {
+				sessionIDCopy := update.ProviderSessionID
+				runRecord.ProviderSessionID = &sessionIDCopy
+				state.Runs[runRecord.ID] = runRecord
+			}
 			return nil
 		}
 
@@ -704,6 +714,7 @@ func (service *Service) handleSessionBinding(nodeID string, message protocol.Sla
 		for otherID, other := range state.SessionBindings {
 			if other.InstanceID == runRecord.InstanceID &&
 				other.AllocationID == runRecord.AllocationID &&
+				other.Transport == update.Transport &&
 				!protocol.IsTerminalSessionBindingStatus(other.Status) {
 				other.Status = "replaced"
 				other.ReplacedByBindingID = newBindingID
