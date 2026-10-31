@@ -32,6 +32,14 @@ func NewIdentifier(prefix string) string {
 	return prefix + "-" + hex.EncodeToString(randomBytes[:])
 }
 
+func NewRoomMessageIdentifier() string {
+	var randomBytes [8]byte
+	if _, err := rand.Read(randomBytes[:]); err != nil {
+		return "rmsg_" + time.Now().UTC().Format("20060102150405000000000")
+	}
+	return "rmsg_" + hex.EncodeToString(randomBytes[:])
+}
+
 func NowTimestamp() string {
 	return time.Now().UTC().Format(time.RFC3339Nano)
 }

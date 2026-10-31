@@ -2,8 +2,10 @@ package mcpserver
 
 import "github.com/cafecito-games/Orchestra/internal/protocol"
 
-const instructions = "Use get_task_context for the durable thread, your task, its lineage, and your mailbox cursor. " +
-	"Workers report with update_task, ask or answer through send_task_message, and wait for replies or task changes with wait_for_task_events, passing back the cursor it returns. " +
+const instructions = "Use get_task_context for the durable thread, your task, its lineage, your mailbox cursor, and your room summary. " +
+	"Share thread-scoped findings, contracts, decisions, gotchas, questions, and answers on the blackboard with post_room_message and inspect sibling entries with read_room. " +
+	"When get_task_context or wait_for_task_events indicates an unread room nudge (or update_task returns unread_room_nudge), call read_room, reconcile your work if needed, and then finalize. " +
+	"Workers report with update_task, ask or answer through send_task_message, and wait for replies, nudges, or task changes with wait_for_task_events, passing back the cursor it returns. " +
 	"Delegating instances inspect get_execution_inventory and submit parallel work with submit_tasks, describing capabilities rather than machines, " +
 	"and may spawn_instance, inspect it with get_instance, renew_instance while it is needed, and release_instance when it is done. " +
 	"Refine or complete the thread with update_thread and post durable files with post_artifact. " +
@@ -133,14 +135,37 @@ type toolDefinition struct {
 var definitions = map[string]toolDefinition{
 	"get_task_context": {
 		title:       "Get task context",
-		description: "Get the durable thread, your task or a visible related task, its dependencies, attempts, child tasks, artifacts, your mailbox summary and cursor, and limits.",
+		description: "Get the durable thread, your task or a visible related task, its dependencies, attempts, child tasks, artifacts, room summary, your mailbox summary and cursor, and limits.",
 		input:       object(schema{"taskId": text()}),
 		output: resultSchema(schema{
-			"thread": anyObject(), "caller": anyObject(), "task": anyObject(), "durableTask": anyObject(),
+			"thread": anyObject(), "caller": anyObject(), "task": anyObject(), "room": anyObject(), "durableTask": anyObject(),
 			"childTasks": objects(), "taskGraph": objects(), "taskGraphTruncated": boolean(),
 			"mailbox": anyObject(), "artifacts": objects(), "limits": anyObject(), "version": text(),
-		}, "thread", "task", "artifacts", "limits", "version"),
+		}, "thread", "task", "room", "artifacts"),
 		readOnly: true,
+	},
+	"read_room": {
+		title:       "Read thread room",
+		description: "Read ordered blackboard entries for the current thread and advance your task's lastReadRoomSequence cursor.",
+		input: object(schema{
+			"afterSequence": schema{"type": "integer", "minimum": 0},
+			"kinds":         list(enum(protocol.RoomMessageKinds...)),
+			"limit":         schema{"type": "integer", "minimum": 1, "maximum": protocol.MaximumRoomReadLimit},
+		}),
+		output: resultSchema(schema{
+			"threadId": text(), "room": anyObject(), "messages": objects(),
+			"headSequence": integer(), "lastReadSequence": integer(), "requiredSequence": integer(),
+			"unreadNudge": boolean(), "throughSequence": integer(), "hasMore": boolean(),
+		}, "threadId", "room", "messages", "headSequence", "lastReadSequence", "unreadNudge", "hasMore"),
+		readOnly: true,
+	},
+	"post_room_message": {
+		title:       "Post room message",
+		description: "Append a structured blackboard entry (finding, contract, decision, gotcha, guidance, question, or answer) to the current thread's room.",
+		input:       postRoomMessageInputSchema(false),
+		output: resultSchema(schema{
+			"threadId": text(), "room": anyObject(), "message": anyObject(), "nudgedTaskIds": list(text()), "replayed": boolean(),
+		}, "threadId", "room", "message", "nudgedTaskIds", "replayed"),
 	},
 	"post_artifact": {
 		title:       "Post artifact",
@@ -290,6 +315,30 @@ var definitions = map[string]toolDefinition{
 		}, "idempotencyKey"),
 		output: resultSchema(schema{"created": boolean(), "updateId": text(), "task": anyObject()}, "created", "updateId", "task"),
 	},
+}
+
+func postRoomMessageInputSchema(canDelegate bool) schema {
+	properties := schema{
+		"idempotencyKey":     text(),
+		"kind":               enum(protocol.RoomMessageKinds...),
+		"topic":              text(),
+		"body":               text(),
+		"replyToSequence":    schema{"type": "integer", "minimum": 1},
+		"supersedesSequence": schema{"type": "integer", "minimum": 1},
+		"artifactIds":        list(text()),
+	}
+	if canDelegate {
+		properties["nudgeTaskIds"] = list(text())
+	}
+	return object(properties, "idempotencyKey", "kind", "body")
+}
+
+func definitionForGrant(name string, canDelegate bool) toolDefinition {
+	definition := definitions[name]
+	if name == "post_room_message" && canDelegate {
+		definition.input = postRoomMessageInputSchema(true)
+	}
+	return definition
 }
 
 func ToolNames(canDelegate bool) []string {

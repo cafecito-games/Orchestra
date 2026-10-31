@@ -360,6 +360,12 @@ func (service *Service) WaitForTaskEvents(
 					childTaskIDs[candidate.ID] = true
 				}
 			}
+			taskHasUnreadNudge := false
+			if caller.TaskID != "" {
+				if callerTask, exists := state.Tasks[caller.TaskID]; exists {
+					taskHasUnreadNudge = callerTask.RequiredRoomSequence > callerTask.LastReadRoomSequence
+				}
+			}
 
 			allEvents := state.ThreadEvents[caller.ThreadID]
 			filtered := make([]protocol.TaskEventEntry, 0)
@@ -370,7 +376,7 @@ func (service *Service) WaitForTaskEvents(
 				if entry.Sequence <= cursorSequence {
 					continue
 				}
-				if !isEventVisibleToWorker(entry, caller.TaskID, caller.RunID, childTaskIDs) {
+				if !isEventVisibleToWorker(entry, caller.TaskID, caller.RunID, childTaskIDs, taskHasUnreadNudge) {
 					lastScanned = entry.Sequence
 					continue
 				}
@@ -468,7 +474,14 @@ func isEventVisibleToWorker(
 	taskID string,
 	runID string,
 	childTaskIDs map[string]bool,
+	taskHasUnreadNudge bool,
 ) bool {
+	if entry.Type == "room.message_posted" {
+		return false
+	}
+	if entry.Type == "room.nudged" {
+		return taskHasUnreadNudge && taskID != "" && entry.TaskID == taskID
+	}
 	if entry.Type == "thread.updated" || entry.Type == "artifact.posted" {
 		return true
 	}

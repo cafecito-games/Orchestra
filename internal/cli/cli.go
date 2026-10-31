@@ -71,6 +71,8 @@ func Run(
 		return runThreads(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "thread":
 		return runThreadDetail(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
+	case "room":
+		return runRoom(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "approvals":
 		return runApprovals(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "approve":
@@ -104,6 +106,7 @@ Operator Commands:
   nodes       List registered worker machines, harnesses, capabilities, and capacity
   threads     List coordination threads on the orchestrator
   thread      Inspect a thread's task DAG, resident instances, runs, messages, and transcripts
+  room        Read, post, nudge, or locate a thread's shared blackboard room
   approvals   List worker permission requests
   approve     Approve a pending worker permission request
   reject      Reject a pending worker permission request

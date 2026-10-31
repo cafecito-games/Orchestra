@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -51,13 +52,47 @@ type DelegateTaskInput struct {
 	InstanceID        string                         `json:"instanceId,omitempty"`
 }
 
+type TaskCompletionInput struct {
+	Summary     string   `json:"summary"`
+	ArtifactIDs []string `json:"artifactIds,omitempty"`
+}
+
+type NullableString struct {
+	Set   bool
+	Value *string
+}
+
+func (nullable *NullableString) UnmarshalJSON(raw []byte) error {
+	nullable.Set = true
+	if string(raw) == "null" {
+		nullable.Value = nil
+		return nil
+	}
+	var decoded string
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return err
+	}
+	nullable.Value = &decoded
+	return nil
+}
+
+func (nullable NullableString) MarshalJSON() ([]byte, error) {
+	if !nullable.Set || nullable.Value == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(*nullable.Value)
+}
+
 type UpdateTaskInput struct {
-	TaskID         string   `json:"taskId,omitempty"`
-	IdempotencyKey string   `json:"idempotencyKey,omitempty"`
-	Status         string   `json:"status,omitempty"`
-	Summary        *string  `json:"summary,omitempty"`
-	BlockerReason  *string  `json:"blockerReason,omitempty"`
-	ArtifactIDs    []string `json:"artifactIds,omitempty"`
+	TaskID         string               `json:"taskId,omitempty"`
+	IdempotencyKey string               `json:"idempotencyKey,omitempty"`
+	Status         string               `json:"status,omitempty"`
+	Summary        *string              `json:"summary,omitempty"`
+	Progress       *string              `json:"progress,omitempty"`
+	BlockerReason  *string              `json:"blockerReason,omitempty"`
+	BlockedReason  NullableString       `json:"blockedReason,omitempty"`
+	ArtifactIDs    []string             `json:"artifactIds,omitempty"`
+	Completion     *TaskCompletionInput `json:"completion,omitempty"`
 }
 
 type DependencyTaskSummary struct {
@@ -70,13 +105,14 @@ type DependencyTaskSummary struct {
 }
 
 type TaskContextResponse struct {
-	Thread       protocol.Thread         `json:"thread"`
-	Task         protocol.Task           `json:"task"`
-	Run          *protocol.Run           `json:"run,omitempty"`
-	Dependencies []DependencyTaskSummary `json:"dependencies"`
-	Children     []protocol.Task         `json:"children"`
-	Messages     []protocol.TaskMessage  `json:"messages"`
-	Artifacts    []protocol.Artifact     `json:"artifacts"`
+	Thread       protocol.Thread          `json:"thread"`
+	Task         protocol.Task            `json:"task"`
+	Room         protocol.TaskRoomSummary `json:"room"`
+	Run          *protocol.Run            `json:"run,omitempty"`
+	Dependencies []DependencyTaskSummary  `json:"dependencies"`
+	Children     []protocol.Task          `json:"children"`
+	Messages     []protocol.TaskMessage   `json:"messages"`
+	Artifacts    []protocol.Artifact      `json:"artifacts"`
 }
 
 func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInput) (SubmitTasksResult, error) {
@@ -383,8 +419,13 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 	sourceKey := caller.SourceKey()
 	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
 	digest := canonicalDigest(input)
+	isCompletionAttempt := input.Completion != nil || input.Status == "completed"
 
 	var updatedTask protocol.Task
+	rejectedByUnreadNudge := false
+	var unreadRequiredSequence int64
+	var unreadLastReadSequence int64
+
 	_, err := service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
 		task, exists := state.Tasks[taskID]
 		if !exists {
@@ -399,8 +440,8 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 			}
 		}
 
+		receiptKey := sourceKey + "\x00" + taskID + "\x00" + idempotencyKey
 		if idempotencyKey != "" {
-			receiptKey := sourceKey + "\x00" + taskID + "\x00" + idempotencyKey
 			if existingReceipt, found := state.TaskUpdates[receiptKey]; found {
 				if existingReceipt.Digest != digest {
 					return conflictError("idempotency_conflict", "idempotencyKey was already used for a different task update")
@@ -408,36 +449,101 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 				updatedTask = task
 				return nil
 			}
-			state.TaskUpdates[receiptKey] = protocol.TaskUpdateReceipt{
-				ID:             protocol.NewIdentifier("upd"),
-				TaskID:         taskID,
-				SourceKey:      sourceKey,
-				IdempotencyKey: idempotencyKey,
-				Digest:         digest,
-				CreatedAt:      service.nowUTC(),
-			}
 		}
 
-		nowText := service.nowUTC()
+		var completionSummary string
+		if input.Completion != nil {
+			completionSummary = strings.TrimSpace(input.Completion.Summary)
+			if completionSummary == "" || !protocol.IsBoundedString(completionSummary, 8192) {
+				return invalidRequest("completion.summary must be a non-empty string up to 8192 bytes")
+			}
+			for _, artifactID := range input.Completion.ArtifactIDs {
+				artifact, artifactExists := state.Artifacts[artifactID]
+				if !artifactExists || artifact.ThreadID != task.ThreadID {
+					return invalidRequest(fmt.Sprintf("unknown artifact %q in thread %s", artifactID, task.ThreadID))
+				}
+			}
+		}
 		if input.Summary != nil {
 			trimmed := strings.TrimSpace(*input.Summary)
 			if !protocol.IsBoundedString(trimmed, 8192) {
 				return invalidRequest("task summary exceeds 8192 bytes")
 			}
-			task.Summary = trimmed
+		}
+		if input.Progress != nil {
+			trimmed := strings.TrimSpace(*input.Progress)
+			if !protocol.IsBoundedString(trimmed, 8192) {
+				return invalidRequest("task progress exceeds 8192 bytes")
+			}
 		}
 		if input.BlockerReason != nil {
 			trimmed := strings.TrimSpace(*input.BlockerReason)
 			if !protocol.IsBoundedString(trimmed, 4096) {
 				return invalidRequest("task blockerReason exceeds 4096 bytes")
 			}
-			task.BlockerReason = trimmed
+		}
+		if input.BlockedReason.Set && input.BlockedReason.Value != nil {
+			trimmed := strings.TrimSpace(*input.BlockedReason.Value)
+			if !protocol.IsBoundedString(trimmed, 4096) {
+				return invalidRequest("task blockedReason exceeds 4096 bytes")
+			}
 		}
 		for _, artifactID := range input.ArtifactIDs {
 			artifact, artifactExists := state.Artifacts[artifactID]
 			if !artifactExists || artifact.ThreadID != task.ThreadID {
 				return invalidRequest(fmt.Sprintf("unknown artifact %q in thread %s", artifactID, task.ThreadID))
 			}
+		}
+
+		nowText := service.nowUTC()
+		if caller.Kind == "run" && isCompletionAttempt && task.ID == caller.TaskID &&
+			task.RequiredRoomSequence > task.LastReadRoomSequence &&
+			task.NudgedAtRoomSequence < task.RequiredRoomSequence {
+			task.NudgedAtRoomSequence = task.RequiredRoomSequence
+			task.UpdatedAt = nowText
+			state.Tasks[task.ID] = task
+			rejectedByUnreadNudge = true
+			unreadRequiredSequence = task.RequiredRoomSequence
+			unreadLastReadSequence = task.LastReadRoomSequence
+			return nil
+		}
+
+		if idempotencyKey != "" {
+			state.TaskUpdates[receiptKey] = protocol.TaskUpdateReceipt{
+				ID:             protocol.NewIdentifier("upd"),
+				TaskID:         taskID,
+				SourceKey:      sourceKey,
+				IdempotencyKey: idempotencyKey,
+				Digest:         digest,
+				CreatedAt:      nowText,
+			}
+		}
+
+		if input.Progress != nil {
+			task.Progress = service.redactor.Redact(strings.TrimSpace(*input.Progress))
+		}
+		if input.Summary != nil {
+			task.Summary = service.redactor.Redact(strings.TrimSpace(*input.Summary))
+		}
+		if input.Completion != nil {
+			task.Summary = service.redactor.Redact(completionSummary)
+			for _, artifactID := range input.Completion.ArtifactIDs {
+				if !slices.Contains(task.ArtifactIDs, artifactID) {
+					task.ArtifactIDs = append(task.ArtifactIDs, artifactID)
+				}
+			}
+		}
+		if input.BlockerReason != nil {
+			task.BlockerReason = service.redactor.Redact(strings.TrimSpace(*input.BlockerReason))
+		}
+		if input.BlockedReason.Set {
+			if input.BlockedReason.Value == nil {
+				task.BlockerReason = ""
+			} else {
+				task.BlockerReason = service.redactor.Redact(strings.TrimSpace(*input.BlockedReason.Value))
+			}
+		}
+		for _, artifactID := range input.ArtifactIDs {
 			if !slices.Contains(task.ArtifactIDs, artifactID) {
 				task.ArtifactIDs = append(task.ArtifactIDs, artifactID)
 			}
@@ -471,7 +577,20 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 		})
 		return nil
 	})
-	return updatedTask, err
+	if err != nil {
+		return protocol.Task{}, err
+	}
+	if rejectedByUnreadNudge {
+		return protocol.Task{}, conflictError(
+			"unread_room_nudge",
+			fmt.Sprintf(
+				"thread room has unread nudge through sequence %d (lastReadSequence=%d); call read_room before completing this task",
+				unreadRequiredSequence,
+				unreadLastReadSequence,
+			),
+		)
+	}
+	return updatedTask, nil
 }
 
 func (service *Service) GetTaskContext(caller CallerIdentity) (TaskContextResponse, error) {
@@ -496,6 +615,7 @@ func (service *Service) GetTaskContext(caller CallerIdentity) (TaskContextRespon
 		if runRecord.TaskID != nil {
 			if task, taskExists := state.Tasks[*runRecord.TaskID]; taskExists {
 				response.Task = task
+				response.Room = buildTaskRoomSummary(state, runRecord.ThreadID, task)
 				for _, dependency := range task.Dependencies {
 					if depTask, depExists := state.Tasks[dependency.TaskID]; depExists {
 						response.Dependencies = append(response.Dependencies, DependencyTaskSummary{
@@ -514,6 +634,8 @@ func (service *Service) GetTaskContext(caller CallerIdentity) (TaskContextRespon
 					}
 				}
 			}
+		} else {
+			response.Room = buildTaskRoomSummary(state, runRecord.ThreadID, protocol.Task{})
 		}
 
 		for _, message := range collectThreadMessages(state, runRecord.ThreadID) {

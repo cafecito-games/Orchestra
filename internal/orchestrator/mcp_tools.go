@@ -76,6 +76,41 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 			}, []string{"threadId"}),
 		},
 		{
+			Name:        "read_room",
+			Description: "Read ordered entries from a thread's shared blackboard room, optionally filtered after a sequence or by message kinds.",
+			InputSchema: objectSchema(map[string]any{
+				"threadId":      map[string]any{"type": "string"},
+				"afterSequence": map[string]any{"type": "integer", "minimum": 0},
+				"kinds":         map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": protocol.RoomMessageKinds}},
+				"limit":         map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumRoomReadLimit},
+			}, []string{"threadId"}),
+		},
+		{
+			Name:        "post_room_message",
+			Description: "Post an append-only blackboard entry to a thread's room, optionally nudging active tasks in that thread to read before finalizing.",
+			InputSchema: objectSchema(map[string]any{
+				"threadId":           map[string]any{"type": "string"},
+				"idempotencyKey":     map[string]any{"type": "string"},
+				"kind":               map[string]any{"type": "string", "enum": protocol.RoomMessageKinds},
+				"topic":              map[string]any{"type": "string"},
+				"body":               map[string]any{"type": "string"},
+				"replyToSequence":    map[string]any{"type": "integer", "minimum": 1},
+				"supersedesSequence": map[string]any{"type": "integer", "minimum": 1},
+				"artifactIds":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"nudge":              map[string]any{"type": "boolean"},
+				"nudgeTaskIds":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			}, []string{"threadId", "idempotencyKey", "kind", "body"}),
+		},
+		{
+			Name:        "nudge_room",
+			Description: "Require active tasks in a thread (or specified taskIds) to read through the room's current head sequence before completing.",
+			InputSchema: objectSchema(map[string]any{
+				"threadId":       map[string]any{"type": "string"},
+				"idempotencyKey": map[string]any{"type": "string"},
+				"taskIds":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			}, []string{"threadId", "idempotencyKey"}),
+		},
+		{
 			Name:        "submit_tasks",
 			Description: "Atomically and idempotently submit a task or DAG of tasks into a thread for capability-matched scheduling across slave nodes.",
 			InputSchema: objectSchema(map[string]any{
@@ -376,6 +411,24 @@ func (service *Service) ExecuteOrchestratorTool(
 			return nil, decodeErr
 		}
 		responseValue, err = service.GetThreadEvents(caller, input)
+	case "read_room":
+		input, decodeErr := decodeToolArguments[ReadRoomInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.ReadRoom(caller, input)
+	case "post_room_message":
+		input, decodeErr := decodeToolArguments[PostRoomMessageInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.PostRoomMessage(caller, input)
+	case "nudge_room":
+		input, decodeErr := decodeToolArguments[NudgeRoomInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.NudgeRoom(caller, input)
 	case "submit_tasks":
 		input, decodeErr := decodeToolArguments[SubmitTasksInput](rawArguments)
 		if decodeErr != nil {

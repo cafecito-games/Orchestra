@@ -236,7 +236,7 @@ func (server *Server) newProtocolServer(activeGrant grant) *mcp.Server {
 		}
 	})
 	for _, name := range ToolNames(activeGrant.canDelegate) {
-		definition := definitions[name]
+		definition := definitionForGrant(name, activeGrant.canDelegate)
 		destructive := false
 		protocolServer.AddTool(&mcp.Tool{
 			Name:         name,
@@ -263,6 +263,14 @@ func (server *Server) callTool(operationContext context.Context, activeGrant gra
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(arguments, &object); err != nil || object == nil {
 		return toolErrorResult(&ToolError{Code: "invalid_arguments", Message: "Tool arguments must be a JSON object"})
+	}
+	if name == "post_room_message" && !activeGrant.canDelegate {
+		if _, hasNudge := object["nudge"]; hasNudge {
+			return toolErrorResult(&ToolError{Code: "forbidden", Message: "Non-delegating worker runs cannot nudge tasks"})
+		}
+		if _, hasNudgeTaskIDs := object["nudgeTaskIds"]; hasNudgeTaskIDs {
+			return toolErrorResult(&ToolError{Code: "forbidden", Message: "Non-delegating worker runs cannot nudge tasks"})
+		}
 	}
 	var (
 		result json.RawMessage

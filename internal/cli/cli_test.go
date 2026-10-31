@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -232,6 +233,29 @@ func TestCLIOperatorCommandsAndSetupDoctor(t *testing.T) {
 	code, stdout, stderr = runCLI("cancel", submitted.Tasks[0].ID)
 	require.Equal(t, 0, code, stderr)
 	require.Contains(t, stdout, "Cancelled task "+submitted.Tasks[0].ID)
+
+	code, stdout, stderr = runCLI(
+		"room", "post", createdThread.ID, "Switch integration target to staging",
+		"--kind", "guidance",
+		"--topic", "staging-target",
+		"--nudge",
+		"--idempotency-key", "cli-room-post-1",
+	)
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stdout, "Posted room message #1")
+
+	code, stdout, stderr = runCLI("room", "read", createdThread.ID, "--kind", "guidance")
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stdout, "staging-target")
+	require.Contains(t, stdout, "Switch integration target to staging")
+
+	code, stdout, stderr = runCLI("room", "nudge", createdThread.ID, "--task", submitted.Tasks[1].ID, "--idempotency-key", "cli-room-nudge-1")
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stdout, "Nudged 1 task(s)")
+
+	code, stdout, stderr = runCLI("room", "path", createdThread.ID)
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, strings.TrimSpace(stdout), "messages.jsonl")
 
 	code, stdout, stderr = runCLI("setup", "plan")
 	require.Equal(t, 0, code, stderr)
