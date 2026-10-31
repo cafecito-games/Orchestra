@@ -62,6 +62,8 @@ func TestSlaveSelfUpdateDrainsActiveRunPreservesResidentHandoffAndExecs(t *testi
 	installedBinaryPath := filepath.Join(t.TempDir(), "orchestra")
 	initialScript := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\n  echo '{\"version\":\"0.1.0\",\"protocolVersion\":%q}'\n  exit 0\nfi\nexit 0\n", protocol.ProtocolVersion)
 	require.NoError(t, os.WriteFile(installedBinaryPath, []byte(initialScript), 0o755))
+	installedBinaryPath, err = filepath.EvalSymlinks(installedBinaryPath)
+	require.NoError(t, err)
 
 	updatedBinaryBytes := fmt.Appendf(nil, "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\n  echo '{\"version\":\"0.2.0\",\"protocolVersion\":%q}'\n  exit 0\nfi\nexit 0\n", protocol.ProtocolVersion)
 	updatedSum := sha256.Sum256(updatedBinaryBytes)

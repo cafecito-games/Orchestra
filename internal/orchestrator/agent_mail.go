@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
@@ -265,6 +266,14 @@ func (service *Service) SetMailIdentity(
 		target.LastSeenAt = nowText
 		state.Mailboxes[target.ID] = target
 		updated = target
+		mutation.OnCommit(func() {
+			service.logger.Info(
+				"mail",
+				"renamed",
+				activitylog.String("from", previousAddress),
+				activitylog.String("to", newAddress),
+			)
+		})
 		return nil
 	})
 	return updated, err
@@ -497,6 +506,14 @@ func (service *Service) SendMail(
 			if shouldTriggerSchedule {
 				service.TriggerSchedule()
 			}
+			service.logger.Info(
+				"mail",
+				"sent",
+				activitylog.String("id", committedMessage.ID),
+				activitylog.String("from", committedMessage.FromAddress),
+				activitylog.String("to", committedMessage.ToAddress),
+				activitylog.String("subject", committedMessage.Subject),
+			)
 		})
 		return nil
 	})

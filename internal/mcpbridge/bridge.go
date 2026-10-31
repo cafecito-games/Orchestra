@@ -26,6 +26,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/cafecito-games/Orchestra/internal/localstate"
 	"github.com/cafecito-games/Orchestra/internal/orchestrator"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/slave"
@@ -37,34 +38,61 @@ const (
 )
 
 type Configuration struct {
-	Endpoint   string
-	Token      string
-	ClientID   string
-	MailName   string
-	MailHost   string
-	Workspace  string
-	ProcessID  int
-	HTTPClient *http.Client
+	Endpoint           string
+	Token              string
+	ClientID           string
+	MailName           string
+	MailHost           string
+	Workspace          string
+	ProcessID          int
+	HTTPClient         *http.Client
+	ConnectionFilePath string
+	EndpointExplicit   bool
+	TokenExplicit      bool
+	TLSExplicit        bool
 }
 
 func ParseConfiguration(arguments []string, lookupEnvironment func(string) (string, bool)) (Configuration, error) {
+	defaultConnectionFile := localstate.ResolveConnectionFilePath(lookupEnvironment)
 	if lookupEnvironment == nil {
 		lookupEnvironment = os.LookupEnv
 	}
-	defaultEndpoint := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_ENDPOINT", "CONTROL_ENDPOINT")
+
+	environmentEndpoint := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_ENDPOINT", "CONTROL_ENDPOINT")
+	environmentToken := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TOKEN")
+	environmentTLSCACert := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_CA")
+	environmentTLSInsecureRaw := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_INSECURE")
+
+	discoveredState, hasDiscoveredState, _ := localstate.ReadConnectionState(defaultConnectionFile)
+
+	defaultEndpoint := environmentEndpoint
+	if defaultEndpoint == "" && hasDiscoveredState && discoveredState.Endpoint != "" {
+		defaultEndpoint = discoveredState.Endpoint
+	}
 	if defaultEndpoint == "" {
 		defaultEndpoint = slave.DefaultEndpoint
 	}
-	defaultToken := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TOKEN")
+
+	defaultToken := environmentToken
+	if defaultToken == "" && hasDiscoveredState && discoveredState.Token != "" {
+		defaultToken = discoveredState.Token
+	}
+
 	defaultClientID := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_CLIENT_ID")
 	if defaultClientID == "" {
 		defaultClientID = protocol.NewIdentifier("mcp-client")
 	}
 	defaultMailName := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_MAIL_NAME", "ORCHESTRA_AGENT_NAME")
 	defaultMailHost := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_MAIL_HOST")
-	defaultTLSCACert := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_CA")
-	defaultTLSInsecure := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_INSECURE") == "1" ||
-		strings.EqualFold(firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_INSECURE"), "true")
+
+	defaultTLSCACert := environmentTLSCACert
+	if defaultTLSCACert == "" && hasDiscoveredState && discoveredState.TLSCACert != "" {
+		defaultTLSCACert = discoveredState.TLSCACert
+	}
+	defaultTLSInsecure := environmentTLSInsecureRaw == "1" || strings.EqualFold(environmentTLSInsecureRaw, "true")
+	if environmentTLSInsecureRaw == "" && hasDiscoveredState {
+		defaultTLSInsecure = discoveredState.TLSInsecure
+	}
 
 	flagSet := flag.NewFlagSet("orchestra mcp", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
@@ -75,6 +103,7 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	flagSet.StringVar(&configuration.Endpoint, "endpoint", defaultEndpoint, "Orchestra master HTTP or WebSocket endpoint")
 	flagSet.StringVar(&configuration.Endpoint, "control-endpoint", defaultEndpoint, "Orchestra master HTTP or WebSocket endpoint")
 	flagSet.StringVar(&configuration.Token, "token", defaultToken, "Bearer token matching ORCHESTRA_TOKEN")
+	flagSet.StringVar(&configuration.ConnectionFilePath, "connection-file", defaultConnectionFile, "Local connection state file path")
 	flagSet.StringVar(&configuration.ClientID, "client-id", defaultClientID, "Stable orchestrator client identifier")
 	flagSet.StringVar(&configuration.MailName, "name", defaultMailName, "Optional agent mail handle (for example \"auth-api\")")
 	flagSet.StringVar(&configuration.MailHost, "host", defaultMailHost, "Optional agent mail host override (defaults to local hostname)")
@@ -87,6 +116,21 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	if flagSet.NArg() > 0 {
 		return Configuration{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flagSet.Args(), " "))
 	}
+
+	configuration.EndpointExplicit = environmentEndpoint != ""
+	configuration.TokenExplicit = environmentToken != ""
+	configuration.TLSExplicit = environmentTLSCACert != "" || environmentTLSInsecureRaw != ""
+	flagSet.Visit(func(visited *flag.Flag) {
+		switch visited.Name {
+		case "endpoint", "control-endpoint":
+			configuration.EndpointExplicit = true
+		case "token":
+			configuration.TokenExplicit = true
+		case "tls-ca", "tls-insecure":
+			configuration.TLSExplicit = true
+		}
+	})
+
 	if !protocol.IsIdentifier(configuration.ClientID) {
 		return Configuration{}, fmt.Errorf("invalid --client-id %q", configuration.ClientID)
 	}
@@ -121,9 +165,12 @@ type Bridge struct {
 	mcpConnectionMutex sync.RWMutex
 	mcpConnection      mcp.Connection
 
-	connectionMutex sync.Mutex
-	connection      *websocket.Conn
-	connected       chan struct{}
+	connectionMutex  sync.Mutex
+	connection       *websocket.Conn
+	connected        chan struct{}
+	activeEndpoint   string
+	activeToken      string
+	activeHTTPClient *http.Client
 
 	requestSequence atomic.Int64
 	pendingMutex    sync.Mutex
@@ -499,7 +546,8 @@ func (bridge *Bridge) invokePostArtifact(
 		return nil, &protocol.HubRPCError{Code: "internal_error", Message: "malformed post_artifact response"}
 	}
 
-	uploadURL, err := bridge.resolveHTTPURL(grantResult.Upload.Path)
+	targetEndpoint, targetToken, httpClient := bridge.activeOrResolvedTarget()
+	uploadURL, err := resolveHTTPURLFromEndpoint(targetEndpoint, grantResult.Upload.Path)
 	if err != nil {
 		return nil, &protocol.HubRPCError{Code: "internal_error", Message: err.Error()}
 	}
@@ -509,11 +557,10 @@ func (bridge *Bridge) invokePostArtifact(
 	}
 	putRequest.ContentLength = int64(len(fileBytes))
 	putRequest.Header.Set("Content-Type", "application/octet-stream")
-	if bridge.configuration.Token != "" {
-		putRequest.Header.Set("Authorization", "Bearer "+bridge.configuration.Token)
+	if targetToken != "" {
+		putRequest.Header.Set("Authorization", "Bearer "+targetToken)
 	}
 
-	httpClient := bridge.configuration.HTTPClient
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
@@ -635,19 +682,20 @@ func (bridge *Bridge) maintainWebSocketLoop(operationContext context.Context) {
 }
 
 func (bridge *Bridge) runSingleWebSocketSession(operationContext context.Context, reattach bool) bool {
-	wsURL, err := bridge.orchestratorClientWebSocketURL()
+	targetEndpoint, targetToken, targetHTTPClient := bridge.resolveConnectionTarget()
+	wsURL, err := orchestratorClientWebSocketURLFromEndpoint(targetEndpoint)
 	if err != nil {
 		return false
 	}
 	headers := http.Header{}
-	if bridge.configuration.Token != "" {
-		headers.Set("Authorization", "Bearer "+bridge.configuration.Token)
+	if targetToken != "" {
+		headers.Set("Authorization", "Bearer "+targetToken)
 	}
 
 	dialContext, cancelDial := context.WithTimeout(operationContext, 10*time.Second)
 	connection, httpResponse, err := websocket.Dial(dialContext, wsURL, &websocket.DialOptions{
 		HTTPHeader: headers,
-		HTTPClient: bridge.configuration.HTTPClient,
+		HTTPClient: targetHTTPClient,
 	})
 	cancelDial()
 	if httpResponse != nil && httpResponse.Body != nil {
@@ -662,6 +710,9 @@ func (bridge *Bridge) runSingleWebSocketSession(operationContext context.Context
 		bridge.connectionMutex.Lock()
 		if bridge.connection == connection {
 			bridge.connection = nil
+			bridge.activeEndpoint = ""
+			bridge.activeToken = ""
+			bridge.activeHTTPClient = nil
 			bridge.connected = make(chan struct{})
 		}
 		bridge.connectionMutex.Unlock()
@@ -701,6 +752,9 @@ func (bridge *Bridge) runSingleWebSocketSession(operationContext context.Context
 
 	bridge.connectionMutex.Lock()
 	bridge.connection = connection
+	bridge.activeEndpoint = targetEndpoint
+	bridge.activeToken = targetToken
+	bridge.activeHTTPClient = targetHTTPClient
 	close(bridge.connected)
 	bridge.connectionMutex.Unlock()
 
@@ -976,10 +1030,53 @@ func (bridge *Bridge) failPendingCalls() {
 	}
 }
 
-func (bridge *Bridge) orchestratorClientWebSocketURL() (string, error) {
-	parsedURL, err := url.Parse(bridge.configuration.Endpoint)
+func (bridge *Bridge) resolveConnectionTarget() (string, string, *http.Client) {
+	endpoint := bridge.configuration.Endpoint
+	token := bridge.configuration.Token
+	httpClient := bridge.configuration.HTTPClient
+
+	if (!bridge.configuration.EndpointExplicit || !bridge.configuration.TokenExplicit || !bridge.configuration.TLSExplicit) &&
+		strings.TrimSpace(bridge.configuration.ConnectionFilePath) != "" {
+		discovered, found, err := localstate.ReadConnectionState(bridge.configuration.ConnectionFilePath)
+		if err == nil && found {
+			if !bridge.configuration.EndpointExplicit && discovered.Endpoint != "" {
+				endpoint = discovered.Endpoint
+			}
+			if !bridge.configuration.TokenExplicit && (discovered.Token != "" || strings.EqualFold(discovered.AuthMode, "tailscale")) {
+				token = discovered.Token
+			}
+			if !bridge.configuration.TLSExplicit && (discovered.TLSCACert != "" || discovered.TLSInsecure) {
+				if discoveredClient, tlsErr := protocol.BuildHTTPClient(discovered.TLSCACert, discovered.TLSInsecure, 0); tlsErr == nil {
+					httpClient = discoveredClient
+				}
+			}
+		}
+	}
+
+	if strings.TrimSpace(endpoint) == "" {
+		endpoint = slave.DefaultEndpoint
+	}
+	return endpoint, token, httpClient
+}
+
+func (bridge *Bridge) activeOrResolvedTarget() (string, string, *http.Client) {
+	bridge.connectionMutex.Lock()
+	activeEndpoint := bridge.activeEndpoint
+	activeToken := bridge.activeToken
+	activeHTTPClient := bridge.activeHTTPClient
+	hasActiveConnection := bridge.connection != nil
+	bridge.connectionMutex.Unlock()
+
+	if hasActiveConnection && activeEndpoint != "" {
+		return activeEndpoint, activeToken, activeHTTPClient
+	}
+	return bridge.resolveConnectionTarget()
+}
+
+func orchestratorClientWebSocketURLFromEndpoint(endpoint string) (string, error) {
+	parsedURL, err := url.Parse(endpoint)
 	if err != nil || parsedURL.Host == "" {
-		return "", fmt.Errorf("invalid endpoint %q", bridge.configuration.Endpoint)
+		return "", fmt.Errorf("invalid endpoint %q", endpoint)
 	}
 	switch parsedURL.Scheme {
 	case "http":
@@ -994,7 +1091,7 @@ func (bridge *Bridge) orchestratorClientWebSocketURL() (string, error) {
 	return parsedURL.String(), nil
 }
 
-func (bridge *Bridge) resolveHTTPURL(relativeOrAbsolute string) (string, error) {
+func resolveHTTPURLFromEndpoint(endpoint string, relativeOrAbsolute string) (string, error) {
 	parsedTarget, err := url.Parse(relativeOrAbsolute)
 	if err != nil {
 		return "", err
@@ -1002,9 +1099,9 @@ func (bridge *Bridge) resolveHTTPURL(relativeOrAbsolute string) (string, error) 
 	if parsedTarget.Scheme == "http" || parsedTarget.Scheme == "https" {
 		return parsedTarget.String(), nil
 	}
-	parsedBase, err := url.Parse(bridge.configuration.Endpoint)
+	parsedBase, err := url.Parse(endpoint)
 	if err != nil || parsedBase.Host == "" {
-		return "", fmt.Errorf("invalid endpoint %q", bridge.configuration.Endpoint)
+		return "", fmt.Errorf("invalid endpoint %q", endpoint)
 	}
 	switch parsedBase.Scheme {
 	case "ws":

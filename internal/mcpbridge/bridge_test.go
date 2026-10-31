@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cafecito-games/Orchestra/internal/localstate"
 	"github.com/cafecito-games/Orchestra/internal/orchestrator"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
@@ -631,4 +632,111 @@ func TestStdioBridgeMasterHTTPErrorPropagation(t *testing.T) {
 
 	_ = stdinWriter.Close()
 	require.NoError(t, <-bridgeDone)
+}
+
+func TestBridgeAutoDiscoversAndHotReloadsConnectionFile(t *testing.T) {
+	temporaryHome := t.TempDir()
+	lookupEnvironment := func(name string) (string, bool) {
+		if name == "HOME" {
+			return temporaryHome, true
+		}
+		return "", false
+	}
+
+	configuration, err := ParseConfiguration(nil, lookupEnvironment)
+	require.NoError(t, err)
+	assert.False(t, configuration.EndpointExplicit)
+	assert.False(t, configuration.TokenExplicit)
+	require.NotEmpty(t, configuration.ConnectionFilePath)
+
+	bridge := NewBridge(configuration)
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+
+	bridgeContext, cancelBridge := context.WithCancel(t.Context())
+	defer cancelBridge()
+
+	go func() {
+		defer stdoutWriter.Close()
+		_ = bridge.Run(bridgeContext, stdinReader, stdoutWriter)
+	}()
+
+	lines := make(chan map[string]any, 32)
+	go func() {
+		scanner := bufio.NewScanner(stdoutReader)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			var parsed map[string]any
+			if json.Unmarshal(scanner.Bytes(), &parsed) == nil {
+				lines <- parsed
+			}
+		}
+	}()
+
+	sendLine := func(payload string) {
+		t.Helper()
+		_, writeErr := stdinWriter.Write([]byte(payload + "\n"))
+		require.NoError(t, writeErr)
+	}
+	readResponseByID := func(expectedID float64) map[string]any {
+		t.Helper()
+		deadline := time.After(8 * time.Second)
+		for {
+			select {
+			case message := <-lines:
+				if idValue, ok := message["id"].(float64); ok && idValue == expectedID {
+					return message
+				}
+			case <-deadline:
+				require.Failf(t, "timeout", "timed out waiting for response id %v", expectedID)
+				return nil
+			}
+		}
+	}
+
+	sendLine(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"antigravity","version":"1.0.0"}}}`)
+	_ = readResponseByID(1)
+
+	firstStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer firstStore.Close()
+	firstService, err := orchestrator.NewService(orchestrator.ServiceOptions{
+		Store: firstStore,
+		Token: "first-dynamic-token",
+	})
+	require.NoError(t, err)
+	defer firstService.Close()
+	firstServer := httptest.NewServer(firstService.Handler())
+
+	require.NoError(t, localstate.WriteConnectionState(configuration.ConnectionFilePath, localstate.ConnectionState{
+		Endpoint: firstServer.URL,
+		Token:    "first-dynamic-token",
+	}))
+
+	sendLine(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_thread","arguments":{"title":"First Dynamic Master"}}}`)
+	firstCreate := readResponseByID(2)
+	assert.NotEqual(t, true, firstCreate["result"].(map[string]any)["isError"])
+
+	firstServer.Close()
+
+	secondStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer secondStore.Close()
+	secondService, err := orchestrator.NewService(orchestrator.ServiceOptions{
+		Store: secondStore,
+		Token: "second-rotated-token",
+	})
+	require.NoError(t, err)
+	defer secondService.Close()
+	secondServer := httptest.NewServer(secondService.Handler())
+	defer secondServer.Close()
+
+	require.NoError(t, localstate.WriteConnectionState(configuration.ConnectionFilePath, localstate.ConnectionState{
+		Endpoint: secondServer.URL,
+		Token:    "second-rotated-token",
+	}))
+
+	sendLine(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_thread","arguments":{"title":"Second Dynamic Master"}}}`)
+	secondCreate := readResponseByID(3)
+	assert.NotEqual(t, true, secondCreate["result"].(map[string]any)["isError"])
 }

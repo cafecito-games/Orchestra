@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/cafecito-games/Orchestra/internal/acpadapter"
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/harness"
+	"github.com/cafecito-games/Orchestra/internal/localstate"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/readiness"
 	"github.com/cafecito-games/Orchestra/internal/safepath"
@@ -27,6 +29,7 @@ import (
 
 const (
 	DefaultEndpoint         = "http://127.0.0.1:8787"
+	DefaultMasterPort       = 8787
 	DefaultKind             = "local"
 	DefaultConcurrency      = 2
 	DefaultInstanceCapacity = 4
@@ -37,6 +40,9 @@ var nonSlugCharacters = regexp.MustCompile(`[^a-z0-9-]+`)
 
 type Configuration struct {
 	ControlEndpoint      string
+	EndpointExplicit     bool
+	MasterPort           int
+	TailscaleBinary      string
 	NodeID               string
 	Name                 string
 	Kind                 string
@@ -49,6 +55,8 @@ type Configuration struct {
 	Concurrency          int
 	InstanceCapacity     int
 	Token                string
+	TokenExplicit        bool
+	TLSExplicit          bool
 	DataRoot             string
 	AdapterManifest      string
 	ACPAdapters          []acpadapter.Override
@@ -58,6 +66,10 @@ type Configuration struct {
 	ClaudeACPAuthMode    string
 	ApprovalPolicies     harness.ApprovalPolicies
 	BuiltInACPExecutable string
+	ConnectionFilePath   string
+	LogLevel             activitylog.Level
+	LogFormat            activitylog.Format
+	ActivityLogger       *activitylog.Logger
 	HTTPClient           *http.Client
 	Version              string
 }
@@ -94,6 +106,7 @@ func (flagValue *repeatFlag) Set(raw string) error {
 }
 
 func ParseConfiguration(arguments []string, lookupEnvironment func(string) (string, bool)) (Configuration, error) {
+	defaultConnectionFile := localstate.ResolveConnectionFilePath(lookupEnvironment)
 	if lookupEnvironment == nil {
 		lookupEnvironment = os.LookupEnv
 	}
@@ -102,7 +115,8 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 		hostname = "orchestra-node"
 	}
 
-	defaultEndpoint := firstEnvironment(lookupEnvironment, "ORCHESTRA_ENDPOINT", "CONTROL_ENDPOINT")
+	endpointFromEnvironment := firstEnvironment(lookupEnvironment, "ORCHESTRA_ENDPOINT", "CONTROL_ENDPOINT")
+	defaultEndpoint := endpointFromEnvironment
 	if defaultEndpoint == "" {
 		defaultEndpoint = DefaultEndpoint
 	}
@@ -115,13 +129,18 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	if defaultKind == "" {
 		defaultKind = DefaultKind
 	}
-	defaultToken := firstEnvironment(lookupEnvironment, "ORCHESTRA_TOKEN")
+	tokenFromEnvironment := firstEnvironment(lookupEnvironment, "ORCHESTRA_TOKEN")
+	defaultToken := tokenFromEnvironment
 	defaultDataRoot := firstEnvironment(lookupEnvironment, "ORCHESTRA_DATA_ROOT")
 	defaultManifest := firstEnvironment(lookupEnvironment, "ORCHESTRA_ADAPTER_MANIFEST")
 	defaultClaudeAuthMode := firstEnvironment(lookupEnvironment, "ORCHESTRA_CLAUDE_ACP_AUTH_MODE")
 	defaultTLSCACert := firstEnvironment(lookupEnvironment, "ORCHESTRA_TLS_CA")
 	defaultTLSInsecure := firstEnvironment(lookupEnvironment, "ORCHESTRA_TLS_INSECURE") == "1" ||
 		strings.EqualFold(firstEnvironment(lookupEnvironment, "ORCHESTRA_TLS_INSECURE"), "true")
+	defaultVerbose := firstEnvironment(lookupEnvironment, "ORCHESTRA_VERBOSE") == "1" ||
+		strings.EqualFold(firstEnvironment(lookupEnvironment, "ORCHESTRA_VERBOSE"), "true")
+	defaultLogLevelRaw := firstEnvironment(lookupEnvironment, "ORCHESTRA_LOG_LEVEL")
+	defaultLogFormatRaw := firstEnvironment(lookupEnvironment, "ORCHESTRA_LOG_FORMAT")
 	defaultRequireACP := false
 	if rawRequireACP := firstEnvironment(lookupEnvironment, "ORCHESTRA_REQUIRE_ACP"); rawRequireACP != "" {
 		parsedRequireACP, err := parseStrictBool(rawRequireACP)
@@ -163,6 +182,15 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 		}
 		defaultMemoryMegabytes = parsed
 	}
+	defaultMasterPort := DefaultMasterPort
+	if raw := firstEnvironment(lookupEnvironment, "ORCHESTRA_MASTER_PORT"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > 65535 {
+			return Configuration{}, fmt.Errorf("invalid ORCHESTRA_MASTER_PORT %q", raw)
+		}
+		defaultMasterPort = parsed
+	}
+	defaultTailscaleBinary := firstEnvironment(lookupEnvironment, "ORCHESTRA_TAILSCALE_BINARY")
 
 	var workspaceRootFlag repeatFlag
 	var projectFlag repeatFlag
@@ -179,8 +207,14 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	var configuration Configuration
 	var tlsCACert string
 	var tlsInsecure bool
+	var verbose bool
+	var logLevelRaw string
+	var logFormatRaw string
 	flagSet.StringVar(&configuration.ControlEndpoint, "control-endpoint", defaultEndpoint, "Orchestrator HTTP or WebSocket base endpoint")
 	flagSet.StringVar(&configuration.ControlEndpoint, "endpoint", defaultEndpoint, "Orchestrator HTTP or WebSocket base endpoint")
+	flagSet.IntVar(&configuration.MasterPort, "master-port", defaultMasterPort, "Master port probed during automatic Tailscale discovery")
+	flagSet.StringVar(&configuration.TailscaleBinary, "tailscale-binary", defaultTailscaleBinary, "Optional explicit path to the tailscale CLI binary")
+	flagSet.StringVar(&configuration.ConnectionFilePath, "connection-file", defaultConnectionFile, "Local connection discovery state file path")
 	flagSet.StringVar(&configuration.Name, "name", defaultName, "Display name for this slave node")
 	flagSet.StringVar(&configuration.NodeID, "id", defaultNodeID, "Stable node identifier")
 	flagSet.StringVar(&configuration.Kind, "kind", defaultKind, "Node kind (local, home-server, cloud)")
@@ -193,6 +227,9 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	flagSet.StringVar(&configuration.ClaudeACPAuthMode, "claude-acp-auth-mode", defaultClaudeAuthMode, "Claude ACP auth mode (local-subscription or api)")
 	flagSet.StringVar(&tlsCACert, "tls-ca", defaultTLSCACert, "Optional CA certificate PEM path for wss:// / https://")
 	flagSet.BoolVar(&tlsInsecure, "tls-insecure", defaultTLSInsecure, "Skip TLS certificate verification")
+	flagSet.BoolVar(&verbose, "verbose", defaultVerbose, "Enable debug operational logs")
+	flagSet.StringVar(&logLevelRaw, "log-level", defaultLogLevelRaw, "Operational log level (debug, info, warn, error, quiet)")
+	flagSet.StringVar(&logFormatRaw, "log-format", defaultLogFormatRaw, "Operational log format (text or json)")
 	flagSet.Var(&workspaceRootFlag, "workspace-root", "Canonical workspace root (repeatable)")
 	flagSet.Var(&projectFlag, "project", "Allowed project profile identifier (repeatable)")
 	flagSet.Var(&labelFlag, "label", "Node capability label (repeatable)")
@@ -209,6 +246,59 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	}
 	if flagSet.NArg() > 0 {
 		return Configuration{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flagSet.Args(), " "))
+	}
+
+	explicitFlags := map[string]bool{}
+	flagSet.Visit(func(visited *flag.Flag) {
+		explicitFlags[visited.Name] = true
+	})
+
+	switch {
+	case strings.TrimSpace(logLevelRaw) != "":
+		parsedLevel, levelErr := activitylog.ParseLevel(logLevelRaw)
+		if levelErr != nil {
+			return Configuration{}, levelErr
+		}
+		configuration.LogLevel = parsedLevel
+	case verbose:
+		configuration.LogLevel = activitylog.LevelDebug
+	default:
+		configuration.LogLevel = activitylog.LevelInfo
+	}
+	parsedFormat, formatErr := activitylog.ParseFormat(logFormatRaw)
+	if formatErr != nil {
+		return Configuration{}, formatErr
+	}
+	configuration.LogFormat = parsedFormat
+
+	endpointExplicit := explicitFlags["endpoint"] || explicitFlags["control-endpoint"] || endpointFromEnvironment != ""
+	tokenExplicit := explicitFlags["token"] || tokenFromEnvironment != ""
+	tlsExplicit := explicitFlags["tls-ca"] || explicitFlags["tls-insecure"] || defaultTLSCACert != "" || defaultTLSInsecure
+	configuration.EndpointExplicit = endpointExplicit
+	configuration.TokenExplicit = tokenExplicit
+	configuration.TLSExplicit = tlsExplicit
+
+	if configuration.MasterPort <= 0 || configuration.MasterPort > 65535 {
+		return Configuration{}, errors.New("master-port must be between 1 and 65535")
+	}
+
+	if configuration.ConnectionFilePath != "" && (!endpointExplicit || !tokenExplicit || !tlsExplicit) {
+		if discovered, found, readErr := localstate.ReadConnectionState(configuration.ConnectionFilePath); readErr == nil && found {
+			if !endpointExplicit && strings.TrimSpace(discovered.Endpoint) != "" {
+				configuration.ControlEndpoint = strings.TrimSpace(discovered.Endpoint)
+			}
+			if !tokenExplicit && (strings.TrimSpace(discovered.Token) != "" || strings.EqualFold(discovered.AuthMode, "tailscale")) {
+				configuration.Token = strings.TrimSpace(discovered.Token)
+			}
+			if !tlsExplicit {
+				if strings.TrimSpace(discovered.TLSCACert) != "" {
+					tlsCACert = strings.TrimSpace(discovered.TLSCACert)
+				}
+				if discovered.TLSInsecure {
+					tlsInsecure = true
+				}
+			}
+		}
 	}
 
 	if configuration.NodeID == "" {
@@ -514,6 +604,7 @@ func BuildRuntime(operationContext context.Context, configuration Configuration)
 		WorkspaceManager:  workspaceManager,
 		CapabilityReport:  &capabilityReport,
 		ComponentReport:   &componentReport,
+		ActivityLogger:    configuration.ActivityLogger,
 		HTTPClient:        configuration.HTTPClient,
 		DataRoot:          configuration.DataRoot,
 		DisableSelfUpdate: configuration.DisableSelfUpdate,

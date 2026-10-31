@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
@@ -381,6 +382,26 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 		})
 		return nil
 	})
+	if err == nil && !result.Replayed {
+		readyCount := 0
+		titles := make([]string, 0, min(len(result.Tasks), 3))
+		for index, task := range result.Tasks {
+			if task.Status == "ready" {
+				readyCount++
+			}
+			if index < 3 {
+				titles = append(titles, task.Title)
+			}
+		}
+		service.logger.Info(
+			"task",
+			"submitted",
+			activitylog.String("thread", result.ThreadID),
+			activitylog.Int("count", len(result.Tasks)),
+			activitylog.Int("ready", readyCount),
+			activitylog.String("titles", strings.Join(titles, "; ")),
+		)
+	}
 	return result, err
 }
 
@@ -591,6 +612,18 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 			),
 		)
 	}
+	statusOrProgress := updatedTask.Summary
+	if statusOrProgress == "" {
+		statusOrProgress = updatedTask.Progress
+	}
+	service.logger.Info(
+		"task",
+		"updated",
+		activitylog.String("task", updatedTask.ID),
+		activitylog.String("thread", updatedTask.ThreadID),
+		activitylog.String("status", updatedTask.Status),
+		activitylog.String("summary", statusOrProgress),
+	)
 	return updatedTask, nil
 }
 
@@ -726,6 +759,23 @@ func (service *Service) CancelTarget(targetID string) (CancelResult, error) {
 
 		return notFound(fmt.Sprintf("no run or task %q exists", targetID))
 	})
+	if err == nil {
+		runID := ""
+		if result.Run != nil {
+			runID = result.Run.ID
+		}
+		taskID := ""
+		if result.Task != nil {
+			taskID = result.Task.ID
+		}
+		service.logger.Warn(
+			"cancel",
+			"requested",
+			activitylog.String("kind", result.Kind),
+			activitylog.String("task", taskID),
+			activitylog.String("run", runID),
+		)
+	}
 	return result, err
 }
 

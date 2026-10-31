@@ -9,12 +9,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +27,7 @@ import (
 
 	"github.com/cafecito-games/Orchestra/internal/cli"
 	"github.com/cafecito-games/Orchestra/internal/harness"
+	"github.com/cafecito-games/Orchestra/internal/localstate"
 	"github.com/cafecito-games/Orchestra/internal/orchestrator"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/selfupdate"
@@ -780,4 +783,529 @@ func TestCLIUpdateAndNodesUpdate(t *testing.T) {
 	assert.Equal(t, "succeeded", nodesResponse.Nodes[0].Status)
 	assert.Equal(t, "0.1.0", nodesResponse.Nodes[0].PreviousVersion)
 	assert.Equal(t, "9.9.9", nodesResponse.Nodes[0].CurrentVersion)
+}
+
+func TestCLIZeroConfigMasterDiscoveryAndMCPSetup(t *testing.T) {
+	homeDirectory := t.TempDir()
+	dataRoot := filepath.Join(homeDirectory, ".local", "share", "orchestra")
+	masterDataDirectory := filepath.Join(dataRoot, "master")
+	connectionFilePath := filepath.Join(dataRoot, "connection.json")
+
+	environment := map[string]string{
+		"HOME":                homeDirectory,
+		"ORCHESTRA_DATA_ROOT": dataRoot,
+		"NO_COLOR":            "1",
+	}
+	lookupEnvironment := func(name string) (string, bool) {
+		value, found := environment[name]
+		return value, found
+	}
+
+	masterContext, cancelMaster := context.WithCancel(context.Background())
+	defer cancelMaster()
+
+	var masterStdout, masterStderr bytes.Buffer
+	masterDone := make(chan int, 1)
+	go func() {
+		masterDone <- cli.Run(
+			masterContext,
+			[]string{
+				"master",
+				"--listen", "127.0.0.1:0",
+				"--data-dir", masterDataDirectory,
+				"--log-format", "json",
+			},
+			nil,
+			&masterStdout,
+			&masterStderr,
+			lookupEnvironment,
+		)
+	}()
+
+	var discovered localstate.ConnectionState
+	require.Eventually(t, func() bool {
+		state, found, err := localstate.ReadConnectionState(connectionFilePath)
+		if err != nil || !found || state.Endpoint == "" || state.Token == "" {
+			return false
+		}
+		discovered = state
+		return true
+	}, 5*time.Second, 25*time.Millisecond)
+
+	tokenBytes, err := os.ReadFile(filepath.Join(masterDataDirectory, "token"))
+	require.NoError(t, err)
+	persistedToken := strings.TrimSpace(string(tokenBytes))
+	require.NotEmpty(t, persistedToken)
+	require.Equal(t, persistedToken, discovered.Token)
+
+	runSubcommand := func(arguments ...string) (int, string, string) {
+		var stdout, stderr bytes.Buffer
+		exitCode := cli.Run(context.Background(), arguments, nil, &stdout, &stderr, lookupEnvironment)
+		return exitCode, stdout.String(), stderr.String()
+	}
+
+	// `orchestra status` succeeds with zero --endpoint or --token flags via connection.json discovery.
+	exitCode, statusOut, statusErr := runSubcommand("status")
+	require.Equal(t, 0, exitCode, statusErr)
+	require.Contains(t, statusOut, "Orchestra Master")
+
+	// Install MCP config across all 4 harness formats, inspect status, and uninstall.
+	exitCode, installOut, installErr := runSubcommand(
+		"mcp", "install",
+		"--harness", "antigravity,claude,codex,opencode",
+		"--binary", "/usr/local/bin/orchestra",
+	)
+	require.Equal(t, 0, exitCode, installErr)
+	require.Contains(t, installOut, "Antigravity")
+	require.Contains(t, installOut, "Claude Code")
+	require.Contains(t, installOut, "Codex")
+	require.Contains(t, installOut, "OpenCode")
+
+	exitCode, mcpStatusJSON, mcpStatusErr := runSubcommand("mcp", "status", "--json")
+	require.Equal(t, 0, exitCode, mcpStatusErr)
+	var statusReport struct {
+		Connection struct {
+			Discovered bool   `json:"discovered"`
+			Endpoint   string `json:"endpoint"`
+			HasToken   bool   `json:"hasToken"`
+			Reachable  bool   `json:"reachable"`
+		} `json:"connection"`
+		Harnesses []localstate.HarnessMCPStatus `json:"harnesses"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(mcpStatusJSON), &statusReport))
+	require.True(t, statusReport.Connection.Discovered)
+	require.Equal(t, discovered.Endpoint, statusReport.Connection.Endpoint)
+	require.True(t, statusReport.Connection.HasToken)
+	require.True(t, statusReport.Connection.Reachable)
+	require.Len(t, statusReport.Harnesses, 4)
+	for _, entry := range statusReport.Harnesses {
+		require.True(t, entry.Configured, "expected %s to be configured", entry.Target)
+		require.Equal(t, "/usr/local/bin/orchestra", entry.Command)
+	}
+	require.NotContains(t, mcpStatusJSON, persistedToken)
+
+	exitCode, uninstallOut, uninstallErr := runSubcommand("mcp", "uninstall", "--harness", "antigravity,claude,codex,opencode")
+	require.Equal(t, 0, exitCode, uninstallErr)
+	require.Contains(t, uninstallOut, "removed")
+
+	cancelMaster()
+	select {
+	case masterExit := <-masterDone:
+		require.Equal(t, 0, masterExit, masterStderr.String())
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timed out waiting for orchestra master shutdown")
+	}
+
+	logOutput := masterStderr.String()
+	require.Contains(t, logOutput, `"category":"master"`)
+	require.Contains(t, logOutput, `"category":"auth"`)
+	require.Contains(t, logOutput, `"category":"config"`)
+	require.NotContains(t, logOutput, persistedToken)
+}
+
+func TestCLITailscaleAuthModeZeroTokenSlaveAndStatus(t *testing.T) {
+	homeDirectory := t.TempDir()
+	dataRoot := filepath.Join(homeDirectory, ".local", "share", "orchestra")
+	masterDataDirectory := filepath.Join(dataRoot, "master")
+	connectionFilePath := filepath.Join(dataRoot, "connection.json")
+	workspaceDirectory := t.TempDir()
+
+	fakeTailscale := filepath.Join(t.TempDir(), "tailscale")
+	fakeTailscaleScript := `#!/bin/sh
+if [ "$1" = "status" ]; then
+  cat <<'EOF'
+{
+  "MagicDNSSuffix": "tail999.ts.net",
+  "Self": {
+    "HostName": "main-mac",
+    "DNSName": "main-mac.tail999.ts.net.",
+    "UserID": 42,
+    "TailscaleIPs": ["100.88.1.10", "fd7a:115c:a1e0::10"]
+  },
+  "User": {
+    "42": {"ID": 42, "LoginName": "christian@example.com"}
+  }
+}
+EOF
+  exit 0
+fi
+exit 1
+`
+	require.NoError(t, os.WriteFile(fakeTailscale, []byte(fakeTailscaleScript), 0o755))
+
+	// Seed a stale token-mode connection.json to prove --auth tailscale overwrites it with empty token.
+	require.NoError(t, localstate.WriteConnectionState(connectionFilePath, localstate.ConnectionState{
+		Endpoint: "http://127.0.0.1:9",
+		AuthMode: "token",
+		Token:    "stale-bearer-token-should-be-cleared",
+	}))
+
+	environment := map[string]string{
+		"HOME":                homeDirectory,
+		"ORCHESTRA_DATA_ROOT": dataRoot,
+		"NO_COLOR":            "1",
+	}
+	lookupEnvironment := func(name string) (string, bool) {
+		value, found := environment[name]
+		return value, found
+	}
+
+	// Wildcard listen address must fail fast when --auth tailscale is active.
+	var wildcardOut, wildcardErr bytes.Buffer
+	wildcardExit := cli.Run(
+		context.Background(),
+		[]string{
+			"master",
+			"--auth", "tailscale",
+			"--tailscale-binary", fakeTailscale,
+			"--listen", "0.0.0.0:8787",
+			"--data-dir", masterDataDirectory,
+		},
+		nil,
+		&wildcardOut,
+		&wildcardErr,
+		lookupEnvironment,
+	)
+	require.Equal(t, 1, wildcardExit)
+	require.Contains(t, wildcardErr.String(), "refuses wildcard listen address")
+
+	// Start master in --auth tailscale mode bound to loopback ephemeral port.
+	masterContext, cancelMaster := context.WithCancel(context.Background())
+	defer cancelMaster()
+
+	var masterStdout, masterStderr bytes.Buffer
+	masterDone := make(chan int, 1)
+	go func() {
+		masterDone <- cli.Run(
+			masterContext,
+			[]string{
+				"master",
+				"--auth", "tailscale",
+				"--tailscale-binary", fakeTailscale,
+				"--listen", "127.0.0.1:0",
+				"--data-dir", masterDataDirectory,
+				"--log-format", "json",
+			},
+			nil,
+			&masterStdout,
+			&masterStderr,
+			lookupEnvironment,
+		)
+	}()
+
+	var discovered localstate.ConnectionState
+	require.Eventually(t, func() bool {
+		state, found, err := localstate.ReadConnectionState(connectionFilePath)
+		if err != nil || !found || state.AuthMode != "tailscale" || state.Endpoint == "" || state.Endpoint == "http://127.0.0.1:9" {
+			return false
+		}
+		discovered = state
+		return true
+	}, 5*time.Second, 25*time.Millisecond)
+
+	// No <data-dir>/token file is created and connection.json contains no bearer token.
+	_, statErr := os.Stat(filepath.Join(masterDataDirectory, "token"))
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+	require.Empty(t, discovered.Token)
+
+	// Start a remote-style `orchestra slave` with ONLY --endpoint (no token env, no connection.json).
+	isolatedSlaveEnvironment := func(string) (string, bool) { return "", false }
+	slaveContext, cancelSlave := context.WithCancel(context.Background())
+	defer cancelSlave()
+
+	var slaveStdout, slaveStderr bytes.Buffer
+	slaveDone := make(chan int, 1)
+	go func() {
+		slaveDone <- cli.Run(
+			slaveContext,
+			[]string{
+				"slave",
+				"--endpoint", discovered.Endpoint,
+				"--id", "tailnet-worker-01",
+				"--name", "Tailnet Worker",
+				"--workspace-root", workspaceDirectory,
+			},
+			nil,
+			&slaveStdout,
+			&slaveStderr,
+			isolatedSlaveEnvironment,
+		)
+	}()
+
+	runSubcommand := func(arguments ...string) (int, string, string) {
+		var stdout, stderr bytes.Buffer
+		exitCode := cli.Run(context.Background(), arguments, nil, &stdout, &stderr, lookupEnvironment)
+		return exitCode, stdout.String(), stderr.String()
+	}
+
+	// Wait until the zero-token slave registers and syncs with the master.
+	require.Eventually(t, func() bool {
+		code, nodesJSON, _ := runSubcommand("nodes", "--json")
+		return code == 0 && strings.Contains(nodesJSON, `"id": "tailnet-worker-01"`) && strings.Contains(nodesJSON, `"status": "online"`)
+	}, 5*time.Second, 50*time.Millisecond)
+
+	exitCode, mcpStatusOut, mcpStatusErr := runSubcommand("mcp", "status")
+	require.Equal(t, 0, exitCode, mcpStatusErr)
+	require.Contains(t, mcpStatusOut, "auth=tailscale")
+
+	// Browser requests with Origin header are rejected with 401 even over loopback.
+	browserRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, discovered.Endpoint+"/api/status", nil)
+	require.NoError(t, err)
+	browserRequest.Header.Set("Origin", "https://evil.example")
+	browserResponse, err := http.DefaultClient.Do(browserRequest)
+	require.NoError(t, err)
+	_ = browserResponse.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, browserResponse.StatusCode)
+
+	cancelSlave()
+	select {
+	case slaveExit := <-slaveDone:
+		require.Equal(t, 0, slaveExit, slaveStderr.String())
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timed out waiting for orchestra slave shutdown")
+	}
+
+	cancelMaster()
+	select {
+	case masterExit := <-masterDone:
+		require.Equal(t, 0, masterExit, masterStderr.String())
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timed out waiting for orchestra master shutdown")
+	}
+
+	require.Contains(t, masterStderr.String(), `"auth":"tailscale"`)
+	require.Contains(t, masterStderr.String(), `"tailscale peer identity verification enabled"`)
+}
+
+func TestCLISlaveTailscaleAutoDiscoveryAndInteractiveSelection(t *testing.T) {
+	var listenConfig net.ListenConfig
+	probeListener, err := listenConfig.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := probeListener.Addr().(*net.TCPAddr).Port
+	_ = probeListener.Close()
+
+	ipv6Probe, ipv6Err := listenConfig.Listen(t.Context(), "tcp6", net.JoinHostPort("::1", strconv.Itoa(port)))
+	hasIPv6Loopback := ipv6Err == nil
+	if ipv6Probe != nil {
+		_ = ipv6Probe.Close()
+	}
+
+	fakeTailscale := filepath.Join(t.TempDir(), "tailscale")
+	fakeTailscaleScript := `#!/bin/sh
+if [ "$1" = "status" ]; then
+  cat <<'EOF'
+{
+  "BackendState": "Running",
+  "MagicDNSSuffix": "tail999.ts.net",
+  "Self": {
+    "HostName": "remote-worker",
+    "DNSName": "remote-worker.tail999.ts.net.",
+    "UserID": 42,
+    "TailscaleIPs": ["100.88.1.99"]
+  },
+  "Peer": {
+    "peer-alpha": {
+      "HostName": "alpha-mac",
+      "DNSName": "alpha-mac.tail999.ts.net.",
+      "UserID": 42,
+      "TailscaleIPs": ["127.0.0.1"],
+      "Online": true
+    },
+    "peer-beta": {
+      "HostName": "beta-server",
+      "DNSName": "beta-server.tail999.ts.net.",
+      "UserID": 42,
+      "TailscaleIPs": ["::1"],
+      "Online": true
+    }
+  },
+  "User": {
+    "42": {"ID": 42, "LoginName": "christian@example.com"}
+  }
+}
+EOF
+  exit 0
+fi
+exit 1
+`
+	require.NoError(t, os.WriteFile(fakeTailscale, []byte(fakeTailscaleScript), 0o755))
+
+	noEnvironment := func(string) (string, bool) { return "", false }
+
+	// Start Master Alpha on 127.0.0.1:<port>.
+	alphaDataDirectory := filepath.Join(t.TempDir(), "alpha-master")
+	alphaContext, cancelAlpha := context.WithCancel(t.Context())
+	defer cancelAlpha()
+	alphaDone := make(chan int, 1)
+	var alphaOutput, alphaError bytes.Buffer
+	go func() {
+		alphaDone <- cli.Run(
+			alphaContext,
+			[]string{
+				"master",
+				"--auth", "tailscale",
+				"--tailscale-binary", fakeTailscale,
+				"--listen", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+				"--data-dir", alphaDataDirectory,
+				"--connection-file", "none",
+			},
+			nil,
+			&alphaOutput,
+			&alphaError,
+			noEnvironment,
+		)
+	}()
+
+	alphaEndpoint := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	require.Eventually(t, func() bool {
+		healthRequest, requestErr := http.NewRequestWithContext(t.Context(), http.MethodGet, alphaEndpoint+"/healthz", nil)
+		if requestErr != nil {
+			return false
+		}
+		response, requestErr := http.DefaultClient.Do(healthRequest)
+		if requestErr != nil {
+			return false
+		}
+		_ = response.Body.Close()
+		return response.StatusCode == http.StatusOK
+	}, 5*time.Second, 25*time.Millisecond)
+
+	// 1. With only 1 master online, `orchestra slave` with NO --endpoint and NO --token auto-discovers Alpha.
+	workspaceDirectory := t.TempDir()
+	slave1Context, cancelSlave1 := context.WithCancel(t.Context())
+	defer cancelSlave1()
+	slave1Done := make(chan int, 1)
+	var slave1Output, slave1Error bytes.Buffer
+	go func() {
+		slave1Done <- cli.Run(
+			slave1Context,
+			[]string{
+				"slave",
+				"--master-port", strconv.Itoa(port),
+				"--tailscale-binary", fakeTailscale,
+				"--connection-file", "none",
+				"--id", "auto-slave-01",
+				"--workspace-root", workspaceDirectory,
+			},
+			strings.NewReader(""),
+			&slave1Output,
+			&slave1Error,
+			noEnvironment,
+		)
+	}()
+
+	require.Eventually(t, func() bool {
+		var standardOutput, errorBuffer bytes.Buffer
+		code := cli.Run(t.Context(), []string{"nodes", "--endpoint", alphaEndpoint, "--json"}, nil, &standardOutput, &errorBuffer, noEnvironment)
+		return code == 0 && strings.Contains(standardOutput.String(), `"id": "auto-slave-01"`) && strings.Contains(standardOutput.String(), `"status": "online"`)
+	}, 5*time.Second, 50*time.Millisecond)
+
+	cancelSlave1()
+	require.Equal(t, 0, <-slave1Done, slave1Error.String())
+	require.Contains(t, slave1Error.String(), "discovered orchestra master on tailscale")
+
+	if !hasIPv6Loopback {
+		cancelAlpha()
+		require.Equal(t, 0, <-alphaDone)
+		return
+	}
+
+	// 2. Start Master Beta on [::1]:<port> so 2 Tailscale masters are online simultaneously.
+	betaDataDirectory := filepath.Join(t.TempDir(), "beta-master")
+	betaContext, cancelBeta := context.WithCancel(t.Context())
+	defer cancelBeta()
+	betaDone := make(chan int, 1)
+	var betaOutput, betaError bytes.Buffer
+	go func() {
+		betaDone <- cli.Run(
+			betaContext,
+			[]string{
+				"master",
+				"--auth", "tailscale",
+				"--tailscale-binary", fakeTailscale,
+				"--listen", net.JoinHostPort("::1", strconv.Itoa(port)),
+				"--data-dir", betaDataDirectory,
+				"--connection-file", "none",
+			},
+			nil,
+			&betaOutput,
+			&betaError,
+			noEnvironment,
+		)
+	}()
+
+	betaEndpoint := "http://" + net.JoinHostPort("::1", strconv.Itoa(port))
+	require.Eventually(t, func() bool {
+		healthRequest, requestErr := http.NewRequestWithContext(t.Context(), http.MethodGet, betaEndpoint+"/healthz", nil)
+		if requestErr != nil {
+			return false
+		}
+		response, requestErr := http.DefaultClient.Do(healthRequest)
+		if requestErr != nil {
+			return false
+		}
+		_ = response.Body.Close()
+		return response.StatusCode == http.StatusOK
+	}, 5*time.Second, 25*time.Millisecond)
+
+	// Non-interactive (EOF stdin) exits 1 listing both discovered masters.
+	var nonInteractiveOutput, nonInteractiveError bytes.Buffer
+	nonInteractiveExit := cli.Run(
+		t.Context(),
+		[]string{
+			"slave",
+			"--master-port", strconv.Itoa(port),
+			"--tailscale-binary", fakeTailscale,
+			"--connection-file", "none",
+			"--id", "auto-slave-noninteractive",
+			"--workspace-root", workspaceDirectory,
+		},
+		strings.NewReader(""),
+		&nonInteractiveOutput,
+		&nonInteractiveError,
+		noEnvironment,
+	)
+	require.Equal(t, 1, nonInteractiveExit)
+	require.Contains(t, nonInteractiveError.String(), "multiple Orchestra masters discovered on Tailscale")
+	require.Contains(t, nonInteractiveError.String(), "alpha-mac")
+	require.Contains(t, nonInteractiveError.String(), "beta-server")
+
+	// Interactive selection ("2\n") prompts and connects to Master Beta!
+	slave2Context, cancelSlave2 := context.WithCancel(t.Context())
+	defer cancelSlave2()
+	slave2Done := make(chan int, 1)
+	var slave2Output, slave2Error bytes.Buffer
+	go func() {
+		slave2Done <- cli.Run(
+			slave2Context,
+			[]string{
+				"slave",
+				"--master-port", strconv.Itoa(port),
+				"--tailscale-binary", fakeTailscale,
+				"--connection-file", "none",
+				"--id", "auto-slave-picked-beta",
+				"--workspace-root", workspaceDirectory,
+			},
+			strings.NewReader("2\n"),
+			&slave2Output,
+			&slave2Error,
+			noEnvironment,
+		)
+	}()
+
+	require.Eventually(t, func() bool {
+		var standardOutput, errorBuffer bytes.Buffer
+		code := cli.Run(t.Context(), []string{"nodes", "--endpoint", betaEndpoint, "--json"}, nil, &standardOutput, &errorBuffer, noEnvironment)
+		return code == 0 && strings.Contains(standardOutput.String(), `"id": "auto-slave-picked-beta"`) && strings.Contains(standardOutput.String(), `"status": "online"`)
+	}, 5*time.Second, 50*time.Millisecond)
+
+	cancelSlave2()
+	require.Equal(t, 0, <-slave2Done, slave2Error.String())
+	require.Contains(t, slave2Error.String(), "Select master [1-2]:")
+	require.Contains(t, slave2Error.String(), "selected orchestra master on tailscale")
+
+	cancelBeta()
+	assert.Equal(t, 0, <-betaDone)
+	cancelAlpha()
+	assert.Equal(t, 0, <-alphaDone)
 }

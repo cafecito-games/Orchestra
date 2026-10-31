@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
@@ -276,12 +278,22 @@ func (service *Service) serveSlaveConnection(requestContext context.Context, con
 
 	defer func() {
 		cancelSession()
+		removedCurrent := false
 		service.slavesMutex.Lock()
 		if service.slaves[node.ID] == session {
 			delete(service.slaves, node.ID)
+			removedCurrent = true
 		}
 		service.slavesMutex.Unlock()
 		service.markNodeOffline(node.ID)
+		if removedCurrent {
+			service.logger.Warn(
+				"node",
+				"disconnected",
+				activitylog.String("node", node.ID),
+				activitylog.String("name", node.Name),
+			)
+		}
 		_ = connection.Close(websocket.StatusNormalClosure, "closed")
 	}()
 
@@ -304,6 +316,22 @@ func (service *Service) serveSlaveConnection(requestContext context.Context, con
 		}
 		return nil
 	})
+
+	var availableHarnesses []string
+	for _, profile := range node.Harnesses {
+		if profile.Available {
+			availableHarnesses = append(availableHarnesses, profile.ID)
+		}
+	}
+	service.logger.Info(
+		"node",
+		"connected",
+		activitylog.String("node", node.ID),
+		activitylog.String("name", node.Name),
+		activitylog.String("platform", node.Platform),
+		activitylog.String("harnesses", strings.Join(availableHarnesses, ",")),
+		activitylog.Int("concurrency", node.Concurrency),
+	)
 
 	if err := session.send(sessionContext, protocol.MasterControlMessage{
 		Type: "ping",
@@ -690,6 +718,13 @@ func (service *Service) handleSyncComplete(session *slaveSession, message protoc
 	})
 
 	session.synced.Store(true)
+	service.logger.Info(
+		"node",
+		"synced",
+		activitylog.String("node", nodeID),
+		activitylog.Int("active-runs", len(reportedRuns)),
+		activitylog.Int("active-instances", len(reportedInstances)),
+	)
 	for _, item := range outbound {
 		_ = session.send(context.Background(), item)
 	}

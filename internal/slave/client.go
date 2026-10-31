@@ -15,6 +15,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/harness"
 	"github.com/cafecito-games/Orchestra/internal/mcpserver"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
@@ -45,6 +46,7 @@ type ClientOptions struct {
 	ProcessEnvironment []string
 	ReconnectMinDelay  time.Duration
 	ReconnectMaxDelay  time.Duration
+	ActivityLogger     *activitylog.Logger
 	Logger             func(string)
 	Now                func() time.Time
 }
@@ -65,6 +67,7 @@ type Client struct {
 	processEnvironment []string
 	reconnectMinDelay  time.Duration
 	reconnectMaxDelay  time.Duration
+	activityLogger     *activitylog.Logger
 	loggerMutex        sync.RWMutex
 	logger             func(string)
 	now                func() time.Time
@@ -134,6 +137,7 @@ func NewClient(options ClientOptions) *Client {
 		processEnvironment:  slices.Clone(options.ProcessEnvironment),
 		reconnectMinDelay:   minimumDelay,
 		reconnectMaxDelay:   maximumDelay,
+		activityLogger:      options.ActivityLogger,
 		logger:              options.Logger,
 		now:                 nowFunction,
 		rootContext:         context.Background(),
@@ -154,6 +158,11 @@ func (client *Client) SetLogger(logger func(string)) {
 	client.loggerMutex.Lock()
 	client.logger = logger
 	client.loggerMutex.Unlock()
+}
+
+func (client *Client) SetTarget(endpoint string, token string) {
+	client.endpoint = strings.TrimSpace(endpoint)
+	client.token = token
 }
 
 func (client *Client) logf(format string, arguments ...any) {
@@ -202,8 +211,18 @@ func (client *Client) Run(operationContext context.Context) error {
 		}
 		if connectionErr != nil {
 			client.logf("control connection closed (node=%s): %v", client.node.ID, connectionErr)
-		}
-		if admittedOnce {
+			if admittedOnce {
+				delay = client.reconnectMinDelay
+			}
+			client.activityLogger.Warn(
+				"master",
+				"connection closed; reconnecting",
+				activitylog.String("node", client.node.ID),
+				activitylog.String("endpoint", client.endpoint),
+				activitylog.String("error", connectionErr.Error()),
+				activitylog.Duration("backoff", delay),
+			)
+		} else if admittedOnce {
 			delay = client.reconnectMinDelay
 		}
 
@@ -303,6 +322,13 @@ func (client *Client) runConnection(operationContext context.Context) (bool, err
 					return true, err
 				}
 				client.logf("admitted and synced with master (node=%s)", client.node.ID)
+				client.activityLogger.Info(
+					"master",
+					"connected and synced",
+					activitylog.String("node", client.node.ID),
+					activitylog.String("endpoint", client.endpoint),
+					activitylog.Int("concurrency", client.node.Concurrency),
+				)
 				go func() {
 					defer close(heartbeatDone)
 					ticker := time.NewTicker(heartbeatInterval)

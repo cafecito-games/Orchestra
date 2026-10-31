@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
@@ -249,6 +250,15 @@ func (service *Service) SpawnInstance(
 		instanceSnapshot := instance
 		allocationSnapshot := allocation
 		mutation.OnCommit(func() {
+			service.logger.Info(
+				"instance",
+				"spawned",
+				activitylog.String("instance", instanceSnapshot.ID),
+				activitylog.String("node", targetNodeID),
+				activitylog.String("harness", allocationSnapshot.HarnessID),
+				activitylog.String("model", allocationSnapshot.Model),
+				activitylog.String("thread", instanceSnapshot.ThreadID),
+			)
 			_ = service.sendToSlave(targetNodeID, protocol.MasterControlMessage{
 				Type:       "instance.provision",
 				Instance:   &instanceSnapshot,
@@ -479,6 +489,15 @@ func (service *Service) ReleaseInstance(
 		}
 		return nil
 	})
+	if err == nil && !result.Replayed {
+		service.logger.Info(
+			"instance",
+			"releasing",
+			activitylog.String("instance", result.Instance.ID),
+			activitylog.String("mode", mode),
+			activitylog.String("status", result.Instance.Status),
+		)
+	}
 	return result, err
 }
 
@@ -637,7 +656,18 @@ func (service *Service) handleInstanceReady(nodeID string, message protocol.Slav
 		service.syncInstanceMailboxInState(state, instance.ID, nowText)
 		service.enqueuePendingInstanceMailWakeInState(state, instance.ID, nowText)
 
+		instanceSnapshot := instance
+		allocationSnapshot := allocation
 		mutation.OnCommit(func() {
+			service.logger.Info(
+				"instance",
+				"ready",
+				activitylog.String("instance", instanceSnapshot.ID),
+				activitylog.String("node", nodeID),
+				activitylog.String("harness", allocationSnapshot.HarnessID),
+				activitylog.String("model", allocationSnapshot.Model),
+				activitylog.String("transport", allocationSnapshot.Transport),
+			)
 			service.TriggerSchedule()
 		})
 		return nil
@@ -686,7 +716,15 @@ func (service *Service) handleInstanceFailed(nodeID string, message protocol.Sla
 			}
 		}
 
+		instanceID := instance.ID
 		mutation.OnCommit(func() {
+			service.logger.Error(
+				"instance",
+				"failed",
+				activitylog.String("instance", instanceID),
+				activitylog.String("node", nodeID),
+				activitylog.String("error", failureReason),
+			)
 			service.TriggerSchedule()
 		})
 		return nil
@@ -732,7 +770,14 @@ func (service *Service) handleInstanceReleased(nodeID string, message protocol.S
 		}
 		service.syncInstanceMailboxInState(state, instance.ID, nowText)
 
+		instanceID := instance.ID
 		mutation.OnCommit(func() {
+			service.logger.Info(
+				"instance",
+				"released",
+				activitylog.String("instance", instanceID),
+				activitylog.String("node", nodeID),
+			)
 			service.TriggerSchedule()
 		})
 		return nil

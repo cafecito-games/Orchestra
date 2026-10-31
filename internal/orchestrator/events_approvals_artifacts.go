@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
@@ -67,9 +68,11 @@ func (service *Service) handleRunStarted(nodeID string, message protocol.SlaveCo
 			return nil
 		}
 		nowText := service.nowUTC()
+		transitionedToRunning := false
 		if runRecord.Status == "queued" {
 			runRecord.Status = "running"
 			runRecord.StartedAt = &nowText
+			transitionedToRunning = true
 		}
 		if message.Transport != nil && message.Transport.Validate() == nil {
 			selectionCopy := *message.Transport
@@ -81,6 +84,23 @@ func (service *Service) handleRunStarted(nodeID string, message protocol.SlaveCo
 			runRecord.ProviderSessionID = &sessionID
 		}
 		state.Runs[runRecord.ID] = runRecord
+		if transitionedToRunning {
+			runSnapshot := runRecord
+			mutation.OnCommit(func() {
+				sessionID := ""
+				if runSnapshot.ProviderSessionID != nil {
+					sessionID = *runSnapshot.ProviderSessionID
+				}
+				service.logger.Info(
+					"run",
+					"started",
+					activitylog.String("run", runSnapshot.ID),
+					activitylog.String("node", nodeID),
+					activitylog.String("transport", runSnapshot.Transport),
+					activitylog.String("session", sessionID),
+				)
+			})
+		}
 		return nil
 	})
 }
@@ -171,7 +191,28 @@ func (service *Service) handleRunCompleted(nodeID string, message protocol.Slave
 			}
 		}
 
+		runSnapshot := runRecord
 		mutation.OnCommit(func() {
+			taskID := ""
+			if runSnapshot.TaskID != nil {
+				taskID = *runSnapshot.TaskID
+			}
+			var runDuration time.Duration
+			if runSnapshot.StartedAt != nil && runSnapshot.FinishedAt != nil {
+				startedAt, parsedStart := protocol.ParseTimestamp(*runSnapshot.StartedAt)
+				finishedAt, parsedFinish := protocol.ParseTimestamp(*runSnapshot.FinishedAt)
+				if parsedStart && parsedFinish && finishedAt.After(startedAt) {
+					runDuration = finishedAt.Sub(startedAt)
+				}
+			}
+			service.logger.Info(
+				"run",
+				"completed",
+				activitylog.String("run", runSnapshot.ID),
+				activitylog.String("node", nodeID),
+				activitylog.String("task", taskID),
+				activitylog.Duration("duration", runDuration),
+			)
 			service.TriggerSchedule()
 		})
 		return nil
@@ -211,9 +252,11 @@ func (service *Service) handleRunFailed(nodeID string, message protocol.SlaveCon
 		service.settleRunApprovalsInState(state, runRecord.ID, "cancelled", nowText)
 		service.releaseInstanceAfterRunInState(state, runRecord.InstanceID, nowText)
 
+		willRetry := false
 		if runRecord.TaskID != nil {
 			if task, taskExists := state.Tasks[*runRecord.TaskID]; taskExists && !protocol.IsTerminalTaskStatus(task.Status) {
 				if retryEligible && task.AttemptCount < task.MaxAttempts {
+					willRetry = true
 					task.Status = "ready"
 					task.Assignment = nil
 					task.Summary = fmt.Sprintf("retrying after attempt %d failed: %s", task.AttemptCount, errorMessage)
@@ -229,7 +272,21 @@ func (service *Service) handleRunFailed(nodeID string, message protocol.SlaveCon
 			}
 		}
 
+		runSnapshot := runRecord
 		mutation.OnCommit(func() {
+			taskID := ""
+			if runSnapshot.TaskID != nil {
+				taskID = *runSnapshot.TaskID
+			}
+			service.logger.Error(
+				"run",
+				"failed",
+				activitylog.String("run", runSnapshot.ID),
+				activitylog.String("node", nodeID),
+				activitylog.String("task", taskID),
+				activitylog.Bool("retrying", willRetry),
+				activitylog.String("error", errorMessage),
+			)
 			service.TriggerSchedule()
 		})
 		return nil
@@ -246,6 +303,7 @@ func (service *Service) handleRunCancelled(nodeID string, message protocol.Slave
 			return nil
 		}
 		nowText := service.nowUTC()
+		transitioned := false
 		if !protocol.IsTerminalRunStatus(runRecord.Status) {
 			runRecord.Status = "cancelled"
 			runRecord.FinishedAt = &nowText
@@ -253,6 +311,7 @@ func (service *Service) handleRunCancelled(nodeID string, message protocol.Slave
 				runRecord.Output = protocol.TruncateUTF8Head(service.redactor.Redact(*message.Output), protocol.TextMaximumBytes)
 			}
 			state.Runs[runRecord.ID] = runRecord
+			transitioned = true
 		}
 		service.settleRunApprovalsInState(state, runRecord.ID, "cancelled", nowText)
 		service.releaseInstanceAfterRunInState(state, runRecord.InstanceID, nowText)
@@ -267,7 +326,21 @@ func (service *Service) handleRunCancelled(nodeID string, message protocol.Slave
 			}
 		}
 
+		runSnapshot := runRecord
 		mutation.OnCommit(func() {
+			if transitioned {
+				taskID := ""
+				if runSnapshot.TaskID != nil {
+					taskID = *runSnapshot.TaskID
+				}
+				service.logger.Warn(
+					"run",
+					"cancelled",
+					activitylog.String("run", runSnapshot.ID),
+					activitylog.String("node", nodeID),
+					activitylog.String("task", taskID),
+				)
+			}
 			service.TriggerSchedule()
 		})
 		return nil
@@ -370,10 +443,21 @@ func (service *Service) handleHarnessEvent(nodeID string, message protocol.Slave
 		transcript.LastSequence = event.Sequence
 		transcript.UpdatedAt = event.At
 
+		previousToolStatus := ""
+		if event.Type == "tool.call" {
+			for index := range activity.ToolCalls {
+				if activity.ToolCalls[index].ToolCallID == event.ToolCallID {
+					previousToolStatus = activity.ToolCalls[index].Status
+					break
+				}
+			}
+		}
+
 		projectHarnessEventIntoActivityAndTranscript(&activity, &transcript, event)
 		state.RunActivities[runRecord.ID] = activity
 		state.RunTranscripts[runRecord.ID] = transcript
 
+		approvalCreated := false
 		switch event.Type {
 		case "permission.requested":
 			node := state.Nodes[nodeID]
@@ -404,6 +488,7 @@ func (service *Service) handleHarnessEvent(nodeID string, message protocol.Slave
 					ExpiresAt:     expiresAt,
 					UpdatedAt:     event.At,
 				}
+				approvalCreated = true
 			}
 		case "permission.resolved":
 			if approval, found := state.Approvals[event.ApprovalID]; found {
@@ -417,6 +502,76 @@ func (service *Service) handleHarnessEvent(nodeID string, message protocol.Slave
 				state.Approvals[event.ApprovalID] = approval
 			}
 		}
+
+		runID := runRecord.ID
+		eventCopy := event
+		mutation.OnCommit(func() {
+			switch eventCopy.Type {
+			case "tool.call":
+				if previousToolStatus != eventCopy.Status {
+					service.logger.Info(
+						"tool",
+						eventCopy.Status,
+						activitylog.String("run", runID),
+						activitylog.String("node", nodeID),
+						activitylog.String("kind", eventCopy.Kind),
+						activitylog.String("title", eventCopy.Title),
+					)
+				}
+			case "plan.updated":
+				service.logger.Info(
+					"plan",
+					"updated",
+					activitylog.String("run", runID),
+					activitylog.String("node", nodeID),
+					activitylog.Int("steps", len(eventCopy.Entries)),
+				)
+			case "diff":
+				service.logger.Info(
+					"diff",
+					"modified",
+					activitylog.String("run", runID),
+					activitylog.String("node", nodeID),
+					activitylog.String("path", eventCopy.Path),
+				)
+			case "permission.requested":
+				if approvalCreated {
+					service.logger.Warn(
+						"approval",
+						"requested",
+						activitylog.String("approval", eventCopy.ApprovalID),
+						activitylog.String("run", runID),
+						activitylog.String("node", nodeID),
+						activitylog.String("title", eventCopy.Title),
+					)
+				}
+			case "warning":
+				service.logger.Warn(
+					"harness",
+					eventCopy.Message,
+					activitylog.String("run", runID),
+					activitylog.String("node", nodeID),
+					activitylog.String("code", eventCopy.Code),
+				)
+			case "usage":
+				var inputTokens int64
+				if eventCopy.InputTokens != nil {
+					inputTokens = *eventCopy.InputTokens
+				}
+				var outputTokens int64
+				if eventCopy.OutputTokens != nil {
+					outputTokens = *eventCopy.OutputTokens
+				}
+				service.logger.Debug(
+					"usage",
+					"reported",
+					activitylog.String("run", runID),
+					activitylog.String("node", nodeID),
+					activitylog.Int64("inputTokens", inputTokens),
+					activitylog.Int64("outputTokens", outputTokens),
+				)
+			}
+		})
 		return nil
 	})
 }
@@ -926,6 +1081,18 @@ func (service *Service) ResolveApproval(
 
 		state.Approvals[approval.ID] = approval
 		resolved = approval
+		approvalSnapshot := approval
+		mutation.OnCommit(func() {
+			service.logger.Info(
+				"approval",
+				"resolved",
+				activitylog.String("approval", approvalSnapshot.ID),
+				activitylog.String("run", approvalSnapshot.RunID),
+				activitylog.String("status", approvalSnapshot.Status),
+				activitylog.String("option", approvalSnapshot.SelectedOptionID),
+				activitylog.String("by", actor.Kind),
+			)
+		})
 		return nil
 	})
 	return resolved, err
@@ -1023,6 +1190,23 @@ func (service *Service) handleWorkspaceLeaseUpdate(nodeID string, message protoc
 	})
 
 	if confirmStatus != "" {
+		if confirmStatus == "failed" {
+			service.logger.Error(
+				"lease",
+				confirmStatus,
+				activitylog.String("lease", update.LeaseID),
+				activitylog.String("node", nodeID),
+				activitylog.String("detail", update.Detail),
+			)
+		} else {
+			service.logger.Info(
+				"lease",
+				confirmStatus,
+				activitylog.String("lease", update.LeaseID),
+				activitylog.String("node", nodeID),
+				activitylog.String("reason", update.RetentionReason),
+			)
+		}
 		_ = service.sendToSlave(nodeID, protocol.MasterControlMessage{
 			Type:    "workspace.lease.confirmed",
 			LeaseID: update.LeaseID,
@@ -1249,6 +1433,17 @@ func (service *Service) CompleteArtifactUpload(
 		updated = artifact
 		return nil
 	})
+	if err == nil {
+		service.logger.Info(
+			"artifact",
+			"uploaded",
+			activitylog.String("artifact", updated.ID),
+			activitylog.String("thread", updated.ThreadID),
+			activitylog.String("task", updated.TaskID),
+			activitylog.String("name", updated.Name),
+			activitylog.Int64("bytes", updated.SizeBytes),
+		)
+	}
 	return updated, err
 }
 

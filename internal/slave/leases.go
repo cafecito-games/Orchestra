@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/workspace"
 )
@@ -210,6 +211,13 @@ func (coordinator *leaseCoordinator) provisionForRun(
 		if detail == "" {
 			detail = fmt.Sprintf("workspace lease entered %s status", outcome.Status)
 		}
+		coordinator.client.activityLogger.Error(
+			"lease",
+			"failed",
+			activitylog.String("lease", grant.ID),
+			activitylog.String("run", run.ID),
+			activitylog.String("error", detail),
+		)
 		return nil, "", errors.New(detail)
 	}
 
@@ -225,6 +233,14 @@ func (coordinator *leaseCoordinator) provisionForRun(
 	if outcome.ResolvedBaseRevision != "" {
 		grant.ResolvedBaseRevision = outcome.ResolvedBaseRevision
 	}
+	coordinator.client.activityLogger.Info(
+		"lease",
+		"active",
+		activitylog.String("lease", grant.ID),
+		activitylog.String("run", run.ID),
+		activitylog.String("branch", grant.Branch),
+		activitylog.String("path", outcome.Path),
+	)
 	return &activeRunLease{
 		grant:         grant,
 		runID:         run.ID,
@@ -263,6 +279,13 @@ func (coordinator *leaseCoordinator) finishForRun(lease *activeRunLease) {
 		)
 		lease.grant.Status = lease.currentStatus
 	})
+	coordinator.client.activityLogger.Info(
+		"lease",
+		outcome.Status,
+		activitylog.String("lease", lease.grant.ID),
+		activitylog.String("run", lease.runID),
+		activitylog.String("reason", outcome.RetentionReason),
+	)
 	_ = coordinator.sendTransition(cleanupContext, lease.runID, &lease.currentStatus, outcome, lease.grant.ID, false)
 }
 

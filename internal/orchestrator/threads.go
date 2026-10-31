@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
@@ -117,6 +118,13 @@ func (service *Service) CreateThread(
 	if err != nil {
 		return protocol.Thread{}, nil, err
 	}
+	service.logger.Info(
+		"thread",
+		"created",
+		activitylog.String("thread", created.ID),
+		activitylog.String("title", created.Title),
+		activitylog.String("by", caller.SourceKey()),
+	)
 	return created, createdAttachment, nil
 }
 
@@ -315,6 +323,15 @@ func (service *Service) UpdateThread(caller CallerIdentity, input UpdateThreadIn
 		updated = thread
 		return nil
 	})
+	if err == nil && input.Status != nil {
+		service.logger.Info(
+			"thread",
+			"updated",
+			activitylog.String("thread", updated.ID),
+			activitylog.String("status", updated.Status),
+			activitylog.String("title", updated.Title),
+		)
+	}
 	return updated, err
 }
 
