@@ -211,10 +211,10 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 		return Configuration{}, fmt.Errorf("invalid node kind %q (expected one of %s)", configuration.Kind, strings.Join(protocol.NodeKinds, ", "))
 	}
 	if configuration.Concurrency <= 0 || configuration.Concurrency > 65535 {
-		return Configuration{}, fmt.Errorf("concurrency must be between 1 and 65535")
+		return Configuration{}, errors.New("concurrency must be between 1 and 65535")
 	}
 	if configuration.InstanceCapacity < 0 || configuration.InstanceCapacity > 65535 {
-		return Configuration{}, fmt.Errorf("instance-capacity must be between 0 and 65535")
+		return Configuration{}, errors.New("instance-capacity must be between 0 and 65535")
 	}
 
 	rawWorkspaceRoots := workspaceRootFlag.values
@@ -603,10 +603,10 @@ func parseACPAdapterOverrides(entries []string) ([]acpadapter.Override, error) {
 			return nil, fmt.Errorf("duplicate --acp-adapter for %s", harnessID)
 		}
 		seen[harnessID] = true
-		if !strings.HasPrefix(remainder, "sha256:") {
+		afterPrefix, ok := strings.CutPrefix(remainder, "sha256:")
+		if !ok {
 			return nil, fmt.Errorf("invalid --acp-adapter %q (missing sha256: prefix)", entry)
 		}
-		afterPrefix := strings.TrimPrefix(remainder, "sha256:")
 		digest, adapterPath, found := strings.Cut(afterPrefix, ":")
 		if !found || len(digest) != 64 || !filepath.IsAbs(adapterPath) {
 			return nil, fmt.Errorf("invalid --acp-adapter %q (expected sha256:<64-hex>:<absolute-path>)", entry)

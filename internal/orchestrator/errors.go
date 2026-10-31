@@ -68,9 +68,8 @@ func toHubRPCError(err error) *protocol.HubRPCError {
 	if err == nil {
 		return nil
 	}
-	var operationErr *OperationError
-	if errors.As(err, &operationErr) {
-		return operationErr.HubError()
+	if operationError, ok := errors.AsType[*OperationError](err); ok {
+		return operationError.HubError()
 	}
 	return &protocol.HubRPCError{
 		Code:    "internal_error",

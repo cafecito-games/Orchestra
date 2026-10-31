@@ -234,11 +234,12 @@ func AdvertiseACP(operationContext context.Context, profiles []protocol.HarnessP
 			continue
 		}
 		profile := advertised[index]
-		transports := []string{}
+		transports := make([]string, 0, 2)
 		if profile.Available {
 			transports = append(transports, TransportNative)
 		}
-		profile.Transports = append(transports, TransportACP)
+		transports = append(transports, TransportACP)
+		profile.Transports = transports
 		if !profile.Available {
 			profile.Description = "ACP adapter"
 			if capabilities.AdapterVersion != "" {

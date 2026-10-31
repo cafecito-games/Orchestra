@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"path"
 	"slices"
 	"strconv"
@@ -87,10 +88,10 @@ func (service *Service) scheduleReadyTasks() {
 				continue
 			}
 
-			effectiveReqs := mergeProjectProfileRequirements(state, task.Requirements)
+			effectiveRequirements := mergeProjectProfileRequirements(state, task.Requirements)
 
-			if resident, allocation, found := service.findReusableResident(state, task, effectiveReqs); found {
-				dispatchMessage := service.assignTaskToResident(state, &task, &resident, &allocation, effectiveReqs, nowText)
+			if resident, allocation, found := service.findReusableResident(state, task, effectiveRequirements); found {
+				dispatchMessage := service.assignTaskToResident(state, &task, &resident, &allocation, effectiveRequirements, nowText)
 				dispatches = append(dispatches, pendingDispatch{
 					nodeID:  allocation.NodeID,
 					message: dispatchMessage,
@@ -123,18 +124,18 @@ func (service *Service) scheduleReadyTasks() {
 				continue
 			}
 
-			if service.hasProvisioningCompatibleInstance(state, task.ThreadID, effectiveReqs, task.PlacementOverride) {
+			if service.hasProvisioningCompatibleInstance(state, task.ThreadID, effectiveRequirements, task.PlacementOverride) {
 				continue
 			}
 
-			selection, diagnostic := service.selectOfferingForRequirements(state, effectiveReqs, task.PlacementOverride, true)
+			selection, diagnostic := service.selectOfferingForRequirements(state, effectiveRequirements, task.PlacementOverride, true)
 			if selection == nil {
-				if drainedNodeID, drainedInstID, drainedAllocID, didDrain := service.evictIdleAutoManagedInstance(state, effectiveReqs, task.PlacementOverride, nowText); didDrain {
+				if drainedNodeID, drainedInstanceID, drainedAllocationID, didDrain := service.evictIdleAutoManagedInstance(state, effectiveRequirements, task.PlacementOverride, nowText); didDrain {
 					drains = append(drains, struct {
 						nodeID       string
 						instanceID   string
 						allocationID string
-					}{nodeID: drainedNodeID, instanceID: drainedInstID, allocationID: drainedAllocID})
+					}{nodeID: drainedNodeID, instanceID: drainedInstanceID, allocationID: drainedAllocationID})
 				}
 				task.PlacementDiagnostic = &diagnostic
 				state.Tasks[task.ID] = task
@@ -526,7 +527,7 @@ func (service *Service) selectOfferingForRequirements(
 	override *protocol.PlacementOverride,
 	requireInstanceSlot bool,
 ) (*matchedOffering, protocol.PlacementDiagnostic) {
-	effectiveReqs := mergeProjectProfileRequirements(state, requirements)
+	effectiveRequirements := mergeProjectProfileRequirements(state, requirements)
 	nowText := service.nowUTC()
 	diagnostic := protocol.PlacementDiagnostic{
 		EvaluatedAt:     nowText,
@@ -576,7 +577,7 @@ func (service *Service) selectOfferingForRequirements(
 		}
 
 		report := state.CapabilityReports[nodeID]
-		if capFailure := checkNodeCapabilities(node, report, effectiveReqs); capFailure != "" {
+		if capFailure := checkNodeCapabilities(node, report, effectiveRequirements); capFailure != "" {
 			diagnostic.Unsatisfied = append(diagnostic.Unsatisfied, protocol.UnsatisfiedRequirement{
 				Kind:        "capability",
 				Requirement: capFailure,
@@ -586,7 +587,7 @@ func (service *Service) selectOfferingForRequirements(
 			continue
 		}
 
-		workspaceRoot, workspacePath, workspaceOK := resolveWorkspaceOnNode(node, effectiveReqs)
+		workspaceRoot, workspacePath, workspaceOK := resolveWorkspaceOnNode(node, effectiveRequirements)
 		if !workspaceOK {
 			diagnostic.Unsatisfied = append(diagnostic.Unsatisfied, protocol.UnsatisfiedRequirement{
 				Kind:        "workspace",
@@ -602,16 +603,16 @@ func (service *Service) selectOfferingForRequirements(
 			if !harnessProfile.Available {
 				continue
 			}
-			if len(effectiveReqs.HarnessIDs) > 0 && !slices.Contains(effectiveReqs.HarnessIDs, harnessProfile.ID) {
+			if len(effectiveRequirements.HarnessIDs) > 0 && !slices.Contains(effectiveRequirements.HarnessIDs, harnessProfile.ID) {
 				continue
 			}
 
-			selectedModel := chooseModel(harnessProfile, effectiveReqs)
-			if selectedModel == "" && len(effectiveReqs.Models) > 0 {
+			selectedModel := chooseModel(harnessProfile, effectiveRequirements)
+			if selectedModel == "" && len(effectiveRequirements.Models) > 0 {
 				continue
 			}
 
-			selectedTransport := chooseTransport(harnessProfile, effectiveReqs)
+			selectedTransport := chooseTransport(harnessProfile, effectiveRequirements)
 			if selectedTransport == "" {
 				continue
 			}
@@ -624,7 +625,7 @@ func (service *Service) selectOfferingForRequirements(
 				transport:     selectedTransport,
 				workspaceRoot: workspaceRoot,
 				workspacePath: workspacePath,
-				preferenceHit: scorePreferences(node, report, harnessProfile.ID, selectedModel, effectiveReqs.Preferences),
+				preferenceHit: scorePreferences(node, report, harnessProfile.ID, selectedModel, effectiveRequirements.Preferences),
 				activeRuns:    activeRuns,
 			})
 		}
@@ -772,9 +773,7 @@ func mergeProjectProfileRequirements(
 	}
 	if merged.Toolchains == nil && len(profile.Requirements.Toolchains) > 0 {
 		merged.Toolchains = map[string]string{}
-		for key, value := range profile.Requirements.Toolchains {
-			merged.Toolchains[key] = value
-		}
+		maps.Copy(merged.Toolchains, profile.Requirements.Toolchains)
 	}
 	if merged.Workspace == nil && (profile.Repository != nil || profile.WorkspacePolicy.Isolation != "") {
 		merged.Workspace = &protocol.WorkspaceRequirements{}
@@ -1018,36 +1017,38 @@ func buildWorkspaceLease(
 func composeTaskPrompt(state *store.State, task protocol.Task) string {
 	var builder strings.Builder
 	if thread, exists := state.Threads[task.ThreadID]; exists {
-		builder.WriteString(fmt.Sprintf("Thread: %s (%s)\n", thread.Title, thread.ID))
+		fmt.Fprintf(&builder, "Thread: %s (%s)\n", thread.Title, thread.ID)
 		if thread.Summary != "" {
 			builder.WriteString("Thread Summary: " + thread.Summary + "\n")
 		}
 	}
-	builder.WriteString(fmt.Sprintf("Task: %s (%s)\n", task.Title, task.ID))
+	fmt.Fprintf(&builder, "Task: %s (%s)\n", task.Title, task.ID)
 	if len(task.Dependencies) > 0 {
 		builder.WriteString("\nCompleted Dependencies:\n")
 		for _, dependency := range task.Dependencies {
-			if depTask, exists := state.Tasks[dependency.TaskID]; exists {
-				builder.WriteString(fmt.Sprintf("- %s [%s]: %s\n", depTask.Title, depTask.Status, depTask.Summary))
+			if dependencyTask, exists := state.Tasks[dependency.TaskID]; exists {
+				fmt.Fprintf(&builder, "- %s [%s]: %s\n", dependencyTask.Title, dependencyTask.Status, dependencyTask.Summary)
 			}
 		}
 	}
 	roomHead := state.RoomHeads[task.ThreadID]
 	hasUnreadNudge := task.RequiredRoomSequence > task.LastReadRoomSequence
 	if roomHead.HeadSequence > 0 || hasUnreadNudge {
-		builder.WriteString(fmt.Sprintf(
+		fmt.Fprintf(
+			&builder,
 			"\nThread Room: headSequence=%d, lastReadSequence=%d, requiredSequence=%d, unreadNudge=%t\n",
 			roomHead.HeadSequence,
 			task.LastReadRoomSequence,
 			task.RequiredRoomSequence,
 			hasUnreadNudge,
-		))
+		)
 		builder.WriteString("Use `read_room` to inspect shared thread findings, contracts, decisions, gotchas, and guidance, and `post_room_message` to publish discoveries for sibling tasks.\n")
 		if hasUnreadNudge {
-			builder.WriteString(fmt.Sprintf(
+			fmt.Fprintf(
+				&builder,
 				"Action Required: Unread room nudge through sequence %d. Call `read_room` before finalizing, reconcile your work if needed, and then complete the task.\n",
 				task.RequiredRoomSequence,
-			))
+			)
 		}
 	}
 	if task.LastRunOutput != "" && (hasUnreadNudge || task.NudgedAtRoomSequence > 0) {

@@ -639,8 +639,8 @@ type ProjectProfile struct {
 	ID              string                 `json:"id"`
 	Name            string                 `json:"name"`
 	Repository      *ProjectRepository     `json:"repository,omitempty"`
-	WorkspacePolicy ProjectWorkspacePolicy `json:"workspacePolicy,omitempty"`
-	Requirements    ExecutionRequirements  `json:"requirements,omitempty"`
+	WorkspacePolicy ProjectWorkspacePolicy `json:"workspacePolicy"`
+	Requirements    ExecutionRequirements  `json:"requirements"`
 }
 
 type EventCursorPayload struct {
@@ -672,10 +672,10 @@ func EncodeEventCursor(threadID, readerKey string, sequence int64) (string, erro
 }
 
 func DecodeEventCursor(cursor string, expectedThreadID, expectedReaderKey string) (int64, error) {
-	if !strings.HasPrefix(cursor, cursorPrefix) {
+	remainder, ok := strings.CutPrefix(cursor, cursorPrefix)
+	if !ok {
 		return 0, errors.New("event cursor has an invalid prefix")
 	}
-	remainder := strings.TrimPrefix(cursor, cursorPrefix)
 	encodedPayload, providedChecksum, found := strings.Cut(remainder, ".")
 	if !found || encodedPayload == "" || providedChecksum == "" {
 		return 0, errors.New("event cursor is malformed")

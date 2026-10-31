@@ -93,10 +93,10 @@ func ParseStatus(output []byte) (StatusSummary, error) {
 			return StatusSummary{}, errMalformedInventory
 		}
 		code := entry[:2]
-		switch {
-		case code == "??":
+		switch code {
+		case "??":
 			summary.Untracked++
-		case code == "!!":
+		case "!!":
 			summary.Ignored++
 		default:
 			summary.Modified++

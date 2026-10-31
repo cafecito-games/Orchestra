@@ -64,8 +64,8 @@ func objectAt(parent map[string]any, name string) (map[string]any, error) {
 func environmentValue(environment []string, name string) string {
 	prefix := name + "="
 	for _, entry := range environment {
-		if strings.HasPrefix(entry, prefix) {
-			return strings.TrimPrefix(entry, prefix)
+		if after, ok := strings.CutPrefix(entry, prefix); ok {
+			return after
 		}
 	}
 	return ""

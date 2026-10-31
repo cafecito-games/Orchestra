@@ -1,7 +1,6 @@
 package harness
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -52,7 +51,7 @@ func TestClaudeACPAuthGateAndNativeExecution(t *testing.T) {
 
 	var providerSession string
 	var startedSelection protocol.RunTransportSelection
-	result, err := runner.Execute(context.Background(), Invocation{
+	result, err := runner.Execute(t.Context(), Invocation{
 		Run: protocol.Run{
 			ID:        "run-1",
 			HarnessID: "claude-cli",
@@ -122,11 +121,9 @@ printf '{"type":"step_finish","sessionID":"%s","part":{"type":"step-finish","rea
 	var mutex sync.Mutex
 	var waitGroup sync.WaitGroup
 	for index, model := range models {
-		waitGroup.Add(1)
-		go func() {
-			defer waitGroup.Done()
+		waitGroup.Go(func() {
 			var session string
-			answer, err := runner.Execute(context.Background(), Invocation{
+			answer, err := runner.Execute(t.Context(), Invocation{
 				Run: protocol.Run{
 					ID:        "run-" + string(rune('1'+index)),
 					HarnessID: protocol.HarnessOpenCodeCLI,
@@ -143,7 +140,7 @@ printf '{"type":"step_finish","sessionID":"%s","part":{"type":"step-finish","rea
 			mutex.Lock()
 			outcomes[model] = outcome{answer: answer, session: session, err: err}
 			mutex.Unlock()
-		}()
+		})
 	}
 	waitGroup.Wait()
 
@@ -242,7 +239,7 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"agy-conv-777","sta
 
 	var streamed strings.Builder
 	var providerSession string
-	result, err := runner.Execute(context.Background(), Invocation{
+	result, err := runner.Execute(t.Context(), Invocation{
 		Run: protocol.Run{
 			ID:        "run-agy-1",
 			HarnessID: protocol.HarnessAntigravityCLI,
@@ -424,7 +421,7 @@ func TestAdmitResume_TransportIsolationAndNoCrossTransportFallback(t *testing.T)
 		Transports: []string{TransportACP},
 	}})
 	require.Error(t, acpOnlyRunner.AdmitResume(protocol.HarnessClaudeCLI, TransportNative))
-	_, acpOnlyNativeErr := acpOnlyRunner.Execute(context.Background(), Invocation{
+	_, acpOnlyNativeErr := acpOnlyRunner.Execute(t.Context(), Invocation{
 		Run: protocol.Run{
 			ID:        "run-native-disallowed",
 			HarnessID: protocol.HarnessClaudeCLI,
@@ -436,7 +433,7 @@ func TestAdmitResume_TransportIsolationAndNoCrossTransportFallback(t *testing.T)
 	})
 	require.Error(t, acpOnlyNativeErr)
 
-	_, err := runner.Execute(context.Background(), Invocation{
+	_, err := runner.Execute(t.Context(), Invocation{
 		Run: protocol.Run{
 			ID:        "run-acp-resume",
 			HarnessID: protocol.HarnessClaudeCLI,

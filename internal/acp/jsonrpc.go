@@ -81,8 +81,8 @@ type pendingCall struct {
 }
 
 type inboundHandler interface {
-	handleNotification(method string, params json.RawMessage) error
-	handleRequest(requestContext context.Context, method string, params json.RawMessage) (any, *ResponseError)
+	handleNotification(method string, parameters json.RawMessage) error
+	handleRequest(requestContext context.Context, method string, parameters json.RawMessage) (any, *ResponseError)
 }
 
 type connection struct {
@@ -235,11 +235,11 @@ func (peer *connection) enqueue(operationContext context.Context, message any) e
 	}
 }
 
-func (peer *connection) call(operationContext context.Context, method string, params any, result any) error {
-	return peer.callSettled(operationContext, method, params, result, nil)
+func (peer *connection) call(operationContext context.Context, method string, parameters any, result any) error {
+	return peer.callSettled(operationContext, method, parameters, result, nil)
 }
 
-func (peer *connection) callSettled(operationContext context.Context, method string, params any, result any, settled func()) error {
+func (peer *connection) callSettled(operationContext context.Context, method string, parameters any, result any, settled func()) error {
 	peer.mutex.Lock()
 	if peer.failure != nil {
 		failure := peer.failure
@@ -256,7 +256,7 @@ func (peer *connection) callSettled(operationContext context.Context, method str
 	peer.pending[id] = call
 	peer.mutex.Unlock()
 
-	if err := peer.enqueue(operationContext, outboundRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}); err != nil {
+	if err := peer.enqueue(operationContext, outboundRequest{JSONRPC: "2.0", ID: id, Method: method, Params: parameters}); err != nil {
 		return err
 	}
 	select {
@@ -280,8 +280,8 @@ func (peer *connection) callSettled(operationContext context.Context, method str
 	}
 }
 
-func (peer *connection) notify(operationContext context.Context, method string, params any) error {
-	return peer.enqueue(operationContext, outboundNotification{JSONRPC: "2.0", Method: method, Params: params})
+func (peer *connection) notify(operationContext context.Context, method string, parameters any) error {
+	return peer.enqueue(operationContext, outboundNotification{JSONRPC: "2.0", Method: method, Params: parameters})
 }
 
 func (peer *connection) dispatch(frame []byte) error {
@@ -342,12 +342,12 @@ func (peer *connection) dispatchResponse(message envelope) error {
 	return nil
 }
 
-func (peer *connection) dispatchNotification(method string, params json.RawMessage) error {
+func (peer *connection) dispatchNotification(method string, parameters json.RawMessage) error {
 	if method == cancelRequestMethod {
 		var cancellation struct {
 			RequestID json.RawMessage `json:"requestId"`
 		}
-		if json.Unmarshal(params, &cancellation) == nil && cancellation.RequestID != nil {
+		if json.Unmarshal(parameters, &cancellation) == nil && cancellation.RequestID != nil {
 			peer.mutex.Lock()
 			cancel := peer.inboundCancels[string(bytes.TrimSpace(cancellation.RequestID))]
 			peer.mutex.Unlock()
@@ -357,10 +357,10 @@ func (peer *connection) dispatchNotification(method string, params json.RawMessa
 		}
 		return nil
 	}
-	return peer.handler.handleNotification(method, params)
+	return peer.handler.handleNotification(method, parameters)
 }
 
-func (peer *connection) dispatchRequest(rawID json.RawMessage, method string, params json.RawMessage) error {
+func (peer *connection) dispatchRequest(rawID json.RawMessage, method string, parameters json.RawMessage) error {
 	id := bytes.TrimSpace(rawID)
 	if !isRequestIdentifier(id) {
 		return errors.New("request id must be a string or an integer")
@@ -377,20 +377,18 @@ func (peer *connection) dispatchRequest(rawID json.RawMessage, method string, pa
 	}
 	requestContext, cancel := context.WithCancel(peer.baseContext)
 	peer.inboundCancels[key] = cancel
-	peer.requests.Add(1)
 	peer.mutex.Unlock()
 
-	go func() {
-		defer peer.requests.Done()
+	peer.requests.Go(func() {
 		defer func() {
 			peer.mutex.Lock()
 			delete(peer.inboundCancels, key)
 			peer.mutex.Unlock()
 			cancel()
 		}()
-		result, responseError := peer.handler.handleRequest(requestContext, method, params)
+		result, responseError := peer.handler.handleRequest(requestContext, method, parameters)
 		_ = peer.respond(id, result, responseError)
-	}()
+	})
 	return nil
 }
 

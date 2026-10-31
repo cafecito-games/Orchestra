@@ -5,6 +5,7 @@ package antigravityacp
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -524,10 +525,7 @@ func (bridge *server) handleSessionPrompt(operationContext context.Context, requ
 		bridge.runtimeMutex.Unlock()
 	}()
 
-	workingDirectory := session.WorkingDirectory
-	if workingDirectory == "" {
-		workingDirectory = bridge.workingDirectory
-	}
+	workingDirectory := cmp.Or(session.WorkingDirectory, bridge.workingDirectory)
 
 	outcome, turnErr := executeTurn(
 		operationContext,
@@ -776,10 +774,7 @@ func (bridge *server) postMCPMessage(
 	}
 	defer httpResponse.Body.Close()
 
-	returnedSessionID := httpResponse.Header.Get("Mcp-Session-Id")
-	if returnedSessionID == "" {
-		returnedSessionID = mcpSessionID
-	}
+	returnedSessionID := cmp.Or(httpResponse.Header.Get("Mcp-Session-Id"), mcpSessionID)
 	responseBody, _ := io.ReadAll(io.LimitReader(httpResponse.Body, 1<<20))
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
 		return returnedSessionID, fmt.Errorf("MCP HTTP status %d", httpResponse.StatusCode)
@@ -943,15 +938,15 @@ func (bridge *server) respondError(requestID json.RawMessage, code int, message 
 	})
 }
 
-func (bridge *server) sendNotification(method string, params any) error {
-	encodedParams, err := json.Marshal(params)
+func (bridge *server) sendNotification(method string, parameters any) error {
+	encodedParameters, err := json.Marshal(parameters)
 	if err != nil {
 		return err
 	}
 	return bridge.writeFrame(jsonRPCFrame{
 		JSONRPC: "2.0",
 		Method:  method,
-		Params:  encodedParams,
+		Params:  encodedParameters,
 	})
 }
 

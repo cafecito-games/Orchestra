@@ -7,9 +7,11 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cafecito-games/Orchestra/internal/acp"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,7 +32,7 @@ func TestACPClientPromptPermissionsAndResume(t *testing.T) {
 			eventsMutex.Unlock()
 		},
 		Permission: func(requestContext context.Context, request acp.PermissionRequest) (acp.PermissionDecision, error) {
-			require.Equal(t, "Execute tool", request.Title)
+			assert.Equal(t, "Execute tool", request.Title)
 			return acp.PermissionDecision{OptionID: "allow-1"}, nil
 		},
 	})
@@ -224,4 +226,232 @@ func TestStderrTailRedaction(t *testing.T) {
 	output := tail.String()
 	require.NotContains(t, output, secret)
 	require.Contains(t, output, "[redacted]")
+}
+
+func TestClientRejectsAdapterVersionMismatch(t *testing.T) {
+	clientReader, adapterWriter := io.Pipe()
+	adapterReader, clientWriter := io.Pipe()
+
+	client := acp.NewClient(clientReader, clientWriter, acp.Options{
+		RunID:                "run-1",
+		ExpectedAgentVersion: "2.0.0",
+	})
+
+	go func() {
+		defer adapterWriter.Close()
+		scanner := bufio.NewScanner(adapterReader)
+		for scanner.Scan() {
+			var frame struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &frame) != nil {
+				return
+			}
+			if frame.Method == "initialize" {
+				encoded, _ := json.Marshal(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      frame.ID,
+					"result": map[string]any{
+						"protocolVersion": 1,
+						"agentInfo": map[string]any{
+							"name":    "claude-acp",
+							"version": "1.0.0",
+						},
+					},
+				})
+				_, _ = adapterWriter.Write(append(encoded, '\n'))
+			}
+		}
+	}()
+
+	_, err := client.Run(t.Context(), acp.SessionRequest{
+		WorkingDirectory: t.TempDir(),
+		Prompt:           "hello",
+	})
+	require.ErrorIs(t, err, acp.ErrAdapterVersionMismatch)
+	client.Close()
+	client.Wait()
+}
+
+func TestClientRejectsMissingHTTPCapabilityWhenMCPServerRequested(t *testing.T) {
+	clientReader, adapterWriter := io.Pipe()
+	adapterReader, clientWriter := io.Pipe()
+
+	client := acp.NewClient(clientReader, clientWriter, acp.Options{
+		RunID: "run-1",
+	})
+
+	go func() {
+		defer adapterWriter.Close()
+		scanner := bufio.NewScanner(adapterReader)
+		for scanner.Scan() {
+			var frame struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &frame) != nil {
+				return
+			}
+			if frame.Method == "initialize" {
+				encoded, _ := json.Marshal(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      frame.ID,
+					"result": map[string]any{
+						"protocolVersion": 1,
+						"agentCapabilities": map[string]any{
+							"mcpCapabilities": map[string]any{
+								"http": false,
+							},
+						},
+					},
+				})
+				_, _ = adapterWriter.Write(append(encoded, '\n'))
+			}
+		}
+	}()
+
+	_, err := client.Run(t.Context(), acp.SessionRequest{
+		WorkingDirectory: t.TempDir(),
+		Prompt:           "hello",
+		MCPServer: &acp.MCPServer{
+			Name: "test-hub",
+			URL:  "http://localhost:8080",
+		},
+	})
+	require.ErrorIs(t, err, acp.ErrMissingCapability)
+	client.Close()
+	client.Wait()
+}
+
+func TestClientConfigurationSelectionRejection(t *testing.T) {
+	testCases := []struct {
+		name        string
+		requirement acp.ConfigurationRequirement
+		expectedErr error
+	}{
+		{
+			name:        "policy requirement returns missing capability",
+			requirement: acp.ConfigurationPolicy,
+			expectedErr: acp.ErrMissingCapability,
+		},
+		{
+			name:        "requested requirement returns configuration rejected",
+			requirement: acp.ConfigurationRequested,
+			expectedErr: acp.ErrConfigurationRejected,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			clientReader, adapterWriter := io.Pipe()
+			adapterReader, clientWriter := io.Pipe()
+
+			client := acp.NewClient(clientReader, clientWriter, acp.Options{
+				RunID: "run-config",
+			})
+
+			go func() {
+				defer adapterWriter.Close()
+				scanner := bufio.NewScanner(adapterReader)
+				for scanner.Scan() {
+					var frame struct {
+						ID     json.RawMessage `json:"id"`
+						Method string          `json:"method"`
+					}
+					if json.Unmarshal(scanner.Bytes(), &frame) != nil {
+						return
+					}
+					switch frame.Method {
+					case "initialize":
+						encoded, _ := json.Marshal(map[string]any{
+							"jsonrpc": "2.0",
+							"id":      frame.ID,
+							"result": map[string]any{
+								"protocolVersion": 1,
+							},
+						})
+						_, _ = adapterWriter.Write(append(encoded, '\n'))
+					case "session/new":
+						encoded, _ := json.Marshal(map[string]any{
+							"jsonrpc": "2.0",
+							"id":      frame.ID,
+							"result": map[string]any{
+								"sessionId":     "session-1",
+								"configOptions": []any{},
+							},
+						})
+						_, _ = adapterWriter.Write(append(encoded, '\n'))
+					}
+				}
+			}()
+
+			_, err := client.Run(t.Context(), acp.SessionRequest{
+				WorkingDirectory: t.TempDir(),
+				Prompt:           "hello",
+				Configuration: []acp.ConfigurationSelection{
+					{ID: "unknown_option", Value: "val", Requirement: testCase.requirement},
+				},
+			})
+			require.ErrorIs(t, err, testCase.expectedErr)
+			client.Close()
+			client.Wait()
+		})
+	}
+}
+
+func TestClientPromptCancelGraceExpired(t *testing.T) {
+	clientReader, adapterWriter := io.Pipe()
+	adapterReader, clientWriter := io.Pipe()
+
+	client := acp.NewClient(clientReader, clientWriter, acp.Options{
+		RunID:             "run-cancel",
+		CancelGracePeriod: 25 * time.Millisecond,
+	})
+
+	operationContext, cancel := context.WithCancel(t.Context())
+
+	go func() {
+		defer adapterWriter.Close()
+		scanner := bufio.NewScanner(adapterReader)
+		for scanner.Scan() {
+			var frame struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &frame) != nil {
+				return
+			}
+			switch frame.Method {
+			case "initialize":
+				encoded, _ := json.Marshal(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      frame.ID,
+					"result": map[string]any{
+						"protocolVersion": 1,
+					},
+				})
+				_, _ = adapterWriter.Write(append(encoded, '\n'))
+			case "session/new":
+				encoded, _ := json.Marshal(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      frame.ID,
+					"result": map[string]any{
+						"sessionId": "session-1",
+					},
+				})
+				_, _ = adapterWriter.Write(append(encoded, '\n'))
+			case "session/prompt":
+				cancel()
+			}
+		}
+	}()
+
+	_, err := client.Run(operationContext, acp.SessionRequest{
+		WorkingDirectory: t.TempDir(),
+		Prompt:           "run long task",
+	})
+	require.ErrorIs(t, err, acp.ErrCancelGraceExpired)
+	client.Close()
+	client.Wait()
 }

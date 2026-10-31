@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cafecito-games/Orchestra/internal/protocol"
@@ -81,7 +82,7 @@ func TestStoreWALDurabilityRollbackEventPruningAndArtifactBlobs(t *testing.T) {
 	case published := <-subscriberChannel:
 		require.Len(t, published, 3)
 	case <-time.After(time.Second):
-		t.Fatal("expected subscriber event broadcast")
+		require.FailNow(t, "expected subscriber event broadcast")
 	}
 
 	_, err = openedStore.Mutate(func(state *State, mutation *Mutation) error {
@@ -184,9 +185,8 @@ func TestStoreRoomSQLiteDurabilityJSONLMirrorConcurrencyAndStartupReconciliation
 	const writerCount = 12
 	var waitGroup sync.WaitGroup
 	for writerIndex := range writerCount {
-		waitGroup.Add(1)
-		go func(index int) {
-			defer waitGroup.Done()
+		index := writerIndex
+		waitGroup.Go(func() {
 			_, mutateErr := openedStore.Mutate(func(state *State, mutation *Mutation) error {
 				head := state.RoomHeads[threadID]
 				nextSequence := head.HeadSequence + 1
@@ -210,8 +210,8 @@ func TestStoreRoomSQLiteDurabilityJSONLMirrorConcurrencyAndStartupReconciliation
 				})
 				return nil
 			})
-			require.NoError(t, mutateErr)
-		}(writerIndex)
+			assert.NoError(t, mutateErr)
+		})
 	}
 	waitGroup.Wait()
 
@@ -453,4 +453,274 @@ func TestStoreMailboxesMessagesAndReceiptsDurability(t *testing.T) {
 		require.Equal(t, "mail-1", receipt.MessageID)
 		return nil
 	}))
+}
+
+func TestStoreMutationRollbackIntegrity(t *testing.T) {
+	dataDirectory := t.TempDir()
+	openedStore, err := Open(dataDirectory)
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	initialTimestamp := "2026-10-31T12:00:00Z"
+	_, err = openedStore.Mutate(func(state *State, mutation *Mutation) error {
+		state.Threads["thread-initial"] = protocol.Thread{
+			ID:        "thread-initial",
+			Title:     "Initial Thread Title",
+			Status:    "open",
+			CreatedAt: initialTimestamp,
+			UpdatedAt: initialTimestamp,
+		}
+		state.Tasks["task-initial"] = protocol.Task{
+			ID:        "task-initial",
+			ThreadID:  "thread-initial",
+			Title:     "Initial Task",
+			Status:    "ready",
+			CreatedAt: initialTimestamp,
+			UpdatedAt: initialTimestamp,
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	commitCallbackInvoked := false
+	simulatedError := errors.New("simulated mutator failure")
+
+	_, err = openedStore.Mutate(func(state *State, mutation *Mutation) error {
+		state.Threads["thread-initial"] = protocol.Thread{
+			ID:        "thread-initial",
+			Title:     "Corrupted Thread Title",
+			Status:    "closed",
+			CreatedAt: initialTimestamp,
+			UpdatedAt: initialTimestamp,
+		}
+		delete(state.Tasks, "task-initial")
+		state.Tasks["task-corrupted"] = protocol.Task{
+			ID:        "task-corrupted",
+			ThreadID:  "thread-initial",
+			Title:     "Should Not Exist",
+			Status:    "running",
+			CreatedAt: initialTimestamp,
+			UpdatedAt: initialTimestamp,
+		}
+		mutation.OnCommit(func() {
+			commitCallbackInvoked = true
+		})
+		return simulatedError
+	})
+	require.ErrorIs(t, err, simulatedError)
+	assert.False(t, commitCallbackInvoked, "mutation.OnCommit callback must not be invoked on failure")
+
+	require.NoError(t, openedStore.Read(func(state *State) error {
+		thread, threadFound := state.Threads["thread-initial"]
+		assert.True(t, threadFound)
+		assert.Equal(t, "Initial Thread Title", thread.Title)
+		assert.Equal(t, "open", thread.Status)
+
+		task, taskFound := state.Tasks["task-initial"]
+		assert.True(t, taskFound)
+		assert.Equal(t, "Initial Task", task.Title)
+
+		_, corruptedFound := state.Tasks["task-corrupted"]
+		assert.False(t, corruptedFound)
+		return nil
+	}))
+
+	require.NoError(t, openedStore.Close())
+
+	reopenedStore, err := Open(dataDirectory)
+	require.NoError(t, err)
+	defer reopenedStore.Close()
+
+	require.NoError(t, reopenedStore.Read(func(state *State) error {
+		thread, threadFound := state.Threads["thread-initial"]
+		assert.True(t, threadFound)
+		assert.Equal(t, "Initial Thread Title", thread.Title)
+
+		task, taskFound := state.Tasks["task-initial"]
+		assert.True(t, taskFound)
+		assert.Equal(t, "Initial Task", task.Title)
+
+		_, corruptedFound := state.Tasks["task-corrupted"]
+		assert.False(t, corruptedFound)
+		return nil
+	}))
+}
+
+func TestStoreEntityDeletionPersistence(t *testing.T) {
+	dataDirectory := t.TempDir()
+	openedStore, err := Open(dataDirectory)
+	require.NoError(t, err)
+
+	timestamp := "2026-10-31T12:00:00Z"
+	taskID := "task-to-delete"
+	runID := "run-to-delete"
+	leaseID := "lease-to-delete"
+
+	_, err = openedStore.Mutate(func(state *State, mutation *Mutation) error {
+		state.Threads["thread-1"] = protocol.Thread{
+			ID:        "thread-1",
+			Title:     "Thread",
+			Status:    "open",
+			CreatedAt: timestamp,
+			UpdatedAt: timestamp,
+		}
+		state.Tasks[taskID] = protocol.Task{
+			ID:        taskID,
+			ThreadID:  "thread-1",
+			Title:     "Task To Delete",
+			Status:    "ready",
+			CreatedAt: timestamp,
+			UpdatedAt: timestamp,
+		}
+		state.Runs[runID] = protocol.Run{
+			ID:        runID,
+			TaskID:    &taskID,
+			ThreadID:  "thread-1",
+			Status:    "running",
+			NodeID:    "node-1",
+			HarnessID: "harness-1",
+			CreatedAt: timestamp,
+		}
+		state.WorkspaceLeases[leaseID] = protocol.WorkspaceLease{
+			ID:           leaseID,
+			ThreadID:     "thread-1",
+			TaskID:       taskID,
+			RunID:        runID,
+			NodeID:       "node-1",
+			Status:       "active",
+			Root:         "/workspaces/project",
+			WorktreePath: "/workspaces/project/worktree",
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, openedStore.Read(func(state *State) error {
+		_, taskExists := state.Tasks[taskID]
+		assert.True(t, taskExists)
+		_, runExists := state.Runs[runID]
+		assert.True(t, runExists)
+		_, leaseExists := state.WorkspaceLeases[leaseID]
+		assert.True(t, leaseExists)
+		return nil
+	}))
+
+	_, err = openedStore.Mutate(func(state *State, mutation *Mutation) error {
+		delete(state.Tasks, taskID)
+		delete(state.Runs, runID)
+		delete(state.WorkspaceLeases, leaseID)
+		return nil
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, openedStore.Read(func(state *State) error {
+		_, taskExists := state.Tasks[taskID]
+		assert.False(t, taskExists)
+		_, runExists := state.Runs[runID]
+		assert.False(t, runExists)
+		_, leaseExists := state.WorkspaceLeases[leaseID]
+		assert.False(t, leaseExists)
+		return nil
+	}))
+
+	require.NoError(t, openedStore.Close())
+
+	reopenedStore, err := Open(dataDirectory)
+	require.NoError(t, err)
+	defer reopenedStore.Close()
+
+	require.NoError(t, reopenedStore.Read(func(state *State) error {
+		_, taskExists := state.Tasks[taskID]
+		assert.False(t, taskExists, "deleted task must not reappear after reopen")
+		_, runExists := state.Runs[runID]
+		assert.False(t, runExists, "deleted run must not reappear after reopen")
+		_, leaseExists := state.WorkspaceLeases[leaseID]
+		assert.False(t, leaseExists, "deleted workspace lease must not reappear after reopen")
+		return nil
+	}))
+}
+
+func TestStorePaginationAndSubscriberBackpressure(t *testing.T) {
+	dataDirectory := t.TempDir()
+	openedStore, err := Open(dataDirectory)
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	threadID := "thread-pagination-1"
+	timestamp := "2026-10-31T12:00:00Z"
+
+	_, err = openedStore.Mutate(func(state *State, mutation *Mutation) error {
+		state.Threads[threadID] = protocol.Thread{
+			ID:        threadID,
+			Title:     "Pagination Thread",
+			Status:    "open",
+			CreatedAt: timestamp,
+			UpdatedAt: timestamp,
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	_, err = openedStore.Mutate(func(state *State, mutation *Mutation) error {
+		for eventIndex := 1; eventIndex <= 20; eventIndex++ {
+			mutation.EmitEvent(protocol.TaskEventEntry{
+				ThreadID:   threadID,
+				Type:       "progress.tick",
+				Summary:    fmt.Sprintf("Event %d", eventIndex),
+				OccurredAt: timestamp,
+			})
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	firstPage, hasMore, err := openedStore.ReadThreadEvents(threadID, 1, 5)
+	require.NoError(t, err)
+	assert.True(t, hasMore)
+	require.Len(t, firstPage, 5)
+	for index, entry := range firstPage {
+		assert.Equal(t, int64(index+2), entry.Sequence)
+		assert.Equal(t, fmt.Sprintf("Event %d", index+1), entry.Summary)
+	}
+
+	secondPage, hasMore, err := openedStore.ReadThreadEvents(threadID, 6, 5)
+	require.NoError(t, err)
+	assert.True(t, hasMore)
+	require.Len(t, secondPage, 5)
+	for index, entry := range secondPage {
+		assert.Equal(t, int64(index+7), entry.Sequence)
+		assert.Equal(t, fmt.Sprintf("Event %d", index+6), entry.Summary)
+	}
+
+	fourthPage, hasMore, err := openedStore.ReadThreadEvents(threadID, 16, 5)
+	require.NoError(t, err)
+	assert.False(t, hasMore)
+	require.Len(t, fourthPage, 5)
+	for index, entry := range fourthPage {
+		assert.Equal(t, int64(index+17), entry.Sequence)
+		assert.Equal(t, fmt.Sprintf("Event %d", index+16), entry.Summary)
+	}
+
+	emptyPage, hasMore, err := openedStore.ReadThreadEvents(threadID, 21, 5)
+	require.NoError(t, err)
+	assert.False(t, hasMore)
+	assert.Empty(t, emptyPage)
+
+	subscriberChannel, unsubscribe := openedStore.SubscribeEvents()
+	defer unsubscribe()
+
+	for iteration := 1; iteration <= 100; iteration++ {
+		_, mutateErr := openedStore.Mutate(func(state *State, mutation *Mutation) error {
+			mutation.EmitEvent(protocol.TaskEventEntry{
+				ThreadID:   threadID,
+				Type:       "backpressure.test",
+				Summary:    fmt.Sprintf("Backpressure message %d", iteration),
+				OccurredAt: timestamp,
+			})
+			return nil
+		})
+		require.NoError(t, mutateErr)
+	}
+
+	assert.NotEmpty(t, subscriberChannel)
 }

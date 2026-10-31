@@ -3,13 +3,20 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cafecito-games/Orchestra/internal/cli"
@@ -21,42 +28,42 @@ import (
 
 func TestCLIVersionAndHelp(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	exitCode := cli.Run(context.Background(), []string{"version"}, nil, &stdout, &stderr, nil)
-	require.Equal(t, 0, exitCode)
-	require.Contains(t, stdout.String(), "orchestra ")
-	require.Contains(t, stdout.String(), "protocol v1")
+	exitCode := cli.Run(t.Context(), []string{"version"}, nil, &stdout, &stderr, nil)
+	assert.Equal(t, 0, exitCode)
+	assert.Contains(t, stdout.String(), "orchestra ")
+	assert.Contains(t, stdout.String(), "protocol v1")
 
 	stdout.Reset()
 	stderr.Reset()
-	exitCode = cli.Run(context.Background(), []string{"version", "--json"}, nil, &stdout, &stderr, nil)
-	require.Equal(t, 0, exitCode)
+	exitCode = cli.Run(t.Context(), []string{"version", "--json"}, nil, &stdout, &stderr, nil)
+	assert.Equal(t, 0, exitCode)
 	var versionPayload map[string]string
 	require.NoError(t, json.Unmarshal(stdout.Bytes(), &versionPayload))
-	require.Equal(t, protocol.ProtocolVersion, versionPayload["protocolVersion"])
+	assert.Equal(t, protocol.ProtocolVersion, versionPayload["protocolVersion"])
 
 	stdout.Reset()
 	stderr.Reset()
-	exitCode = cli.Run(context.Background(), []string{"--help"}, nil, &stdout, &stderr, nil)
-	require.Equal(t, 0, exitCode)
-	require.Contains(t, stdout.String(), "Runtime Modes:")
+	exitCode = cli.Run(t.Context(), []string{"--help"}, nil, &stdout, &stderr, nil)
+	assert.Equal(t, 0, exitCode)
+	assert.Contains(t, stdout.String(), "Runtime Modes:")
 
 	stdout.Reset()
 	stderr.Reset()
-	exitCode = cli.Run(context.Background(), []string{"slave", "--help"}, nil, &stdout, &stderr, nil)
-	require.Equal(t, 0, exitCode)
-	require.Contains(t, stdout.String(), "--require-acp")
+	exitCode = cli.Run(t.Context(), []string{"slave", "--help"}, nil, &stdout, &stderr, nil)
+	assert.Equal(t, 0, exitCode)
+	assert.Contains(t, stdout.String(), "--require-acp")
 
 	stdout.Reset()
 	stderr.Reset()
-	exitCode = cli.Run(context.Background(), []string{"slave", "--workspace-root", t.TempDir(), "--require-acp", "--acp-native-fallback", "claude-cli"}, nil, &stdout, &stderr, nil)
-	require.Equal(t, 2, exitCode)
-	require.Contains(t, stderr.String(), "--require-acp cannot be combined with --acp-native-fallback")
+	exitCode = cli.Run(t.Context(), []string{"slave", "--workspace-root", t.TempDir(), "--require-acp", "--acp-native-fallback", "claude-cli"}, nil, &stdout, &stderr, nil)
+	assert.Equal(t, 2, exitCode)
+	assert.Contains(t, stderr.String(), "--require-acp cannot be combined with --acp-native-fallback")
 
 	stdout.Reset()
 	stderr.Reset()
-	exitCode = cli.Run(context.Background(), []string{"nonexistent"}, nil, &stdout, &stderr, nil)
-	require.Equal(t, 2, exitCode)
-	require.Contains(t, stderr.String(), "unknown subcommand")
+	exitCode = cli.Run(t.Context(), []string{"nonexistent"}, nil, &stdout, &stderr, nil)
+	assert.Equal(t, 2, exitCode)
+	assert.Contains(t, stderr.String(), "unknown subcommand")
 }
 
 func TestCLIOperatorCommandsAndSetupDoctor(t *testing.T) {
@@ -184,55 +191,56 @@ func TestCLIOperatorCommandsAndSetupDoctor(t *testing.T) {
 	}
 
 	runCLI := func(arguments ...string) (int, string, string) {
+		t.Helper()
 		var stdout, stderr bytes.Buffer
-		code := cli.Run(context.Background(), arguments, nil, &stdout, &stderr, lookupEnvironment)
+		code := cli.Run(t.Context(), arguments, nil, &stdout, &stderr, lookupEnvironment)
 		return code, stdout.String(), stderr.String()
 	}
 
 	code, stdout, stderr := runCLI("status")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "Orchestra Master")
-	require.Contains(t, stdout, "worker-alpha")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "Orchestra Master")
+	assert.Contains(t, stdout, "worker-alpha")
 
 	code, stdout, stderr = runCLI("nodes")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "worker-alpha (Worker Alpha)")
-	require.Contains(t, stdout, "Harness claude-cli")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "worker-alpha (Worker Alpha)")
+	assert.Contains(t, stdout, "Harness claude-cli")
 
 	code, stdout, stderr = runCLI("threads")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, createdThread.ID)
-	require.Contains(t, stdout, "CLI Inspection Thread")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, createdThread.ID)
+	assert.Contains(t, stdout, "CLI Inspection Thread")
 
 	code, stdout, stderr = runCLI("thread", createdThread.ID)
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "Build module")
-	require.Contains(t, stdout, "Verify tests")
-	require.Contains(t, stdout, "approval-test-1")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "Build module")
+	assert.Contains(t, stdout, "Verify tests")
+	assert.Contains(t, stdout, "approval-test-1")
 
 	code, stdout, stderr = runCLI("thread", createdThread.ID, "--json")
-	require.Equal(t, 0, code, stderr)
+	assert.Equal(t, 0, code, stderr)
 	var detail protocol.ThreadDetailResponse
 	require.NoError(t, json.Unmarshal([]byte(stdout), &detail))
-	require.Equal(t, createdThread.ID, detail.Thread.ID)
-	require.Len(t, detail.Tasks, 2)
+	assert.Equal(t, createdThread.ID, detail.Thread.ID)
+	assert.Len(t, detail.Tasks, 2)
 
 	code, stdout, stderr = runCLI("approvals")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "approval-test-1")
-	require.Contains(t, stdout, "approval-test-2")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "approval-test-1")
+	assert.Contains(t, stdout, "approval-test-2")
 
 	code, stdout, stderr = runCLI("approve", "approval-test-1", "--option", "allow_once")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "Approval approval-test-1 approved")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "Approval approval-test-1 approved")
 
 	code, stdout, stderr = runCLI("reject", "--option", "reject_once", "approval-test-2")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "Approval approval-test-2 rejected")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "Approval approval-test-2 rejected")
 
 	code, stdout, stderr = runCLI("cancel", submitted.Tasks[0].ID)
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "Cancelled task "+submitted.Tasks[0].ID)
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "Cancelled task "+submitted.Tasks[0].ID)
 
 	code, stdout, stderr = runCLI(
 		"room", "post", createdThread.ID, "Switch integration target to staging",
@@ -241,21 +249,21 @@ func TestCLIOperatorCommandsAndSetupDoctor(t *testing.T) {
 		"--nudge",
 		"--idempotency-key", "cli-room-post-1",
 	)
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "Posted room message #1")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "Posted room message #1")
 
 	code, stdout, stderr = runCLI("room", "read", createdThread.ID, "--kind", "guidance")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "staging-target")
-	require.Contains(t, stdout, "Switch integration target to staging")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "staging-target")
+	assert.Contains(t, stdout, "Switch integration target to staging")
 
 	code, stdout, stderr = runCLI("room", "nudge", createdThread.ID, "--task", submitted.Tasks[1].ID, "--idempotency-key", "cli-room-nudge-1")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "Nudged 1 task(s)")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "Nudged 1 task(s)")
 
 	code, stdout, stderr = runCLI("room", "path", createdThread.ID)
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, strings.TrimSpace(stdout), "messages.jsonl")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, strings.TrimSpace(stdout), "messages.jsonl")
 
 	_, err = service.RegisterClientMailbox("claude-cli-agent", "sess-cli-mail", &protocol.ClientMailRegistration{
 		RequestedName: "claude1234",
@@ -267,12 +275,12 @@ func TestCLIOperatorCommandsAndSetupDoctor(t *testing.T) {
 	require.NoError(t, err)
 
 	code, stdout, stderr = runCLI("mail", "--help")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "orchestra mail")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "orchestra mail")
 
 	code, stdout, stderr = runCLI("mail", "agents")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "claude1234@fabrica")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "claude1234@fabrica")
 
 	code, stdout, stderr = runCLI(
 		"mail", "send", "claude1234@fabrica", "Run full integration suite on main",
@@ -280,61 +288,266 @@ func TestCLIOperatorCommandsAndSetupDoctor(t *testing.T) {
 		"--from", "operator@fabrica",
 		"--idempotency-key", "cli-mail-send-1",
 	)
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "Sent mail")
-	require.Contains(t, stdout, "claude1234@fabrica")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "Sent mail")
+	assert.Contains(t, stdout, "claude1234@fabrica")
 
 	code, stdout, stderr = runCLI("mail", "inbox", "claude1234@fabrica", "--unread")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "Nightly verification")
-	require.Contains(t, stdout, "Run full integration suite on main")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "Nightly verification")
+	assert.Contains(t, stdout, "Run full integration suite on main")
 
 	code, stdout, stderr = runCLI("mail", "inbox", "claude1234@fabrica", "--unread", "--mark-read", "--json")
-	require.Equal(t, 0, code, stderr)
+	assert.Equal(t, 0, code, stderr)
 	var inboxPayload orchestrator.ReadMailResult
 	require.NoError(t, json.Unmarshal([]byte(stdout), &inboxPayload))
 	require.Len(t, inboxPayload.Messages, 1)
-	require.True(t, inboxPayload.Messages[0].Read)
-	require.Equal(t, 0, inboxPayload.Mailbox.UnreadCount)
+	assert.True(t, inboxPayload.Messages[0].Read)
+	assert.Equal(t, 0, inboxPayload.Mailbox.UnreadCount)
 
 	code, stdout, stderr = runCLI("mail", "rename", "claude1234@fabrica", "release-captain")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "release-captain@fabrica")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "release-captain@fabrica")
 
 	code, stdout, stderr = runCLI("mail", "agents", "--json")
-	require.Equal(t, 0, code, stderr)
+	assert.Equal(t, 0, code, stderr)
 	var agentsPayload orchestrator.ListMailboxesResult
 	require.NoError(t, json.Unmarshal([]byte(stdout), &agentsPayload))
-	foundRenamed := false
-	for _, candidate := range agentsPayload.Mailboxes {
-		if candidate.Address == "release-captain@fabrica" {
-			foundRenamed = true
-			require.Contains(t, candidate.Aliases, "claude1234@fabrica")
-		}
-	}
-	require.True(t, foundRenamed)
+	foundRenamed := slices.ContainsFunc(agentsPayload.Mailboxes, func(candidate protocol.AgentMailbox) bool {
+		return candidate.Address == "release-captain@fabrica" && slices.Contains(candidate.Aliases, "claude1234@fabrica")
+	})
+	assert.True(t, foundRenamed)
 
 	code, stdout, stderr = runCLI("setup", "plan")
-	require.Equal(t, 0, code, stderr)
+	assert.Equal(t, 0, code, stderr)
 	var planPayload map[string]any
 	require.NoError(t, json.Unmarshal([]byte(stdout), &planPayload))
-	require.Equal(t, environment["ORCHESTRA_DATA_ROOT"], planPayload["dataRoot"])
+	assert.Equal(t, environment["ORCHESTRA_DATA_ROOT"], planPayload["dataRoot"])
 
 	code, stdout, stderr = runCLI("doctor")
-	require.Equal(t, 0, code, stderr)
-	require.Contains(t, stdout, "activation ledger:")
-	require.Contains(t, stdout, "reachable")
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "activation ledger:")
+	assert.Contains(t, stdout, "reachable")
 
 	code, stdout, stderr = runCLI("doctor", "--json")
-	require.Equal(t, 0, code, stderr)
+	assert.Equal(t, 0, code, stderr)
 	var doctorPayload map[string]any
 	require.NoError(t, json.Unmarshal([]byte(stdout), &doctorPayload))
 	connectivity, _ := doctorPayload["hubConnectivity"].(map[string]any)
-	require.Equal(t, true, connectivity["reachable"])
+	assert.Equal(t, true, connectivity["reachable"])
+}
+
+func TestCLISetupApplyAndRollback(t *testing.T) {
+	dataRoot := filepath.Join(t.TempDir(), "setup-root")
+	lookupEnvironment := func(name string) (string, bool) {
+		if name == "ORCHESTRA_DATA_ROOT" {
+			return dataRoot, true
+		}
+		return "", false
+	}
+
+	runCLI := func(arguments ...string) (int, string, string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		code := cli.Run(t.Context(), arguments, nil, &stdout, &stderr, lookupEnvironment)
+		return code, stdout.String(), stderr.String()
+	}
+
+	// Setup apply --help
+	code, _, stderr := runCLI("setup", "apply", "--help")
+	assert.Equal(t, 0, code)
+	assert.Contains(t, stderr, "orchestra setup apply")
+
+	// Setup apply without --plan
+	code, _, stderr = runCLI("setup", "apply")
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr, "--plan is required")
+
+	// Setup apply with non-existent --plan
+	code, _, stderr = runCLI("setup", "apply", "--plan", filepath.Join(t.TempDir(), "nonexistent.json"))
+	assert.Equal(t, 1, code)
+	assert.Contains(t, stderr, "read plan")
+
+	// Setup apply with valid custom manifest and artifact
+	sourceBinary := filepath.Join(t.TempDir(), "claude-agent-acp")
+	binaryContent := []byte("#!/bin/sh\necho 0.79.0\n")
+	require.NoError(t, os.WriteFile(sourceBinary, binaryContent, 0o755))
+	checksum := hex.EncodeToString(func() []byte {
+		h := sha256.Sum256(binaryContent)
+		return h[:]
+	}())
+
+	platformKey := runtime.GOOS + "-" + runtime.GOARCH
+	manifestJSON := fmt.Sprintf(`{
+		"manifestVersion": "2",
+		"components": [{
+			"id": "claude-acp",
+			"kind": "acp-adapter",
+			"harnessId": "claude-cli",
+			"provider": "anthropic",
+			"label": "Claude ACP adapter",
+			"version": "0.79.0",
+			"platforms": {
+				"%s": { "kind": "manual", "executablePath": "bin/claude-agent-acp" }
+			},
+			"launch": {},
+			"authDocsUrl": "https://example.com"
+		}]
+	}`, platformKey)
+
+	manifestFile := filepath.Join(t.TempDir(), "manifest.json")
+	require.NoError(t, os.WriteFile(manifestFile, []byte(manifestJSON), 0o644))
+
+	planFile := filepath.Join(t.TempDir(), "plan.json")
+	code, _, stderr = runCLI("setup", "plan", "--manifest", manifestFile, "--out", planFile)
+	assert.Equal(t, 0, code, stderr)
+
+	code, stdout, stderr := runCLI(
+		"setup", "apply",
+		"--manifest", manifestFile,
+		"--plan", planFile,
+		"--manual-artifact", "claude-acp="+sourceBinary,
+		"--manual-checksum", "claude-acp="+checksum,
+	)
+	assert.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "installed: acp-adapter/claude-acp")
+
+	// Setup rollback --help
+	code, _, stderr = runCLI("setup", "rollback", "--help")
+	assert.Equal(t, 0, code)
+	assert.Contains(t, stderr, "orchestra setup rollback")
+
+	// Setup rollback with applied component having no previous version
+	code, _, stderr = runCLI("setup", "rollback", "--manifest", manifestFile, "--component", "claude-acp")
+	assert.NotEqual(t, 0, code)
+	assert.Contains(t, stderr, "orchestra setup rollback")
+
+	// Setup rollback with unknown component
+	code, _, stderr = runCLI("setup", "rollback", "--component", "unknown-component")
+	assert.NotEqual(t, 0, code)
+	assert.Contains(t, stderr, "orchestra setup rollback")
+}
+
+func TestCLISlaveValidation(t *testing.T) {
+	runCLI := func(arguments ...string) (int, string, string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		code := cli.Run(t.Context(), arguments, nil, &stdout, &stderr, nil)
+		return code, stdout.String(), stderr.String()
+	}
+
+	// Invalid node kind
+	code, _, stderr := runCLI("slave", "--kind", "unsupported-kind")
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr, "invalid node kind")
+
+	// Invalid concurrency
+	code, _, stderr = runCLI("slave", "--concurrency", "0")
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr, "concurrency must be between 1 and 65535")
+
+	// Invalid instance capacity
+	code, _, stderr = runCLI("slave", "--instance-capacity", "-1")
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr, "instance-capacity must be between 0 and 65535")
+
+	// Invalid toolchain format (missing =)
+	code, _, stderr = runCLI("slave", "--toolchain", "invalid-format")
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr, "toolchain")
+
+	// Conflicting require-acp and fallback
+	code, _, stderr = runCLI("slave", "--require-acp", "--acp-native-fallback", "claude-cli")
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr, "--require-acp cannot be combined with --acp-native-fallback")
+
+	// Unexpected positional arguments
+	code, _, stderr = runCLI("slave", "extra-arg")
+	assert.Equal(t, 2, code)
+	assert.Contains(t, stderr, "unexpected positional arguments")
+}
+
+func TestCLIOperatorErrors_UnauthorizedAndUnreachable(t *testing.T) {
+	const validToken = "valid-token-secret"
+
+	openedStore, err := store.Open(filepath.Join(t.TempDir(), "operator-error-state"))
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	service, err := orchestrator.NewService(orchestrator.ServiceOptions{
+		Store: openedStore,
+		Token: validToken,
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	server := httptest.NewServer(service.Handler())
+	defer server.Close()
+
+	// 1. Unauthorized: wrong token
+	unauthorizedEnv := func(name string) (string, bool) {
+		switch name {
+		case "ORCHESTRA_ENDPOINT":
+			return server.URL, true
+		case "ORCHESTRA_TOKEN":
+			return "wrong-token", true
+		default:
+			return "", false
+		}
+	}
+
+	runUnauthorized := func(arguments ...string) (int, string, string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		code := cli.Run(t.Context(), arguments, nil, &stdout, &stderr, unauthorizedEnv)
+		return code, stdout.String(), stderr.String()
+	}
+
+	for _, command := range [][]string{
+		{"threads"},
+		{"mail", "agents"},
+		{"room", "read", "thread-123"},
+		{"approvals"},
+	} {
+		code, _, stderr := runUnauthorized(command...)
+		assert.Equal(t, 1, code, "command %v should fail with 1", command)
+		assert.Contains(t, stderr, "unauthorized", "command %v should indicate unauthorized", command)
+	}
+
+	// 2. Unreachable master: no listener
+	unreachableEnv := func(name string) (string, bool) {
+		switch name {
+		case "ORCHESTRA_ENDPOINT":
+			return "http://127.0.0.1:59999", true
+		case "ORCHESTRA_TOKEN":
+			return validToken, true
+		default:
+			return "", false
+		}
+	}
+
+	runUnreachable := func(arguments ...string) (int, string, string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		code := cli.Run(t.Context(), arguments, nil, &stdout, &stderr, unreachableEnv)
+		return code, stdout.String(), stderr.String()
+	}
+
+	for _, command := range [][]string{
+		{"threads"},
+		{"mail", "agents"},
+		{"room", "read", "thread-123"},
+		{"approvals"},
+	} {
+		code, _, stderr := runUnreachable(command...)
+		assert.Equal(t, 1, code, "command %v should fail with 1", command)
+		assert.NotEmpty(t, stderr, "command %v should output error message", command)
+	}
 }
 
 func TestCLIMasterStartAndShutdown(t *testing.T) {
-	masterContext, cancelMaster := context.WithCancel(context.Background())
+	masterContext, cancelMaster := context.WithCancel(t.Context())
+	defer cancelMaster()
 	var stdout, stderr bytes.Buffer
 
 	doneChannel := make(chan int, 1)
@@ -359,9 +572,9 @@ func TestCLIMasterStartAndShutdown(t *testing.T) {
 
 	select {
 	case exitCode := <-doneChannel:
-		require.Equal(t, 0, exitCode, stderr.String())
-		require.Contains(t, stderr.String(), "orchestra master")
+		assert.Equal(t, 0, exitCode, stderr.String())
+		assert.Contains(t, stderr.String(), "orchestra master")
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for orchestra master to shut down")
+		require.Fail(t, "timed out waiting for orchestra master to shut down")
 	}
 }

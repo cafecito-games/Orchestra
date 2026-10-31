@@ -102,7 +102,8 @@ func walk(root string, directory string, visit func(string) error) (string, erro
 	if err := RejectUnsafeAncestor(cleanRoot, rootInformation); err != nil {
 		return "", err
 	}
-	relative := strings.TrimPrefix(strings.TrimPrefix(cleanDirectory, cleanRoot), string(filepath.Separator))
+	suffix, _ := strings.CutPrefix(cleanDirectory, cleanRoot)
+	relative := strings.TrimPrefix(suffix, string(filepath.Separator))
 	current := cleanRoot
 	if relative == "" {
 		return current, nil

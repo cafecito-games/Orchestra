@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/cafecito-games/Orchestra/internal/protocol"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,56 +30,56 @@ func TestMailAddressNormalizationAndParsing(t *testing.T) {
 	for _, testCase := range handleCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			normalized, ok := protocol.NormalizeMailHandle(testCase.raw)
-			require.Equal(t, testCase.valid, ok)
-			require.Equal(t, testCase.expected, normalized)
+			assert.Equal(t, testCase.valid, ok)
+			assert.Equal(t, testCase.expected, normalized)
 		})
 	}
 
-	require.Equal(t, "fabrica", protocol.NormalizeHostnameSlug("Fabrica.local"))
-	require.Equal(t, "bunker-node-1", protocol.NormalizeHostnameSlug("Bunker Node 1.lan"))
-	require.Equal(t, "local", protocol.NormalizeHostnameSlug("..."))
+	assert.Equal(t, "fabrica", protocol.NormalizeHostnameSlug("Fabrica.local"))
+	assert.Equal(t, "bunker-node-1", protocol.NormalizeHostnameSlug("Bunker Node 1.lan"))
+	assert.Equal(t, "local", protocol.NormalizeHostnameSlug("..."))
 
-	require.Equal(t, "claude", protocol.NormalizeHarnessMailSlug("claude-code"))
-	require.Equal(t, "claude", protocol.NormalizeHarnessMailSlug("claude-cli"))
-	require.Equal(t, "codex", protocol.NormalizeHarnessMailSlug("codex-mcp-client"))
-	require.Equal(t, "opencode", protocol.NormalizeHarnessMailSlug("opencode-cli"))
-	require.Equal(t, "antigravity", protocol.NormalizeHarnessMailSlug("agy"))
-	require.Equal(t, "cursor", protocol.NormalizeHarnessMailSlug("Cursor Agent"))
-	require.Equal(t, "gemini", protocol.NormalizeHarnessMailSlug("gemini-cli"))
-	require.Equal(t, "agent", protocol.NormalizeHarnessMailSlug("orchestra"))
-	require.Equal(t, "agent", protocol.NormalizeHarnessMailSlug("mcp-client-a1b2c3d4"))
-	require.Equal(t, "custom-runner", protocol.NormalizeHarnessMailSlug("Custom Runner"))
+	assert.Equal(t, "claude", protocol.NormalizeHarnessMailSlug("claude-code"))
+	assert.Equal(t, "claude", protocol.NormalizeHarnessMailSlug("claude-cli"))
+	assert.Equal(t, "codex", protocol.NormalizeHarnessMailSlug("codex-mcp-client"))
+	assert.Equal(t, "opencode", protocol.NormalizeHarnessMailSlug("opencode-cli"))
+	assert.Equal(t, "antigravity", protocol.NormalizeHarnessMailSlug("agy"))
+	assert.Equal(t, "cursor", protocol.NormalizeHarnessMailSlug("Cursor Agent"))
+	assert.Equal(t, "gemini", protocol.NormalizeHarnessMailSlug("gemini-cli"))
+	assert.Equal(t, "agent", protocol.NormalizeHarnessMailSlug("orchestra"))
+	assert.Equal(t, "agent", protocol.NormalizeHarnessMailSlug("mcp-client-a1b2c3d4"))
+	assert.Equal(t, "custom-runner", protocol.NormalizeHarnessMailSlug("Custom Runner"))
 
 	sanitized, ok := protocol.SanitizeMailHandle("Auth API Reviewer #2")
 	require.True(t, ok)
-	require.Equal(t, "auth-api-reviewer-2", sanitized)
+	assert.Equal(t, "auth-api-reviewer-2", sanitized)
 
 	formatted, err := protocol.FormatMailAddress("Claude1234", "Fabrica")
 	require.NoError(t, err)
-	require.Equal(t, "claude1234@fabrica", formatted)
+	assert.Equal(t, "claude1234@fabrica", formatted)
 
 	parsedHandle, parsedHost, parsedAddress, ok := protocol.ParseMailAddress(" Codex345@Bunker ")
 	require.True(t, ok)
-	require.Equal(t, "codex345", parsedHandle)
-	require.Equal(t, "bunker", parsedHost)
-	require.Equal(t, "codex345@bunker", parsedAddress)
+	assert.Equal(t, "codex345", parsedHandle)
+	assert.Equal(t, "bunker", parsedHost)
+	assert.Equal(t, "codex345@bunker", parsedAddress)
 
 	_, _, _, ok = protocol.ParseMailAddress("missing-host")
-	require.False(t, ok)
+	assert.False(t, ok)
 	_, _, _, ok = protocol.ParseMailAddress("two@at@signs")
-	require.False(t, ok)
+	assert.False(t, ok)
 
 	renameHandle, renameHost, renameAddress, err := protocol.NormalizeRenameTarget("Auth-Worker", "Fabrica")
 	require.NoError(t, err)
-	require.Equal(t, "auth-worker", renameHandle)
-	require.Equal(t, "fabrica", renameHost)
-	require.Equal(t, "auth-worker@fabrica", renameAddress)
+	assert.Equal(t, "auth-worker", renameHandle)
+	assert.Equal(t, "fabrica", renameHost)
+	assert.Equal(t, "auth-worker@fabrica", renameAddress)
 
 	renameHandle, renameHost, renameAddress, err = protocol.NormalizeRenameTarget("Reviewer@Bunker", "fabrica")
 	require.NoError(t, err)
-	require.Equal(t, "reviewer", renameHandle)
-	require.Equal(t, "bunker", renameHost)
-	require.Equal(t, "reviewer@bunker", renameAddress)
+	assert.Equal(t, "reviewer", renameHandle)
+	assert.Equal(t, "bunker", renameHost)
+	assert.Equal(t, "reviewer@bunker", renameAddress)
 
 	_, _, _, err = protocol.NormalizeRenameTarget("", "fabrica")
 	require.Error(t, err)

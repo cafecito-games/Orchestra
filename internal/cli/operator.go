@@ -446,9 +446,9 @@ func runThreadDetail(
 		writer := tabwriter.NewWriter(standardOutput, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(writer, "  TASK ID\tSTATUS\tATTEMPTS\tDEPENDENCIES\tTITLE")
 		for _, task := range detail.Tasks {
-			var depIDs []string
-			for _, dep := range task.Dependencies {
-				depIDs = append(depIDs, dep.TaskID)
+			var dependencyIDs []string
+			for _, dependency := range task.Dependencies {
+				dependencyIDs = append(dependencyIDs, dependency.TaskID)
 			}
 			fmt.Fprintf(
 				writer,
@@ -457,7 +457,7 @@ func runThreadDetail(
 				task.Status,
 				task.AttemptCount,
 				task.MaxAttempts,
-				defaultIfEmpty(strings.Join(depIDs, ","), "-"),
+				defaultIfEmpty(strings.Join(dependencyIDs, ","), "-"),
 				task.Title,
 			)
 		}

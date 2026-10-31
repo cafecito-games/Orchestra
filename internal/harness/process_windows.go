@@ -3,6 +3,7 @@
 package harness
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strconv"
@@ -16,7 +17,7 @@ func configureProcessCancellation(command *exec.Cmd) {
 		if command.Process == nil {
 			return os.ErrProcessDone
 		}
-		killer := exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(command.Process.Pid))
+		killer := exec.CommandContext(context.Background(), "taskkill", "/T", "/F", "/PID", strconv.Itoa(command.Process.Pid))
 		if err := killer.Run(); err != nil && command.ProcessState != nil && command.ProcessState.Exited() {
 			return os.ErrProcessDone
 		} else {

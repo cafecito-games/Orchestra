@@ -156,7 +156,7 @@ func (store *sessionStore) pruneExcessSessionsLocked(sessionsDirectory string) {
 		return cmp.Compare(left.modifiedUnix, right.modifiedUnix)
 	})
 	excess := len(candidates) - maximumStoredSessions
-	for index := 0; index < excess; index++ {
+	for index := range excess {
 		_ = os.Remove(candidates[index].path)
 	}
 }

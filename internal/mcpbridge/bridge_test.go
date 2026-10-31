@@ -5,13 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cafecito-games/Orchestra/internal/orchestrator"
@@ -44,7 +47,7 @@ func TestStdioBridgeInitializeToolsCallArtifactUploadAndDoorbell(t *testing.T) {
 	stdinReader, stdinWriter := io.Pipe()
 	stdoutReader, stdoutWriter := io.Pipe()
 
-	bridgeContext, cancelBridge := context.WithCancel(context.Background())
+	bridgeContext, cancelBridge := context.WithCancel(t.Context())
 	defer cancelBridge()
 
 	bridgeDone := make(chan error, 1)
@@ -81,7 +84,7 @@ func TestStdioBridgeInitializeToolsCallArtifactUploadAndDoorbell(t *testing.T) {
 					return message
 				}
 			case <-deadline:
-				t.Fatalf("timed out waiting for response id %v", expectedID)
+				require.Failf(t, "timeout", "timed out waiting for response id %v", expectedID)
 			}
 		}
 	}
@@ -89,20 +92,20 @@ func TestStdioBridgeInitializeToolsCallArtifactUploadAndDoorbell(t *testing.T) {
 	sendLine(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bridge-test","version":"1.0.0"}}}`)
 	initializeResponse := readResponseByID(1)
 	initializeJSON, _ := json.Marshal(initializeResponse)
-	require.Contains(t, string(initializeJSON), "claude/channel")
+	assert.Contains(t, string(initializeJSON), "claude/channel")
 
 	sendLine(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
 	listResponse := readResponseByID(2)
 	listResult := listResponse["result"].(map[string]any)
 	toolsSlice := listResult["tools"].([]any)
-	require.Len(t, toolsSlice, len(protocol.OrchestratorToolNames))
+	assert.Len(t, toolsSlice, len(protocol.OrchestratorToolNames))
 
 	sendLine(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_thread","arguments":{"title":"Bridge Test Thread","attach":true}}}`)
 	createResponse := readResponseByID(3)
 	structured := createResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
 	threadObject := structured["thread"].(map[string]any)
 	threadID := threadObject["id"].(string)
-	require.True(t, strings.HasPrefix(threadID, "thread-"))
+	assert.True(t, strings.HasPrefix(threadID, "thread-"))
 
 	localArtifactPath := filepath.Join(t.TempDir(), "notes.md")
 	require.NoError(t, os.WriteFile(localArtifactPath, []byte("# Design Notes\nVerified via MCP bridge.\n"), 0o600))
@@ -123,12 +126,11 @@ func TestStdioBridgeInitializeToolsCallArtifactUploadAndDoorbell(t *testing.T) {
 	sendLine(string(postCall))
 	artifactResponse := readResponseByID(4)
 	artifactText, _ := json.Marshal(artifactResponse)
-	require.Contains(t, string(artifactText), `"uploaded":true`)
+	assert.Contains(t, string(artifactText), `"uploaded":true`)
 
-	newSummary := "Trigger doorbell from operator"
 	_, err = service.UpdateThread(orchestrator.CallerIdentity{Kind: "operator", OperatorID: "cli"}, orchestrator.UpdateThreadInput{
 		ThreadID: threadID,
-		Summary:  &newSummary,
+		Summary:  new("Trigger doorbell from operator"),
 	})
 	require.NoError(t, err)
 
@@ -141,7 +143,7 @@ func TestStdioBridgeInitializeToolsCallArtifactUploadAndDoorbell(t *testing.T) {
 				foundDoorbell = true
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for notifications/claude/channel doorbell")
+			require.Fail(t, "timed out waiting for notifications/claude/channel doorbell")
 		}
 	}
 
@@ -228,7 +230,7 @@ func TestStdioBridgeAgentMailIdentityRenameAndLiveChannelPush(t *testing.T) {
 					*bufferedNotifications = append(*bufferedNotifications, message)
 				}
 			case <-deadline:
-				t.Fatalf("timed out waiting for response id %v", expectedID)
+				require.Failf(t, "timeout", "timed out waiting for response id %v", expectedID)
 				return nil
 			}
 		}
@@ -335,7 +337,7 @@ func TestStdioBridgeAgentMailIdentityRenameAndLiveChannelPush(t *testing.T) {
 	renameResponse := readByID(claudeClient, claudeRequestID, &claudeNotifications)
 	renameStructured := renameResponse["result"].(map[string]any)["structuredContent"].(map[string]any)
 	renamedMailbox := renameStructured["mailbox"].(map[string]any)
-	require.Equal(t, "ui-lead@fabrica", renamedMailbox["address"])
+	assert.Equal(t, "ui-lead@fabrica", renamedMailbox["address"])
 
 	codexRequestID++
 	sendRPC(codexClient, map[string]any{
@@ -354,9 +356,10 @@ func TestStdioBridgeAgentMailIdentityRenameAndLiveChannelPush(t *testing.T) {
 	})
 	sendResponse := readByID(codexClient, codexRequestID, nil)
 	sendResult := sendResponse["result"].(map[string]any)
-	require.NotEqual(t, true, sendResult["isError"])
+	assert.NotEqual(t, true, sendResult["isError"])
 
 	checkMailNotification := func(candidate map[string]any) bool {
+		t.Helper()
 		if method, _ := candidate["method"].(string); method != "notifications/claude/channel" {
 			return false
 		}
@@ -365,20 +368,14 @@ func TestStdioBridgeAgentMailIdentityRenameAndLiveChannelPush(t *testing.T) {
 		if metadata["kind"] != "agent_mail" {
 			return false
 		}
-		require.Equal(t, "codex345@bunker", metadata["from"])
-		require.Equal(t, "ui-lead@fabrica", metadata["to"])
+		assert.Equal(t, "codex345@bunker", metadata["from"])
+		assert.Equal(t, "ui-lead@fabrica", metadata["to"])
 		contentText, _ := parameters["content"].(string)
-		require.Contains(t, contentText, "Updated GraphQL schema on bunker")
+		assert.Contains(t, contentText, "Updated GraphQL schema on bunker")
 		return true
 	}
 
-	foundMailPush := false
-	for _, buffered := range claudeNotifications {
-		if checkMailNotification(buffered) {
-			foundMailPush = true
-			break
-		}
-	}
+	foundMailPush := slices.ContainsFunc(claudeNotifications, checkMailNotification)
 	deadline := time.After(4 * time.Second)
 	for !foundMailPush {
 		select {
@@ -387,7 +384,251 @@ func TestStdioBridgeAgentMailIdentityRenameAndLiveChannelPush(t *testing.T) {
 				foundMailPush = true
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for notifications/claude/channel agent_mail push")
+			require.Fail(t, "timed out waiting for notifications/claude/channel agent_mail push")
 		}
 	}
+}
+
+func TestStdioBridgeErrorHandlingAndResilience(t *testing.T) {
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	service, err := orchestrator.NewService(orchestrator.ServiceOptions{
+		Store: openedStore,
+		Token: "test-bridge-token",
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	server := httptest.NewServer(service.Handler())
+	defer server.Close()
+
+	bridge := NewBridge(Configuration{
+		Endpoint: server.URL,
+		Token:    "test-bridge-token",
+		ClientID: "claude-desktop",
+	})
+
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+
+	bridgeContext, cancelBridge := context.WithCancel(t.Context())
+	defer cancelBridge()
+
+	bridgeDone := make(chan error, 1)
+	go func() {
+		defer stdoutWriter.Close()
+		bridgeDone <- bridge.Run(bridgeContext, stdinReader, stdoutWriter)
+	}()
+
+	lines := make(chan map[string]any, 32)
+	go func() {
+		scanner := bufio.NewScanner(stdoutReader)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			var parsed map[string]any
+			if json.Unmarshal(scanner.Bytes(), &parsed) == nil {
+				lines <- parsed
+			}
+		}
+	}()
+
+	sendLine := func(payload string) {
+		t.Helper()
+		_, writeErr := stdinWriter.Write([]byte(payload + "\n"))
+		require.NoError(t, writeErr)
+	}
+
+	readResponseByID := func(expectedID float64) map[string]any {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case message := <-lines:
+				if idValue, ok := message["id"].(float64); ok && idValue == expectedID {
+					return message
+				}
+			case <-deadline:
+				require.Failf(t, "timeout", "timed out waiting for response id %v", expectedID)
+				return nil
+			}
+		}
+	}
+
+	sendLine(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bridge-test","version":"1.0.0"}}}`)
+	initResp := readResponseByID(1)
+	require.NotNil(t, initResp)
+
+	// 1. Invalid JSON-RPC stdin frame recovery without crashing
+	sendLine(`{"jsonrpc":"2.0","id":99,"method":"unknown/invalid_method","params":{}}`)
+	invalidResponse := readResponseByID(99)
+	assert.NotNil(t, invalidResponse)
+	assert.NotNil(t, invalidResponse["error"])
+
+	sendLine(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
+	listResponse := readResponseByID(2)
+	assert.NotNil(t, listResponse)
+	assert.NotNil(t, listResponse["result"])
+
+	// 2. post_artifact with missing local file
+	sendLine(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"post_artifact","arguments":{"filePath":"/tmp/nonexistent-file-xyz-12345.md"}}}`)
+	missingFileResponse := readResponseByID(3)
+	assert.NotNil(t, missingFileResponse)
+	missingResult, _ := missingFileResponse["result"].(map[string]any)
+	assert.Equal(t, true, missingResult["isError"])
+	contentList, _ := missingResult["content"].([]any)
+	require.NotEmpty(t, contentList)
+	firstContent, _ := contentList[0].(map[string]any)
+	assert.Contains(t, firstContent["text"], "filePath must name an existing regular file")
+
+	_ = stdinWriter.Close()
+	require.NoError(t, <-bridgeDone)
+}
+
+type testCustomRoundTripper struct {
+	base     http.RoundTripper
+	override func(*http.Request) (*http.Response, error)
+}
+
+func (tripper testCustomRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if tripper.override != nil {
+		if response, err := tripper.override(request); response != nil || err != nil {
+			return response, err
+		}
+	}
+	base := tripper.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(request)
+}
+
+func TestStdioBridgeMasterHTTPErrorPropagation(t *testing.T) {
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	service, err := orchestrator.NewService(orchestrator.ServiceOptions{
+		Store: openedStore,
+		Token: "test-bridge-token",
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	server := httptest.NewServer(service.Handler())
+	defer server.Close()
+
+	customHTTPClient := &http.Client{
+		Transport: testCustomRoundTripper{
+			override: func(request *http.Request) (*http.Response, error) {
+				if request.Method == http.MethodPut && strings.Contains(request.URL.Path, "/content") {
+					return &http.Response{
+						StatusCode: http.StatusInternalServerError,
+						Body:       io.NopCloser(strings.NewReader("internal storage failure")),
+						Header:     make(http.Header),
+					}, nil
+				}
+				return nil, nil
+			},
+		},
+	}
+
+	bridge := NewBridge(Configuration{
+		Endpoint:   server.URL,
+		Token:      "test-bridge-token",
+		ClientID:   "claude-desktop",
+		HTTPClient: customHTTPClient,
+	})
+
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+
+	bridgeContext, cancelBridge := context.WithCancel(t.Context())
+	defer cancelBridge()
+
+	bridgeDone := make(chan error, 1)
+	go func() {
+		defer stdoutWriter.Close()
+		bridgeDone <- bridge.Run(bridgeContext, stdinReader, stdoutWriter)
+	}()
+
+	lines := make(chan map[string]any, 32)
+	go func() {
+		scanner := bufio.NewScanner(stdoutReader)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			var parsed map[string]any
+			if json.Unmarshal(scanner.Bytes(), &parsed) == nil {
+				lines <- parsed
+			}
+		}
+	}()
+
+	sendLine := func(payload string) {
+		t.Helper()
+		_, writeErr := stdinWriter.Write([]byte(payload + "\n"))
+		require.NoError(t, writeErr)
+	}
+
+	readResponseByID := func(expectedID float64) map[string]any {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case message := <-lines:
+				if idValue, ok := message["id"].(float64); ok && idValue == expectedID {
+					return message
+				}
+			case <-deadline:
+				require.Failf(t, "timeout", "timed out waiting for response id %v", expectedID)
+				return nil
+			}
+		}
+	}
+
+	sendLine(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bridge-test","version":"1.0.0"}}}`)
+	initResp := readResponseByID(1)
+	require.NotNil(t, initResp)
+
+	sendLine(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_thread","arguments":{"title":"HTTP Error Thread"}}}`)
+	createResp := readResponseByID(2)
+	structured := createResp["result"].(map[string]any)["structuredContent"].(map[string]any)
+	threadObject := structured["thread"].(map[string]any)
+	threadID := threadObject["id"].(string)
+
+	localArtifactPath := filepath.Join(t.TempDir(), "upload_fail.txt")
+	require.NoError(t, os.WriteFile(localArtifactPath, []byte("some content"), 0o600))
+
+	postCall, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      3,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "post_artifact",
+			"arguments": map[string]any{
+				"threadId": threadID,
+				"filePath": localArtifactPath,
+				"summary":  "test upload",
+			},
+		},
+	})
+	sendLine(string(postCall))
+	uploadFailResponse := readResponseByID(3)
+	require.NotNil(t, uploadFailResponse)
+	uploadResult, _ := uploadFailResponse["result"].(map[string]any)
+	assert.Equal(t, true, uploadResult["isError"])
+	contentList, _ := uploadResult["content"].([]any)
+	require.NotEmpty(t, contentList)
+	firstContent, _ := contentList[0].(map[string]any)
+	assert.Contains(t, firstContent["text"], "artifact upload returned HTTP 500")
+
+	sendLine(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"send_mail","arguments":{"to":""}}}`)
+	rpcErrorResponse := readResponseByID(4)
+	require.NotNil(t, rpcErrorResponse)
+	rpcResult, _ := rpcErrorResponse["result"].(map[string]any)
+	assert.Equal(t, true, rpcResult["isError"])
+
+	_ = stdinWriter.Close()
+	require.NoError(t, <-bridgeDone)
 }

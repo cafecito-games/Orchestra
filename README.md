@@ -36,7 +36,7 @@ Main Machine                                       Remote Worker Machines (over 
 
 ## Building & Cross-Compiling
 
-Requires **Go 1.26+** (and optionally [`task`](https://taskfile.dev)). Because SQLite uses `modernc.org/sqlite`, cross-compilation requires no C toolchain.
+Requires **Go 1.26+**, **golangci-lint (v2)**, and optionally [`task`](https://taskfile.dev). Because SQLite uses `modernc.org/sqlite`, cross-compilation requires no C toolchain.
 
 ```bash
 # Build for current machine (./bin/orchestra)
@@ -299,6 +299,9 @@ orchestra version
 ```bash
 # Format, vet, unit tests (-race), multi-node real-process system tests (-race), and cross-builds
 task ci
+
+# Run static checks (gofmt, go vet, go fix, golangci-lint, and whitespace checks)
+task lint
 
 # Run unit tests only
 task unit:test

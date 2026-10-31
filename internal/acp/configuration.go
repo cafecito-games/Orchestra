@@ -114,8 +114,7 @@ func (client *Client) configure(operationContext context.Context, sessionID stri
 			if operationContext.Err() != nil {
 				return fmt.Errorf("%w before %s completed", ErrCancelled, methodSetConfigOption)
 			}
-			var responseError *ResponseError
-			if errors.As(err, &responseError) {
+			if _, ok := errors.AsType[*ResponseError](err); ok {
 				return selection.failure("adapter refused to set its %s session option")
 			}
 			return client.setupError(operationContext, methodSetConfigOption, err)

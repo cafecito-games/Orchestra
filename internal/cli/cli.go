@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -31,15 +32,9 @@ func Run(
 	if lookupEnvironment == nil {
 		lookupEnvironment = os.LookupEnv
 	}
-	if standardInput == nil {
-		standardInput = os.Stdin
-	}
-	if standardOutput == nil {
-		standardOutput = os.Stdout
-	}
-	if standardError == nil {
-		standardError = os.Stderr
-	}
+	standardInput = cmp.Or[io.Reader](standardInput, os.Stdin)
+	standardOutput = cmp.Or[io.Writer](standardOutput, os.Stdout)
+	standardError = cmp.Or[io.Writer](standardError, os.Stderr)
 
 	if len(arguments) == 0 {
 		printTopLevelUsage(standardError)

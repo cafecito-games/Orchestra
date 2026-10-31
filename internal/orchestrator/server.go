@@ -80,6 +80,7 @@ type replayWindow struct {
 }
 
 type Service struct {
+	baseContext      context.Context
 	store            *store.Store
 	token            string
 	redactor         *protocol.Redactor
@@ -137,6 +138,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 	}
 
 	service := &Service{
+		baseContext:      context.Background(),
 		store:            options.Store,
 		token:            options.Token,
 		redactor:         protocol.NewRedactor(options.Token),
@@ -186,6 +188,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 	})
 
 	backgroundContext, cancelBackground := context.WithCancel(context.Background())
+	service.baseContext = backgroundContext
 	service.backgroundCancel = cancelBackground
 
 	service.backgroundGroup.Go(func() {
@@ -292,10 +295,10 @@ func (service *Service) isBearerAuthorized(request *http.Request) bool {
 	}
 	header := request.Header.Get("Authorization")
 	const bearerPrefix = "Bearer "
-	if !strings.HasPrefix(header, bearerPrefix) {
+	provided, ok := strings.CutPrefix(header, bearerPrefix)
+	if !ok {
 		return false
 	}
-	provided := strings.TrimPrefix(header, bearerPrefix)
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(service.token)) == 1
 }
 
@@ -361,9 +364,9 @@ func (service *Service) handleOrchestratorClientUpgrade(writer http.ResponseWrit
 func (service *Service) serveOrchestratorClientConnection(requestContext context.Context, connection *websocket.Conn) {
 	connection.SetReadLimit(16 * 1024 * 1024)
 
-	regContext, cancelReg := context.WithTimeout(requestContext, 15*time.Second)
-	_, firstPayload, err := connection.Read(regContext)
-	cancelReg()
+	registrationContext, cancelRegistration := context.WithTimeout(requestContext, 15*time.Second)
+	defer cancelRegistration()
+	_, firstPayload, err := connection.Read(registrationContext)
 	if err != nil {
 		_ = connection.Close(websocket.StatusProtocolError, "expected client registration")
 		return
@@ -1014,13 +1017,12 @@ func writeJSONError(writer http.ResponseWriter, statusCode int, code, message st
 }
 
 func writeOperationError(writer http.ResponseWriter, err error) {
-	var operationErr *OperationError
-	if errors.As(err, &operationErr) {
-		statusCode := operationErr.HTTPStatus
+	if operationError, ok := errors.AsType[*OperationError](err); ok {
+		statusCode := operationError.HTTPStatus
 		if statusCode <= 0 {
 			statusCode = http.StatusBadRequest
 		}
-		writeJSONError(writer, statusCode, operationErr.Code, operationErr.Message)
+		writeJSONError(writer, statusCode, operationError.Code, operationError.Message)
 		return
 	}
 	writeJSONError(writer, http.StatusInternalServerError, "internal_error", protocol.BoundedDiagnostic(protocol.RedactText(err.Error())))
@@ -1192,7 +1194,8 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 		return nil, err
 	}
 
-	listener, err := net.Listen("tcp", configuration.ListenAddress)
+	var listenConfig net.ListenConfig
+	listener, err := listenConfig.Listen(operationContext, "tcp", configuration.ListenAddress)
 	if err != nil {
 		service.Close()
 		_ = openedStore.Close()
@@ -1260,7 +1263,9 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 		if buildErr != nil {
 			cancelWorker()
 			cancelServerBase()
-			_ = httpServer.Shutdown(context.Background())
+			shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelShutdown()
+			_ = httpServer.Shutdown(shutdownContext)
 			service.Close()
 			_ = openedStore.Close()
 			return nil, fmt.Errorf("build embedded local worker: %w", buildErr)

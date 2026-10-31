@@ -302,18 +302,20 @@ func TestAgentMailSendReadWaitIdempotencyRedactionAndThreadlessArtifacts(t *test
 		require.Equal(t, replySent.Message.ID, waited.Messages[0].ID)
 		require.Equal(t, "LGTM, go ahead and merge.", waited.Messages[0].Body)
 	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for WaitForMail to wake on incoming reply")
+		require.FailNow(t, "timed out waiting for WaitForMail to wake on incoming reply")
 	}
 
 	httpServer := httptest.NewServer(service.Handler())
 	defer httpServer.Close()
 
-	unauthorizedResponse, err := http.Get(httpServer.URL + "/api/mail/agents")
+	unauthorizedRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+"/api/mail/agents", nil)
 	require.NoError(t, err)
-	unauthorizedResponse.Body.Close()
+	unauthorizedResponse, err := http.DefaultClient.Do(unauthorizedRequest)
+	require.NoError(t, err)
+	_ = unauthorizedResponse.Body.Close()
 	require.Equal(t, http.StatusUnauthorized, unauthorizedResponse.StatusCode)
 
-	request, err := http.NewRequest(http.MethodGet, httpServer.URL+"/api/mail/agents", nil)
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+"/api/mail/agents", nil)
 	require.NoError(t, err)
 	request.Header.Set("Authorization", "Bearer master-secret-token")
 	authorizedResponse, err := http.DefaultClient.Do(request)
@@ -332,7 +334,7 @@ func TestAgentMailSendReadWaitIdempotencyRedactionAndThreadlessArtifacts(t *test
 		Body:           "Status check from HTTP API",
 	})
 	require.NoError(t, err)
-	postRequest, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/mail/messages", bytes.NewReader(postBody))
+	postRequest, err := http.NewRequestWithContext(t.Context(), http.MethodPost, httpServer.URL+"/api/mail/messages", bytes.NewReader(postBody))
 	require.NoError(t, err)
 	postRequest.Header.Set("Authorization", "Bearer master-secret-token")
 	postRequest.Header.Set("Content-Type", "application/json")

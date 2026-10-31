@@ -78,11 +78,25 @@ tasks:
       - go vet ./...
       - go vet -tags system ./...
 
+  fix:check:
+    desc: Verify Go source against go fix analyzers
+    cmds:
+      - go fix -diff ./...
+      - go fix -tags system -diff ./...
+
+  lint:golangci:
+    desc: Run golangci-lint across unit and system-tagged packages
+    cmds:
+      - golangci-lint run ./...
+      - golangci-lint run --build-tags=system ./...
+
   lint:
     desc: Run static checks across the repository
     cmds:
       - task: fmt:check
       - task: vet
+      - task: fix:check
+      - task: lint:golangci
       - git diff --check
 
   unit:test:
@@ -102,10 +116,9 @@ tasks:
       - task: system:test
 
   ci:
-    desc: Run the full local verification pipeline (formatting, vet, unit + system tests with -race, and cross-platform builds)
+    desc: Run the full local verification pipeline (lint, unit + system tests with -race, and cross-platform builds)
     cmds:
-      - task: fmt:check
-      - task: vet
+      - task: lint
       - task: unit:test
       - task: system:test
       - task: build

@@ -1,8 +1,10 @@
 package store
 
 import (
+	"cmp"
 	"fmt"
 	"reflect"
+	"slices"
 
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 )
@@ -194,7 +196,7 @@ func synthesizeThreadEvents(
 				InstanceID: afterApproval.InstanceID,
 				ApprovalID: approvalID,
 				Status:     afterApproval.Status,
-				Summary:    fmt.Sprintf("Approval requested: %s", afterApproval.Title),
+				Summary:    "Approval requested: " + afterApproval.Title,
 				OccurredAt: chooseTimestamp(afterApproval.RequestedAt, occurredAt),
 			})
 			continue
@@ -254,12 +256,10 @@ func synthesizeThreadEvents(
 		}
 		stream.Head++
 		candidate.Sequence = stream.Head
-		if candidate.OccurredAt == "" {
-			candidate.OccurredAt = occurredAt
-		}
+		candidate.OccurredAt = cmp.Or(candidate.OccurredAt, occurredAt)
 		stream.UpdatedAt = candidate.OccurredAt
 
-		events := append(working.ThreadEvents[candidate.ThreadID], candidate)
+		events := append(slices.Clone(working.ThreadEvents[candidate.ThreadID]), candidate)
 		if len(events) > protocol.ThreadEventRetentionLimit {
 			trimCount := len(events) - protocol.ThreadEventRetentionLimit
 			events = events[trimCount:]
@@ -277,8 +277,5 @@ func synthesizeThreadEvents(
 }
 
 func chooseTimestamp(primary, fallback string) string {
-	if primary != "" {
-		return primary
-	}
-	return fallback
+	return cmp.Or(primary, fallback)
 }

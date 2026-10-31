@@ -125,12 +125,13 @@ func AssessComponents(operationContext context.Context, manifest Manifest, ledge
 			assessment.Readiness = "rejected"
 			appendCode(&assessment, "activation-rejected")
 		case assessment.ActiveVersion == "":
-			if assessment.Provenance == ComponentProvenanceExternal && assessment.HarnessInstalled {
+			switch {
+			case assessment.Provenance == ComponentProvenanceExternal && assessment.HarnessInstalled:
 				assessment.Readiness = authComponentReadiness(assessment.AuthReadiness)
-			} else if assessment.ComponentInstalled {
+			case assessment.ComponentInstalled:
 				assessment.Readiness = "inactive"
 				appendCode(&assessment, "not-activated")
-			} else {
+			default:
 				assessment.Readiness = "unavailable"
 			}
 		case activeErr != nil:

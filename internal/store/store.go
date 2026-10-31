@@ -186,7 +186,7 @@ func (store *Store) JournalMode() (string, error) {
 	store.mutex.RLock()
 	defer store.mutex.RUnlock()
 	var mode string
-	err := store.database.QueryRow(`PRAGMA journal_mode;`).Scan(&mode)
+	err := store.database.QueryRowContext(context.Background(), `PRAGMA journal_mode;`).Scan(&mode)
 	return strings.ToLower(strings.TrimSpace(mode)), err
 }
 
@@ -250,6 +250,33 @@ func (store *Store) Mutate(mutator func(state *State, mutation *Mutation) error)
 		hook()
 	}
 	return committedEvents, nil
+}
+
+// ReadThreadEvents returns a slice of thread events with sequence strictly greater than
+// cursorSequence, up to limit items, and a boolean indicating whether more events exist.
+func (store *Store) ReadThreadEvents(threadID string, cursorSequence int64, limit int) ([]protocol.TaskEventEntry, bool, error) {
+	store.mutex.RLock()
+	defer store.mutex.RUnlock()
+	if store.database == nil {
+		return nil, false, ErrStoreClosed
+	}
+	allEvents := store.state.ThreadEvents[threadID]
+	if limit <= 0 {
+		return nil, false, nil
+	}
+	filtered := make([]protocol.TaskEventEntry, 0, min(limit, len(allEvents)))
+	hasMore := false
+	for _, entry := range allEvents {
+		if entry.Sequence <= cursorSequence {
+			continue
+		}
+		if len(filtered) >= limit {
+			hasMore = true
+			break
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered, hasMore, nil
 }
 
 func (store *Store) SubscribeEvents() (<-chan []protocol.TaskEventEntry, func()) {
@@ -370,7 +397,7 @@ func initializeDatabase(database *sql.DB) error {
 		`PRAGMA busy_timeout = 5000;`,
 	}
 	for _, statement := range pragmas {
-		if _, err := database.Exec(statement); err != nil {
+		if _, err := database.ExecContext(context.Background(), statement); err != nil {
 			return fmt.Errorf("configure sqlite (%s): %w", statement, err)
 		}
 	}
@@ -417,7 +444,7 @@ CREATE TABLE IF NOT EXISTS thread_room_messages (
 	PRIMARY KEY (thread_id, sequence)
 );
 `
-	if _, err := database.Exec(schema); err != nil {
+	if _, err := database.ExecContext(context.Background(), schema); err != nil {
 		return fmt.Errorf("initialize sqlite schema: %w", err)
 	}
 	return nil
@@ -427,7 +454,7 @@ func (store *Store) loadFromDatabase() error {
 	loaded := NewState()
 	serialized := map[string]map[string]string{}
 
-	rows, err := store.database.Query(`SELECT collection, record_id, payload_json FROM kv_records ORDER BY collection, record_id`)
+	rows, err := store.database.QueryContext(context.Background(), `SELECT collection, record_id, payload_json FROM kv_records ORDER BY collection, record_id`)
 	if err != nil {
 		return fmt.Errorf("query kv_records: %w", err)
 	}
@@ -450,7 +477,7 @@ func (store *Store) loadFromDatabase() error {
 		return err
 	}
 
-	headRows, err := store.database.Query(`SELECT thread_id, head_sequence, floor_sequence, updated_at FROM thread_event_heads`)
+	headRows, err := store.database.QueryContext(context.Background(), `SELECT thread_id, head_sequence, floor_sequence, updated_at FROM thread_event_heads`)
 	if err != nil {
 		return fmt.Errorf("query thread_event_heads: %w", err)
 	}
@@ -466,7 +493,7 @@ func (store *Store) loadFromDatabase() error {
 		return err
 	}
 
-	eventRows, err := store.database.Query(`SELECT thread_id, payload_json FROM thread_events ORDER BY thread_id, sequence ASC`)
+	eventRows, err := store.database.QueryContext(context.Background(), `SELECT thread_id, payload_json FROM thread_events ORDER BY thread_id, sequence ASC`)
 	if err != nil {
 		return fmt.Errorf("query thread_events: %w", err)
 	}
@@ -486,7 +513,7 @@ func (store *Store) loadFromDatabase() error {
 		return err
 	}
 
-	roomHeadRows, err := store.database.Query(`SELECT thread_id, directory_name, head_sequence, created_at, updated_at FROM thread_room_heads`)
+	roomHeadRows, err := store.database.QueryContext(context.Background(), `SELECT thread_id, directory_name, head_sequence, created_at, updated_at FROM thread_room_heads`)
 	if err != nil {
 		return fmt.Errorf("query thread_room_heads: %w", err)
 	}
@@ -502,7 +529,7 @@ func (store *Store) loadFromDatabase() error {
 		return err
 	}
 
-	roomMessageRows, err := store.database.Query(`SELECT thread_id, payload_json FROM thread_room_messages ORDER BY thread_id, sequence ASC`)
+	roomMessageRows, err := store.database.QueryContext(context.Background(), `SELECT thread_id, payload_json FROM thread_room_messages ORDER BY thread_id, sequence ASC`)
 	if err != nil {
 		return fmt.Errorf("query thread_room_messages: %w", err)
 	}
@@ -525,7 +552,7 @@ func (store *Store) loadFromDatabase() error {
 	loaded.ensureRoomHeads()
 	for _, threadID := range sortedKeys(loaded.RoomHeads) {
 		head := loaded.RoomHeads[threadID]
-		if _, execErr := store.database.Exec(`
+		if _, execErr := store.database.ExecContext(context.Background(), `
 INSERT INTO thread_room_heads (thread_id, directory_name, head_sequence, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
@@ -551,7 +578,8 @@ func (store *Store) commitDiff(
 	changedRoomHeads map[string]protocol.ThreadRoomHead,
 	newRoomMessages map[string][]protocol.RoomMessage,
 ) error {
-	transaction, err := store.database.BeginTx(context.Background(), nil)
+	operationContext := context.Background()
+	transaction, err := store.database.BeginTx(operationContext, nil)
 	if err != nil {
 		return fmt.Errorf("begin sqlite transaction: %w", err)
 	}
@@ -559,7 +587,7 @@ func (store *Store) commitDiff(
 		_ = transaction.Rollback()
 	}()
 
-	upsertStatement, err := transaction.Prepare(`
+	upsertStatement, err := transaction.PrepareContext(operationContext, `
 INSERT INTO kv_records (collection, record_id, payload_json)
 VALUES (?, ?, ?)
 ON CONFLICT(collection, record_id) DO UPDATE SET payload_json = excluded.payload_json
@@ -569,7 +597,7 @@ ON CONFLICT(collection, record_id) DO UPDATE SET payload_json = excluded.payload
 	}
 	defer upsertStatement.Close()
 
-	deleteStatement, err := transaction.Prepare(`DELETE FROM kv_records WHERE collection = ? AND record_id = ?`)
+	deleteStatement, err := transaction.PrepareContext(operationContext, `DELETE FROM kv_records WHERE collection = ? AND record_id = ?`)
 	if err != nil {
 		return err
 	}
@@ -589,8 +617,8 @@ ON CONFLICT(collection, record_id) DO UPDATE SET payload_json = excluded.payload
 
 		for recordID := range previousRecords {
 			if _, exists := currentRecords[recordID]; !exists {
-				if _, execErr := deleteStatement.Exec(collection, recordID); execErr != nil {
-					return execErr
+				if _, executeError := deleteStatement.ExecContext(operationContext, collection, recordID); executeError != nil {
+					return executeError
 				}
 			}
 		}
@@ -598,23 +626,23 @@ ON CONFLICT(collection, record_id) DO UPDATE SET payload_json = excluded.payload
 			if previousPayload, exists := previousRecords[recordID]; exists && previousPayload == payload {
 				continue
 			}
-			if _, execErr := upsertStatement.Exec(collection, recordID, payload); execErr != nil {
-				return execErr
+			if _, executeError := upsertStatement.ExecContext(operationContext, collection, recordID, payload); executeError != nil {
+				return executeError
 			}
 		}
 	}
 
 	if len(newEvents) > 0 {
-		insertEventStatement, prepErr := transaction.Prepare(`
+		insertEventStatement, prepareError := transaction.PrepareContext(operationContext, `
 INSERT INTO thread_events (thread_id, sequence, event_type, occurred_at, payload_json)
 VALUES (?, ?, ?, ?, ?)
 `)
-		if prepErr != nil {
-			return prepErr
+		if prepareError != nil {
+			return prepareError
 		}
 		defer insertEventStatement.Close()
 
-		upsertHeadStatement, prepErr := transaction.Prepare(`
+		upsertHeadStatement, prepareError := transaction.PrepareContext(operationContext, `
 INSERT INTO thread_event_heads (thread_id, head_sequence, floor_sequence, updated_at)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
@@ -622,8 +650,8 @@ ON CONFLICT(thread_id) DO UPDATE SET
 	floor_sequence = excluded.floor_sequence,
 	updated_at = excluded.updated_at
 `)
-		if prepErr != nil {
-			return prepErr
+		if prepareError != nil {
+			return prepareError
 		}
 		defer upsertHeadStatement.Close()
 
@@ -633,34 +661,35 @@ ON CONFLICT(thread_id) DO UPDATE SET
 			if marshalErr != nil {
 				return marshalErr
 			}
-			if _, execErr := insertEventStatement.Exec(
+			if _, executeError := insertEventStatement.ExecContext(
+				operationContext,
 				event.ThreadID,
 				event.Sequence,
 				event.Type,
 				event.OccurredAt,
 				string(encodedEvent),
-			); execErr != nil {
-				return execErr
+			); executeError != nil {
+				return executeError
 			}
 			touchedThreads[event.ThreadID] = true
 		}
 
 		for threadID := range touchedThreads {
 			if floor, hasPrune := prunedBelow[threadID]; hasPrune && floor > 0 {
-				if _, execErr := transaction.Exec(`DELETE FROM thread_events WHERE thread_id = ? AND sequence <= ?`, threadID, floor); execErr != nil {
-					return execErr
+				if _, executeError := transaction.ExecContext(operationContext, `DELETE FROM thread_events WHERE thread_id = ? AND sequence <= ?`, threadID, floor); executeError != nil {
+					return executeError
 				}
 			}
 			if stream, exists := eventStreams[threadID]; exists {
-				if _, execErr := upsertHeadStatement.Exec(stream.ThreadID, stream.Head, stream.Floor, stream.UpdatedAt); execErr != nil {
-					return execErr
+				if _, executeError := upsertHeadStatement.ExecContext(operationContext, stream.ThreadID, stream.Head, stream.Floor, stream.UpdatedAt); executeError != nil {
+					return executeError
 				}
 			}
 		}
 	}
 
 	if len(changedRoomHeads) > 0 || len(newRoomMessages) > 0 {
-		upsertRoomHeadStatement, prepErr := transaction.Prepare(`
+		upsertRoomHeadStatement, prepareError := transaction.PrepareContext(operationContext, `
 INSERT INTO thread_room_heads (thread_id, directory_name, head_sequence, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
@@ -669,17 +698,17 @@ ON CONFLICT(thread_id) DO UPDATE SET
 	created_at = excluded.created_at,
 	updated_at = excluded.updated_at
 `)
-		if prepErr != nil {
-			return prepErr
+		if prepareError != nil {
+			return prepareError
 		}
 		defer upsertRoomHeadStatement.Close()
 
-		insertRoomMessageStatement, prepErr := transaction.Prepare(`
+		insertRoomMessageStatement, prepareError := transaction.PrepareContext(operationContext, `
 INSERT INTO thread_room_messages (thread_id, sequence, message_id, kind, created_at, payload_json)
 VALUES (?, ?, ?, ?, ?, ?)
 `)
-		if prepErr != nil {
-			return prepErr
+		if prepareError != nil {
+			return prepareError
 		}
 		defer insertRoomMessageStatement.Close()
 
@@ -689,29 +718,31 @@ VALUES (?, ?, ?, ?, ?, ?)
 				if marshalErr != nil {
 					return marshalErr
 				}
-				if _, execErr := insertRoomMessageStatement.Exec(
+				if _, executeError := insertRoomMessageStatement.ExecContext(
+					operationContext,
 					message.ThreadID,
 					message.Sequence,
 					message.ID,
 					message.Kind,
 					message.CreatedAt,
 					string(encodedMessage),
-				); execErr != nil {
-					return execErr
+				); executeError != nil {
+					return executeError
 				}
 			}
 		}
 
 		for _, threadID := range sortedKeys(changedRoomHeads) {
 			head := changedRoomHeads[threadID]
-			if _, execErr := upsertRoomHeadStatement.Exec(
+			if _, executeError := upsertRoomHeadStatement.ExecContext(
+				operationContext,
 				head.ThreadID,
 				head.DirectoryName,
 				head.HeadSequence,
 				head.CreatedAt,
 				head.UpdatedAt,
-			); execErr != nil {
-				return execErr
+			); executeError != nil {
+				return executeError
 			}
 		}
 	}

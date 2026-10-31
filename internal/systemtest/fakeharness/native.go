@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -72,10 +73,7 @@ func runNative(recorder *eventRecorder, role string, arguments []string) int {
 
 	var mcpClient *hubMCPClient
 	if parsed.mcpEndpoint != "" {
-		bearerToken := parsed.mcpBearerToken
-		if bearerToken == "" {
-			bearerToken = os.Getenv("ORCHESTRA_MCP_TOKEN")
-		}
+		bearerToken := cmp.Or(parsed.mcpBearerToken, os.Getenv("ORCHESTRA_MCP_TOKEN"))
 		mcpClient, err = newHubMCPClient(parsed.mcpEndpoint, bearerToken)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "fakeharness: %v\n", err)
@@ -152,8 +150,7 @@ func runNative(recorder *eventRecorder, role string, arguments []string) int {
 	}
 
 	runErr := newScriptEngine(host, mcpClient, parsed.prompt, workingDirectory, conversationID).run(context.Background(), script)
-	var crashResult scriptedCrash
-	if errors.As(runErr, &crashResult) {
+	if crashResult, ok := errors.AsType[scriptedCrash](runErr); ok {
 		return crashResult.code
 	}
 	if errors.Is(runErr, errRunCancelled) {

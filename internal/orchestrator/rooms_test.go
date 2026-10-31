@@ -402,7 +402,7 @@ func TestRoomSafePointsWaitEventsUpdateTaskGateAndEndOfTurnFollowUp(t *testing.T
 		}
 		require.True(t, foundNudge, "expected wait_for_task_events to surface room.nudged")
 	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for room.nudged event")
+		require.FailNow(t, "timed out waiting for room.nudged event")
 	}
 
 	_, err = service.UpdateTask(gateCaller, UpdateTaskInput{
@@ -506,9 +506,11 @@ func TestRoomSafePointsWaitEventsUpdateTaskGateAndEndOfTurnFollowUp(t *testing.T
 	httpServer := httptest.NewServer(service.Handler())
 	defer httpServer.Close()
 
-	unauthorizedResponse, err := http.Get(httpServer.URL + "/api/threads/" + thread.ID + "/room")
+	unauthorizedRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+"/api/threads/"+thread.ID+"/room", nil)
 	require.NoError(t, err)
-	unauthorizedResponse.Body.Close()
+	unauthorizedResponse, err := http.DefaultClient.Do(unauthorizedRequest)
+	require.NoError(t, err)
+	_ = unauthorizedResponse.Body.Close()
 	require.Equal(t, http.StatusUnauthorized, unauthorizedResponse.StatusCode)
 
 	postBody, _ := json.Marshal(map[string]any{
@@ -517,7 +519,7 @@ func TestRoomSafePointsWaitEventsUpdateTaskGateAndEndOfTurnFollowUp(t *testing.T
 		"topic":          "operator-note",
 		"body":           "Ship YAML v2 schema",
 	})
-	postRequest, err := http.NewRequest(http.MethodPost, httpServer.URL+"/api/threads/"+thread.ID+"/room/messages", bytes.NewReader(postBody))
+	postRequest, err := http.NewRequestWithContext(t.Context(), http.MethodPost, httpServer.URL+"/api/threads/"+thread.ID+"/room/messages", bytes.NewReader(postBody))
 	require.NoError(t, err)
 	postRequest.Header.Set("Authorization", "Bearer master-secret-token")
 	postRequest.Header.Set("Content-Type", "application/json")
@@ -526,7 +528,7 @@ func TestRoomSafePointsWaitEventsUpdateTaskGateAndEndOfTurnFollowUp(t *testing.T
 	defer postResponse.Body.Close()
 	require.Equal(t, http.StatusCreated, postResponse.StatusCode)
 
-	getRequest, err := http.NewRequest(http.MethodGet, httpServer.URL+"/api/threads/"+thread.ID+"/room?after=1&kind=decision", nil)
+	getRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+"/api/threads/"+thread.ID+"/room?after=1&kind=decision", nil)
 	require.NoError(t, err)
 	getRequest.Header.Set("Authorization", "Bearer master-secret-token")
 	getResponse, err := http.DefaultClient.Do(getRequest)
