@@ -9,6 +9,7 @@ const instructions = "Use get_task_context for the durable thread, your task, it
 	"Delegating instances inspect get_execution_inventory and submit parallel work with submit_tasks, describing capabilities rather than machines, " +
 	"and may spawn_instance, inspect it with get_instance, renew_instance while it is needed, and release_instance when it is done. " +
 	"Refine or complete the thread with update_thread and post durable files with post_artifact. " +
+	"Peer agents across machines also participate in Orchestra Agent Mail (<handle>@<host>): inspect your address with get_mail_identity, rename your handle with set_mail_identity, discover peers with list_mailboxes, send or reply with send_mail, and inspect or await messages with read_mail and wait_for_mail. " +
 	"Every mutation takes a stable idempotency key: retry with the same key and arguments after a retryable error."
 
 type schema = map[string]any
@@ -314,6 +315,68 @@ var definitions = map[string]toolDefinition{
 			"completion":     object(schema{"summary": text(), "artifactIds": list(text())}, "summary"),
 		}, "idempotencyKey"),
 		output: resultSchema(schema{"created": boolean(), "updateId": text(), "task": anyObject()}, "created", "updateId", "task"),
+	},
+	"get_mail_identity": {
+		title:       "Get mail identity",
+		description: "Inspect this agent's Orchestra mail address (<handle>@<host>), aliases, status, and unread count.",
+		input:       object(schema{}),
+		output:      resultSchema(schema{"mailbox": anyObject()}, "mailbox"),
+		readOnly:    true,
+	},
+	"set_mail_identity": {
+		title:       "Set mail identity",
+		description: "Rename this agent's mail handle (for example \"auth-api\" -> \"auth-api@fabrica\") while retaining the previous address as an alias.",
+		input:       object(schema{"name": text()}, "name"),
+		output:      resultSchema(schema{"mailbox": anyObject()}, "mailbox"),
+	},
+	"list_mailboxes": {
+		title:       "List agent mailboxes",
+		description: "List peer agent mailboxes (<handle>@<host>) across interactive MCP sessions and slave nodes.",
+		input: object(schema{
+			"host":            text(),
+			"onlineOnly":      boolean(),
+			"includeReleased": boolean(),
+			"workspace":       text(),
+		}),
+		output:   resultSchema(schema{"mailboxes": objects()}, "mailboxes"),
+		readOnly: true,
+	},
+	"send_mail": {
+		title:       "Send agent mail",
+		description: "Send a peer-to-peer prompt or reply to another agent by <handle>@<host>, pushing/waking the target agent immediately when supported.",
+		input: object(schema{
+			"idempotencyKey": text(),
+			"to":             text(),
+			"replyToId":      text(),
+			"subject":        text(),
+			"body":           text(),
+			"artifactIds":    list(text()),
+			"wake":           boolean(),
+		}, "idempotencyKey", "body"),
+		output: resultSchema(schema{"message": anyObject(), "recipient": anyObject(), "replayed": boolean()}, "message", "recipient", "replayed"),
+	},
+	"read_mail": {
+		title:       "Read agent mail",
+		description: "Read messages in this agent's inbox or sent folder, optionally marking inbox messages read.",
+		input: object(schema{
+			"box":           enum("inbox", "sent"),
+			"unreadOnly":    boolean(),
+			"afterSequence": schema{"type": "integer", "minimum": 0},
+			"limit":         schema{"type": "integer", "minimum": 1, "maximum": protocol.MaximumMailReadLimit},
+			"markRead":      boolean(),
+		}),
+		output: resultSchema(schema{"mailbox": anyObject(), "messages": objects(), "hasMore": boolean()}, "mailbox", "messages", "hasMore"),
+	},
+	"wait_for_mail": {
+		title:       "Wait for agent mail",
+		description: "Wait up to timeoutMilliseconds for unread mail to arrive in this agent's inbox.",
+		input: object(schema{
+			"timeoutMilliseconds": schema{"type": "integer", "minimum": 0, "maximum": protocol.MaximumWaitMilliseconds},
+			"afterSequence":       schema{"type": "integer", "minimum": 0},
+			"limit":               schema{"type": "integer", "minimum": 1, "maximum": protocol.MaximumMailReadLimit},
+			"markRead":            boolean(),
+		}),
+		output: resultSchema(schema{"mailbox": anyObject(), "messages": objects(), "timedOut": boolean()}, "mailbox", "messages", "timedOut"),
 	},
 }
 

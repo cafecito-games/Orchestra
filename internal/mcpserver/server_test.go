@@ -89,7 +89,7 @@ func TestMCPServerGrantDelegationAndPostArtifact(t *testing.T) {
 	require.Equal(t, http.StatusOK, statusCode)
 	<-workerConfiguration.Connected
 	listedTools := listResult["result"].(map[string]any)["tools"].([]any)
-	require.Len(t, listedTools, 8)
+	require.Len(t, listedTools, len(ToolNames(false)))
 	var leafPostRoomSchema map[string]any
 	for _, rawTool := range listedTools {
 		toolMap := rawTool.(map[string]any)

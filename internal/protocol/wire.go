@@ -15,6 +15,12 @@ var HubToolNames = []string{
 	"update_task",
 	"post_artifact",
 	"update_thread",
+	"get_mail_identity",
+	"set_mail_identity",
+	"list_mailboxes",
+	"send_mail",
+	"read_mail",
+	"wait_for_mail",
 	"get_execution_inventory",
 	"submit_tasks",
 	"delegate_task",
@@ -58,6 +64,12 @@ var OrchestratorToolNames = []string{
 	"release_instance",
 	"list_approvals",
 	"resolve_approval",
+	"get_mail_identity",
+	"set_mail_identity",
+	"list_mailboxes",
+	"send_mail",
+	"read_mail",
+	"wait_for_mail",
 }
 
 func IsHubToolName(name string) bool {
@@ -148,14 +160,15 @@ type HubRPCResponse struct {
 
 // Orchestrator-client WebSocket messages exchanged between `orchestra mcp` and `/orchestrator-client`.
 type OrchestratorClientMessage struct {
-	Type            string          `json:"type"`
-	ProtocolVersion string          `json:"protocolVersion,omitempty"`
-	ClientID        string          `json:"clientId,omitempty"`
-	SessionID       string          `json:"sessionId,omitempty"`
-	RequestID       string          `json:"requestId,omitempty"`
-	Tool            string          `json:"tool,omitempty"`
-	Arguments       json.RawMessage `json:"arguments,omitempty"`
-	At              string          `json:"at,omitempty"`
+	Type            string                  `json:"type"`
+	ProtocolVersion string                  `json:"protocolVersion,omitempty"`
+	ClientID        string                  `json:"clientId,omitempty"`
+	SessionID       string                  `json:"sessionId,omitempty"`
+	Mail            *ClientMailRegistration `json:"mail,omitempty"`
+	RequestID       string                  `json:"requestId,omitempty"`
+	Tool            string                  `json:"tool,omitempty"`
+	Arguments       json.RawMessage         `json:"arguments,omitempty"`
+	At              string                  `json:"at,omitempty"`
 }
 
 type DoorbellNotification struct {
@@ -173,11 +186,13 @@ type OrchestratorServerMessage struct {
 	ProtocolVersion string                `json:"protocolVersion,omitempty"`
 	ClientID        string                `json:"clientId,omitempty"`
 	SessionID       string                `json:"sessionId,omitempty"`
+	Mailbox         *AgentMailbox         `json:"mailbox,omitempty"`
 	Scopes          []string              `json:"scopes,omitempty"`
 	RequestID       string                `json:"requestId,omitempty"`
 	Result          json.RawMessage       `json:"result,omitempty"`
 	Error           *HubRPCError          `json:"error,omitempty"`
 	Doorbell        *DoorbellNotification `json:"doorbell,omitempty"`
+	Mail            *MailNotification     `json:"mail,omitempty"`
 	ThreadID        string                `json:"threadId,omitempty"`
 	Reason          string                `json:"reason,omitempty"`
 	At              string                `json:"at,omitempty"`

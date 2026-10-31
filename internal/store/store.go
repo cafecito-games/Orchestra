@@ -55,6 +55,9 @@ const (
 	collectionRunTranscripts      = "run_transcripts"
 	collectionRoomMessageReceipts = "room_message_receipts"
 	collectionRoomNudgeReceipts   = "room_nudge_receipts"
+	collectionMailboxes           = "mailboxes"
+	collectionMailMessages        = "mail_messages"
+	collectionMailReceipts        = "mail_receipts"
 )
 
 type Mutation struct {
@@ -809,6 +812,15 @@ func serializeCollections(state *State) (map[string]map[string]string, error) {
 	if result[collectionRoomNudgeReceipts], err = serializeMap(state.RoomNudgeReceipts); err != nil {
 		return nil, err
 	}
+	if result[collectionMailboxes], err = serializeMap(state.Mailboxes); err != nil {
+		return nil, err
+	}
+	if result[collectionMailMessages], err = serializeMap(state.MailMessages); err != nil {
+		return nil, err
+	}
+	if result[collectionMailReceipts], err = serializeMap(state.MailReceipts); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -875,6 +887,12 @@ func decodeRecordIntoState(state *State, collection, recordID string, data []byt
 		return decodeInto(state.RoomMessageReceipts, recordID, data)
 	case collectionRoomNudgeReceipts:
 		return decodeInto(state.RoomNudgeReceipts, recordID, data)
+	case collectionMailboxes:
+		return decodeInto(state.Mailboxes, recordID, data)
+	case collectionMailMessages:
+		return decodeInto(state.MailMessages, recordID, data)
+	case collectionMailReceipts:
+		return decodeInto(state.MailReceipts, recordID, data)
 	default:
 		return nil
 	}

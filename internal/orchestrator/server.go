@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -100,6 +101,10 @@ type Service struct {
 	replayMutex   sync.Mutex
 	replayWindows map[string]*replayWindow
 
+	mailSubscriberSequence atomic.Int64
+	mailSubscriberMutex    sync.Mutex
+	mailSubscribers        map[int64]chan protocol.MailMessage
+
 	backgroundCancel context.CancelFunc
 	backgroundGroup  sync.WaitGroup
 	mcpHandler       http.Handler
@@ -145,6 +150,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 		slaves:           map[string]*slaveSession{},
 		clients:          map[string]*orchestratorClientSession{},
 		replayWindows:    map[string]*replayWindow{},
+		mailSubscribers:  map[int64]chan protocol.MailMessage{},
 	}
 	service.mcpHandler, service.closeMCP = service.newMCPHTTPHandler()
 
@@ -169,6 +175,13 @@ func NewService(options ServiceOptions) (*Service, error) {
 				state.Nodes[nodeID] = node
 			}
 		}
+		for mailboxID, mailbox := range state.Mailboxes {
+			if mailbox.Kind == "mcp-session" && mailbox.Status == "online" {
+				mailbox.Status = "offline"
+				mailbox.UpdatedAt = nowText
+				state.Mailboxes[mailboxID] = mailbox
+			}
+		}
 		return nil
 	})
 
@@ -189,6 +202,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 }
 
 func (service *Service) Close() {
+	service.closeMailSubscribers()
 	if service.closeMCP != nil {
 		service.closeMCP()
 	}
@@ -266,6 +280,9 @@ func (service *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/artifacts/", service.handleAPIArtifactSubroutes)
 	mux.HandleFunc("/api/workspace-leases", service.requireBearer(service.handleAPIWorkspaceLeases))
 	mux.HandleFunc("/api/workspace-leases/", service.requireBearer(service.handleAPIWorkspaceLeaseSubroutes))
+	mux.HandleFunc("/api/mail/agents", service.requireBearer(service.handleAPIMailAgents))
+	mux.HandleFunc("/api/mail/messages", service.requireBearer(service.handleAPIMailMessages))
+	mux.HandleFunc("/api/mail/rename", service.requireBearer(service.handleAPIMailRename))
 	return mux
 }
 
@@ -389,19 +406,30 @@ func (service *Service) serveOrchestratorClientConnection(requestContext context
 
 	defer func() {
 		cancelSession()
+		removedCurrent := false
 		service.clientsMutex.Lock()
 		if service.clients[sessionID] == session {
 			delete(service.clients, sessionID)
+			removedCurrent = true
 		}
 		service.clientsMutex.Unlock()
+		if removedCurrent {
+			service.DisconnectClientMailbox(sessionID)
+		}
 		_ = connection.Close(websocket.StatusNormalClosure, "closed")
 	}()
+
+	var mailboxPointer *protocol.AgentMailbox
+	if registeredMailbox, regErr := service.RegisterClientMailbox(clientID, sessionID, registration.Mail); regErr == nil {
+		mailboxPointer = &registeredMailbox
+	}
 
 	if err := session.send(sessionContext, protocol.OrchestratorServerMessage{
 		Type:            "welcome",
 		ProtocolVersion: protocol.ProtocolVersion,
 		ClientID:        clientID,
 		SessionID:       sessionID,
+		Mailbox:         mailboxPointer,
 		Scopes:          slices.Clone(protocol.OrchestratorToolNames),
 		At:              service.nowUTC(),
 	}); err != nil {
@@ -430,6 +458,19 @@ func (service *Service) serveOrchestratorClientConnection(requestContext context
 				Type: "pong",
 				At:   service.nowUTC(),
 			})
+		case "mail.identify":
+			identifiedMailbox, identifyErr := service.RegisterClientMailbox(clientID, sessionID, message.Mail)
+			response := protocol.OrchestratorServerMessage{
+				Type:      "mail.identified",
+				RequestID: message.RequestID,
+				At:        service.nowUTC(),
+			}
+			if identifyErr != nil {
+				response.Error = toHubRPCError(identifyErr)
+			} else {
+				response.Mailbox = &identifiedMailbox
+			}
+			_ = session.send(sessionContext, response)
 		case "tool.call":
 			requestID := message.RequestID
 			toolName := message.Tool
@@ -834,6 +875,118 @@ func (service *Service) handleAPIWorkspaceLeaseSubroutes(writer http.ResponseWri
 		return
 	}
 	writeJSONResponse(writer, http.StatusOK, map[string]any{"workspaceLease": updated})
+}
+
+func (service *Service) handleAPIMailAgents(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	query := request.URL.Query()
+	onlineOnly := query.Get("onlineOnly") == "1" || strings.EqualFold(query.Get("onlineOnly"), "true")
+	includeReleased := query.Get("includeReleased") == "1" || strings.EqualFold(query.Get("includeReleased"), "true")
+	result, err := service.ListMailboxes(ListMailboxesInput{
+		Host:            query.Get("host"),
+		OnlineOnly:      onlineOnly,
+		IncludeReleased: includeReleased,
+		Workspace:       query.Get("workspace"),
+	})
+	if err != nil {
+		writeOperationError(writer, err)
+		return
+	}
+	writeJSONResponse(writer, http.StatusOK, result)
+}
+
+func (service *Service) handleAPIMailMessages(writer http.ResponseWriter, request *http.Request) {
+	operatorCaller := CallerIdentity{Kind: "operator", OperatorID: "cli"}
+	switch request.Method {
+	case http.MethodGet:
+		query := request.URL.Query()
+		unreadOnly := query.Get("unreadOnly") == "1" || strings.EqualFold(query.Get("unreadOnly"), "true")
+		var afterSequence int64
+		if rawAfter := strings.TrimSpace(query.Get("afterSequence")); rawAfter != "" {
+			parsedAfter, parseErr := strconv.ParseInt(rawAfter, 10, 64)
+			if parseErr != nil {
+				writeOperationError(writer, invalidRequest("afterSequence must be an integer"))
+				return
+			}
+			afterSequence = parsedAfter
+		}
+		var limit int
+		if rawLimit := strings.TrimSpace(query.Get("limit")); rawLimit != "" {
+			parsedLimit, parseErr := strconv.Atoi(rawLimit)
+			if parseErr != nil {
+				writeOperationError(writer, invalidRequest("limit must be an integer"))
+				return
+			}
+			limit = parsedLimit
+		}
+		var markRead *bool
+		if rawMarkRead := strings.TrimSpace(query.Get("markRead")); rawMarkRead != "" {
+			parsedMarkRead := rawMarkRead == "1" || strings.EqualFold(rawMarkRead, "true")
+			markRead = &parsedMarkRead
+		} else {
+			defaultNoMark := false
+			markRead = &defaultNoMark
+		}
+		result, err := service.ReadMail(operatorCaller, ReadMailInput{
+			Address:       query.Get("address"),
+			Box:           query.Get("box"),
+			UnreadOnly:    unreadOnly,
+			AfterSequence: afterSequence,
+			Limit:         limit,
+			MarkRead:      markRead,
+		})
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	case http.MethodPost:
+		var input SendMailInput
+		if err := json.NewDecoder(io.LimitReader(request.Body, 256*1024)).Decode(&input); err != nil {
+			writeOperationError(writer, invalidRequest("malformed JSON body"))
+			return
+		}
+		if strings.TrimSpace(input.IdempotencyKey) == "" {
+			input.IdempotencyKey = protocol.NewIdentifier("cli")
+		}
+		result, err := service.SendMail(operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		statusCode := http.StatusCreated
+		if result.Replayed {
+			statusCode = http.StatusOK
+		}
+		writeJSONResponse(writer, statusCode, result)
+	default:
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (service *Service) handleAPIMailRename(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var input SetMailIdentityInput
+	if err := json.NewDecoder(io.LimitReader(request.Body, 32*1024)).Decode(&input); err != nil {
+		writeOperationError(writer, invalidRequest("malformed JSON body"))
+		return
+	}
+	if strings.TrimSpace(input.Address) == "" {
+		writeOperationError(writer, invalidRequest("address is required"))
+		return
+	}
+	updated, err := service.SetMailIdentity(CallerIdentity{Kind: "operator", OperatorID: "cli"}, input)
+	if err != nil {
+		writeOperationError(writer, err)
+		return
+	}
+	writeJSONResponse(writer, http.StatusOK, map[string]any{"mailbox": updated})
 }
 
 func (service *Service) nowUTC() string {

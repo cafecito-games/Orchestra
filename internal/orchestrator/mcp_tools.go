@@ -172,7 +172,7 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 				"sizeBytes":    map[string]any{"type": "integer", "minimum": 0, "maximum": protocol.MaximumArtifactSizeBytes},
 				"sha256":       map[string]any{"type": "string"},
 				"summary":      map[string]any{"type": "string"},
-			}, []string{"threadId"}),
+			}, nil),
 		},
 		{
 			Name:        "spawn_instance",
@@ -229,6 +229,64 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 				"optionId":   map[string]any{"type": "string"},
 			}, []string{"approvalId"}),
 		},
+		{
+			Name:        "get_mail_identity",
+			Description: "Inspect this agent session's Orchestra mail address (<handle>@<host>), aliases, status, and unread message count.",
+			InputSchema: objectSchema(nil, nil),
+		},
+		{
+			Name:        "set_mail_identity",
+			Description: "Rename this agent's mail handle (for example \"auth-api\" -> \"auth-api@fabrica\") or, if address is specified, rename another mailbox while keeping the old address as an alias.",
+			InputSchema: objectSchema(map[string]any{
+				"name":    map[string]any{"type": "string"},
+				"address": map[string]any{"type": "string"},
+			}, []string{"name"}),
+		},
+		{
+			Name:        "list_mailboxes",
+			Description: "List registered peer agent mailboxes (<handle>@<host>) across interactive MCP sessions and slave nodes.",
+			InputSchema: objectSchema(map[string]any{
+				"host":            map[string]any{"type": "string"},
+				"onlineOnly":      map[string]any{"type": "boolean"},
+				"includeReleased": map[string]any{"type": "boolean"},
+				"workspace":       map[string]any{"type": "string"},
+			}, nil),
+		},
+		{
+			Name:        "send_mail",
+			Description: "Send a peer-to-peer mail prompt or reply to another agent by <handle>@<host> (pushing/waking the target agent immediately when supported).",
+			InputSchema: objectSchema(map[string]any{
+				"idempotencyKey": map[string]any{"type": "string"},
+				"to":             map[string]any{"type": "string"},
+				"replyToId":      map[string]any{"type": "string"},
+				"subject":        map[string]any{"type": "string"},
+				"body":           map[string]any{"type": "string"},
+				"artifactIds":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"wake":           map[string]any{"type": "boolean"},
+			}, []string{"idempotencyKey", "body"}),
+		},
+		{
+			Name:        "read_mail",
+			Description: "Read messages in this agent's inbox or sent folder, optionally marking inbox messages read.",
+			InputSchema: objectSchema(map[string]any{
+				"address":       map[string]any{"type": "string"},
+				"box":           map[string]any{"type": "string", "enum": []string{"inbox", "sent"}},
+				"unreadOnly":    map[string]any{"type": "boolean"},
+				"afterSequence": map[string]any{"type": "integer", "minimum": 0},
+				"limit":         map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumMailReadLimit},
+				"markRead":      map[string]any{"type": "boolean"},
+			}, nil),
+		},
+		{
+			Name:        "wait_for_mail",
+			Description: "Block up to timeoutMilliseconds waiting for unread mail to arrive in this agent's inbox.",
+			InputSchema: objectSchema(map[string]any{
+				"timeoutMilliseconds": map[string]any{"type": "integer", "minimum": 0, "maximum": protocol.MaximumWaitMilliseconds},
+				"afterSequence":       map[string]any{"type": "integer", "minimum": 0},
+				"limit":               map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumMailReadLimit},
+				"markRead":            map[string]any{"type": "boolean"},
+			}, nil),
+		},
 	}
 }
 
@@ -239,6 +297,37 @@ func (service *Service) newMCPHTTPHandler() (http.Handler, func()) {
 			Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}},
 		},
 	)
+	protocolServer.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(operationContext context.Context, method string, request mcp.Request) (mcp.Result, error) {
+			result, err := next(operationContext, method, request)
+			if method == "initialize" && err == nil && request != nil {
+				sessionID := "http-session"
+				if session := request.GetSession(); session != nil && protocol.IsIdentifier(session.ID()) {
+					sessionID = session.ID()
+				}
+				clientID := sessionID
+				requestedName := ""
+				requestedHost := ""
+				if extra := request.GetExtra(); extra != nil && extra.Header != nil {
+					if headerClient := strings.TrimSpace(extra.Header.Get("X-Orchestra-Client-Id")); protocol.IsIdentifier(headerClient) {
+						clientID = headerClient
+					}
+					requestedName = strings.TrimSpace(extra.Header.Get("X-Orchestra-Mail-Name"))
+					requestedHost = strings.TrimSpace(extra.Header.Get("X-Orchestra-Mail-Host"))
+				}
+				harnessName := ""
+				if initializeParameters, ok := request.GetParams().(*mcp.InitializeParams); ok && initializeParameters != nil && initializeParameters.ClientInfo != nil {
+					harnessName = initializeParameters.ClientInfo.Name
+				}
+				_, _ = service.RegisterClientMailbox(clientID, sessionID, &protocol.ClientMailRegistration{
+					RequestedName: requestedName,
+					Host:          requestedHost,
+					Harness:       harnessName,
+				})
+			}
+			return result, err
+		}
+	})
 	for _, definition := range OrchestratorToolDefinitions() {
 		protocolServer.AddTool(&mcp.Tool{
 			Name:        definition.Name,
@@ -339,7 +428,6 @@ func (service *Service) ExecuteOrchestratorTool(
 	toolName string,
 	rawArguments json.RawMessage,
 ) (json.RawMessage, error) {
-	_ = operationContext
 	if caller.Kind == "" {
 		caller.Kind = "orchestrator-client"
 	}
@@ -511,6 +599,46 @@ func (service *Service) ExecuteOrchestratorTool(
 			return nil, resolveErr
 		}
 		responseValue = map[string]any{"approval": approval}
+	case "get_mail_identity":
+		mailbox, identityErr := service.GetMailIdentity(caller)
+		if identityErr != nil {
+			return nil, identityErr
+		}
+		responseValue = map[string]any{"mailbox": mailbox}
+	case "set_mail_identity":
+		input, decodeErr := decodeToolArguments[SetMailIdentityInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		mailbox, setErr := service.SetMailIdentity(caller, input)
+		if setErr != nil {
+			return nil, setErr
+		}
+		responseValue = map[string]any{"mailbox": mailbox}
+	case "list_mailboxes":
+		input, decodeErr := decodeToolArguments[ListMailboxesInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.ListMailboxes(input)
+	case "send_mail":
+		input, decodeErr := decodeToolArguments[SendMailInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.SendMail(caller, input)
+	case "read_mail":
+		input, decodeErr := decodeToolArguments[ReadMailInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.ReadMail(caller, input)
+	case "wait_for_mail":
+		input, decodeErr := decodeToolArguments[WaitForMailInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.WaitForMail(operationContext, caller, input)
 	default:
 		return nil, invalidRequest(fmt.Sprintf("unknown orchestrator tool %q", toolName))
 	}

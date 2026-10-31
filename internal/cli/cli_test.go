@@ -257,6 +257,63 @@ func TestCLIOperatorCommandsAndSetupDoctor(t *testing.T) {
 	require.Equal(t, 0, code, stderr)
 	require.Contains(t, strings.TrimSpace(stdout), "messages.jsonl")
 
+	_, err = service.RegisterClientMailbox("claude-cli-agent", "sess-cli-mail", &protocol.ClientMailRegistration{
+		RequestedName: "claude1234",
+		Host:          "fabrica",
+		Harness:       "claude-code",
+		Workspace:     canonicalRoots[0],
+		PushCapable:   true,
+	})
+	require.NoError(t, err)
+
+	code, stdout, stderr = runCLI("mail", "--help")
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stdout, "orchestra mail")
+
+	code, stdout, stderr = runCLI("mail", "agents")
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stdout, "claude1234@fabrica")
+
+	code, stdout, stderr = runCLI(
+		"mail", "send", "claude1234@fabrica", "Run full integration suite on main",
+		"--subject", "Nightly verification",
+		"--from", "operator@fabrica",
+		"--idempotency-key", "cli-mail-send-1",
+	)
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stdout, "Sent mail")
+	require.Contains(t, stdout, "claude1234@fabrica")
+
+	code, stdout, stderr = runCLI("mail", "inbox", "claude1234@fabrica", "--unread")
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stdout, "Nightly verification")
+	require.Contains(t, stdout, "Run full integration suite on main")
+
+	code, stdout, stderr = runCLI("mail", "inbox", "claude1234@fabrica", "--unread", "--mark-read", "--json")
+	require.Equal(t, 0, code, stderr)
+	var inboxPayload orchestrator.ReadMailResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &inboxPayload))
+	require.Len(t, inboxPayload.Messages, 1)
+	require.True(t, inboxPayload.Messages[0].Read)
+	require.Equal(t, 0, inboxPayload.Mailbox.UnreadCount)
+
+	code, stdout, stderr = runCLI("mail", "rename", "claude1234@fabrica", "release-captain")
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stdout, "release-captain@fabrica")
+
+	code, stdout, stderr = runCLI("mail", "agents", "--json")
+	require.Equal(t, 0, code, stderr)
+	var agentsPayload orchestrator.ListMailboxesResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &agentsPayload))
+	foundRenamed := false
+	for _, candidate := range agentsPayload.Mailboxes {
+		if candidate.Address == "release-captain@fabrica" {
+			foundRenamed = true
+			require.Contains(t, candidate.Aliases, "claude1234@fabrica")
+		}
+	}
+	require.True(t, foundRenamed)
+
 	code, stdout, stderr = runCLI("setup", "plan")
 	require.Equal(t, 0, code, stderr)
 	var planPayload map[string]any
