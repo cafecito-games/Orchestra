@@ -2,6 +2,7 @@ package protocol_test
 
 import (
 	"encoding/json"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"testing"
@@ -1650,4 +1651,91 @@ func TestVersionAndPathUtilities(t *testing.T) {
 		clientCreator := protocol.InstanceCreator{Kind: "orchestrator-client", ClientID: "client-1"}
 		assert.Equal(t, "orchestrator-client:client-1", clientCreator.SourceKey())
 	})
+}
+
+func TestResolveBuildInfo(t *testing.T) {
+	testCases := []struct {
+		name              string
+		rawVersion        string
+		rawCommit         string
+		rawDate           string
+		rawTreeState      string
+		goVersion         string
+		embeddedBuildInfo *debug.BuildInfo
+		expected          protocol.BuildInfo
+		expectedText      string
+	}{
+		{
+			name:         "linker injected clean release metadata",
+			rawVersion:   "v1.4.2",
+			rawCommit:    "0123456789abcdef0123456789abcdef01234567",
+			rawDate:      "2026-10-31T13:30:00Z",
+			rawTreeState: "clean",
+			goVersion:    "go1.26.9",
+			embeddedBuildInfo: &debug.BuildInfo{
+				Main: debug.Module{Version: "(devel)"},
+				Settings: []debug.BuildSetting{
+					{Key: "vcs.revision", Value: "ignored"},
+					{Key: "vcs.modified", Value: "true"},
+				},
+			},
+			expected: protocol.BuildInfo{
+				Version:         "1.4.2",
+				ProtocolVersion: protocol.ProtocolVersion,
+				Commit:          "0123456789abcdef0123456789abcdef01234567",
+				Date:            "2026-10-31T13:30:00Z",
+				TreeState:       "clean",
+				GoVersion:       "go1.26.9",
+			},
+			expectedText: "orchestra 1.4.2 (protocol v1, commit 0123456789ab, built 2026-10-31T13:30:00Z)",
+		},
+		{
+			name:       "vcs fallback for go install module version and dirty tree",
+			rawVersion: "dev",
+			goVersion:  "go1.26.9",
+			embeddedBuildInfo: &debug.BuildInfo{
+				Main: debug.Module{Version: "v0.3.1"},
+				Settings: []debug.BuildSetting{
+					{Key: "vcs.revision", Value: "fedcba9876543210"},
+					{Key: "vcs.time", Value: "2026-10-31T10:00:00Z"},
+					{Key: "vcs.modified", Value: "true"},
+				},
+			},
+			expected: protocol.BuildInfo{
+				Version:         "0.3.1",
+				ProtocolVersion: protocol.ProtocolVersion,
+				Commit:          "fedcba9876543210",
+				Date:            "2026-10-31T10:00:00Z",
+				TreeState:       "dirty",
+				GoVersion:       "go1.26.9",
+			},
+			expectedText: "orchestra 0.3.1 (protocol v1, commit fedcba987654, dirty, built 2026-10-31T10:00:00Z)",
+		},
+		{
+			name:       "minimal fallback without vcs metadata",
+			rawVersion: "(devel)",
+			goVersion:  "go1.26.9",
+			expected: protocol.BuildInfo{
+				Version:         "dev",
+				ProtocolVersion: protocol.ProtocolVersion,
+				GoVersion:       "go1.26.9",
+			},
+			expectedText: "orchestra dev (protocol v1)",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			resolved := protocol.ResolveBuildInfo(
+				testCase.rawVersion,
+				testCase.rawCommit,
+				testCase.rawDate,
+				testCase.rawTreeState,
+				testCase.goVersion,
+				testCase.embeddedBuildInfo,
+			)
+			assert.Equal(t, testCase.expected, resolved)
+			assert.Equal(t, testCase.expectedText, resolved.String())
+		})
+	}
 }

@@ -81,7 +81,7 @@ func runAntigravityACPBridge(
 	if runErr := antigravityacp.Run(operationContext, standardInput, standardOutput, standardError, antigravityacp.Options{
 		Binary:         resolvedBinary,
 		StateDirectory: *stateDirectory,
-		Version:        protocol.BuildVersion,
+		Version:        protocol.EffectiveBuildVersion(),
 	}); runErr != nil && !errors.Is(runErr, context.Canceled) {
 		fmt.Fprintf(standardError, "orchestra acp-bridge antigravity: %v\n", runErr)
 		return 1

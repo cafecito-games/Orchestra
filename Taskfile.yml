@@ -3,12 +3,31 @@ version: "3"
 dotenv: [".env"]
 
 vars:
-  ORCHESTRA_BASE_VERSION: 0.1.0
   ORCHESTRA_VERSION:
     sh: |
-      revision="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
-      echo "{{.ORCHESTRA_BASE_VERSION}}+${revision}"
-  LDFLAGS: -s -w -X github.com/cafecito-games/Orchestra/internal/protocol.BuildVersion={{.ORCHESTRA_VERSION}}
+      described="$(git describe --tags --always --dirty 2>/dev/null || true)"
+      case "${described}" in
+        "") echo "dev" ;;
+        v[0-9]*) echo "${described#v}" ;;
+        *) echo "dev+${described}" ;;
+      esac
+  ORCHESTRA_COMMIT:
+    sh: git rev-parse HEAD 2>/dev/null || true
+  ORCHESTRA_BUILD_DATE:
+    sh: date -u +"%Y-%m-%dT%H:%M:%SZ"
+  ORCHESTRA_TREE_STATE:
+    sh: |
+      if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+        echo "clean"
+      else
+        echo "dirty"
+      fi
+  LDFLAGS: >-
+    -s -w
+    -X github.com/cafecito-games/Orchestra/internal/protocol.BuildVersion={{.ORCHESTRA_VERSION}}
+    -X github.com/cafecito-games/Orchestra/internal/protocol.BuildCommit={{.ORCHESTRA_COMMIT}}
+    -X github.com/cafecito-games/Orchestra/internal/protocol.BuildDate={{.ORCHESTRA_BUILD_DATE}}
+    -X github.com/cafecito-games/Orchestra/internal/protocol.BuildTreeState={{.ORCHESTRA_TREE_STATE}}
 
 tasks:
   default:
@@ -84,6 +103,11 @@ tasks:
       - go fix -diff ./...
       - go fix -tags system -diff ./...
 
+  mod:check:
+    desc: Verify go.mod and go.sum are tidy
+    cmds:
+      - go mod tidy -diff
+
   lint:golangci:
     desc: Run golangci-lint across unit and system-tagged packages
     cmds:
@@ -94,6 +118,7 @@ tasks:
     desc: Run static checks across the repository
     cmds:
       - task: fmt:check
+      - task: mod:check
       - task: vet
       - task: fix:check
       - task: lint:golangci
@@ -123,6 +148,11 @@ tasks:
       - task: system:test
       - task: build
       - task: build:all
+
+  release:snapshot:
+    desc: Build cross-platform GoReleaser snapshot archives and Homebrew cask manifest locally
+    cmds:
+      - goreleaser release --snapshot --clean
 
   clean:
     desc: Remove build artifacts in bin/ and dist/

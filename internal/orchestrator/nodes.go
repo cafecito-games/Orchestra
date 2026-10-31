@@ -144,7 +144,7 @@ func (service *Service) GetStatus() (protocol.StatusResponse, error) {
 		return protocol.StatusResponse{}, err
 	}
 	response := protocol.StatusResponse{
-		Version:         protocol.BuildVersion,
+		Version:         protocol.EffectiveBuildVersion(),
 		ProtocolVersion: protocol.ProtocolVersion,
 		StartedAt:       service.startedAt,
 		Now:             service.nowUTC(),

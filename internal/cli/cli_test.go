@@ -39,7 +39,9 @@ func TestCLIVersionAndHelp(t *testing.T) {
 	assert.Equal(t, 0, exitCode)
 	var versionPayload map[string]string
 	require.NoError(t, json.Unmarshal(stdout.Bytes(), &versionPayload))
+	assert.Equal(t, protocol.EffectiveBuildVersion(), versionPayload["version"])
 	assert.Equal(t, protocol.ProtocolVersion, versionPayload["protocolVersion"])
+	assert.NotEmpty(t, versionPayload["goVersion"])
 
 	stdout.Reset()
 	stderr.Reset()

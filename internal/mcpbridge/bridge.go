@@ -327,7 +327,7 @@ const bridgeInstructions = "Orchestra connects coding agents across machines. " 
 
 func (bridge *Bridge) newProtocolServer() *mcp.Server {
 	protocolServer := mcp.NewServer(
-		&mcp.Implementation{Name: "orchestra", Version: protocol.BuildVersion},
+		&mcp.Implementation{Name: "orchestra", Version: protocol.EffectiveBuildVersion()},
 		&mcp.ServerOptions{
 			Instructions: bridgeInstructions,
 			Capabilities: &mcp.ServerCapabilities{

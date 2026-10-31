@@ -293,7 +293,7 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 		}
 		configuration.HTTPClient = httpClient
 	}
-	configuration.Version = protocol.BuildVersion
+	configuration.Version = protocol.EffectiveBuildVersion()
 	return configuration, nil
 }
 

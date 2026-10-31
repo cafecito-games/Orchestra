@@ -4,9 +4,13 @@
 package protocol
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/hex"
+	"runtime"
+	"runtime/debug"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -22,7 +26,135 @@ const (
 	PromptMaximumBytes     = 256 * 1024
 )
 
-var BuildVersion = "0.1.0"
+// Linker-injected build metadata set via -ldflags -X during release and Task builds.
+var (
+	BuildVersion   = "dev"
+	BuildCommit    = ""
+	BuildDate      = ""
+	BuildTreeState = ""
+)
+
+// BuildInfo describes the application version, protocol version, VCS revision,
+// and Go toolchain embedded in an Orchestra binary.
+type BuildInfo struct {
+	Version         string `json:"version"`
+	ProtocolVersion string `json:"protocolVersion"`
+	Commit          string `json:"commit,omitempty"`
+	Date            string `json:"date,omitempty"`
+	TreeState       string `json:"treeState,omitempty"`
+	GoVersion       string `json:"goVersion"`
+}
+
+// CurrentBuildInfo returns linker-injected build metadata supplemented by Go's
+// embedded VCS and module build settings.
+func CurrentBuildInfo() BuildInfo {
+	embeddedBuildInfo, _ := debug.ReadBuildInfo()
+	return ResolveBuildInfo(BuildVersion, BuildCommit, BuildDate, BuildTreeState, runtime.Version(), embeddedBuildInfo)
+}
+
+// EffectiveBuildVersion returns the normalized Orchestra build version.
+func EffectiveBuildVersion() string {
+	return CurrentBuildInfo().Version
+}
+
+// ResolveBuildInfo merges linker-injected metadata with embedded Go build settings.
+func ResolveBuildInfo(
+	rawVersion string,
+	rawCommit string,
+	rawDate string,
+	rawTreeState string,
+	goVersion string,
+	embeddedBuildInfo *debug.BuildInfo,
+) BuildInfo {
+	versionValue := normalizeBuildVersion(rawVersion)
+	commitHash := strings.TrimSpace(rawCommit)
+	buildDate := strings.TrimSpace(rawDate)
+	treeState := normalizeTreeState(rawTreeState)
+
+	if embeddedBuildInfo != nil {
+		if versionValue == "dev" && embeddedBuildInfo.Main.Version != "" && embeddedBuildInfo.Main.Version != "(devel)" {
+			versionValue = normalizeBuildVersion(embeddedBuildInfo.Main.Version)
+		}
+		for _, setting := range embeddedBuildInfo.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				if commitHash == "" {
+					commitHash = strings.TrimSpace(setting.Value)
+				}
+			case "vcs.time":
+				if buildDate == "" {
+					buildDate = strings.TrimSpace(setting.Value)
+				}
+			case "vcs.modified":
+				if treeState == "" {
+					if modified, err := strconv.ParseBool(setting.Value); err == nil {
+						if modified {
+							treeState = "dirty"
+						} else {
+							treeState = "clean"
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return BuildInfo{
+		Version:         versionValue,
+		ProtocolVersion: ProtocolVersion,
+		Commit:          commitHash,
+		Date:            buildDate,
+		TreeState:       treeState,
+		GoVersion:       strings.TrimSpace(goVersion),
+	}
+}
+
+// String formats BuildInfo as a single human-readable line for CLI output.
+func (info BuildInfo) String() string {
+	details := []string{"protocol v" + cmp.Or(info.ProtocolVersion, ProtocolVersion)}
+	if info.Commit != "" {
+		commitLabel := "commit " + shortCommitHash(info.Commit)
+		if info.TreeState == "dirty" {
+			commitLabel += ", dirty"
+		}
+		details = append(details, commitLabel)
+	} else if info.TreeState == "dirty" {
+		details = append(details, "dirty")
+	}
+	if info.Date != "" {
+		details = append(details, "built "+info.Date)
+	}
+	return "orchestra " + cmp.Or(info.Version, "dev") + " (" + strings.Join(details, ", ") + ")"
+}
+
+func normalizeBuildVersion(rawValue string) string {
+	trimmed := strings.TrimSpace(rawValue)
+	if trimmed == "" || trimmed == "(devel)" {
+		return "dev"
+	}
+	if len(trimmed) > 1 && trimmed[0] == 'v' && trimmed[1] >= '0' && trimmed[1] <= '9' {
+		return trimmed[1:]
+	}
+	return trimmed
+}
+
+func normalizeTreeState(rawValue string) string {
+	switch strings.ToLower(strings.TrimSpace(rawValue)) {
+	case "clean":
+		return "clean"
+	case "dirty":
+		return "dirty"
+	default:
+		return ""
+	}
+}
+
+func shortCommitHash(commitHash string) string {
+	if len(commitHash) > 12 {
+		return commitHash[:12]
+	}
+	return commitHash
+}
 
 func NewIdentifier(prefix string) string {
 	var randomBytes [8]byte

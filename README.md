@@ -8,6 +8,7 @@
 [![CGo-Free](https://img.shields.io/badge/CGO__ENABLED-0-success)](#1-build--install)
 [![SQLite WAL](https://img.shields.io/badge/State-Pure--Go_SQLite-003B57?logo=sqlite&logoColor=white)](#how-it-works)
 [![Protocols](https://img.shields.io/badge/Protocols-MCP_%2B_ACP_v1-6E56CF)](#3-connect-your-coding-agent)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 [Quickstart](#quickstart-local-in-60-seconds) · [How It Works](#how-it-works) · [Multi-Machine Setup](#scaling-to-multiple-machines) · [Operator CLI](#operator-cli) · [Architecture & Security](#reference--deep-dives)
 
@@ -31,10 +32,17 @@ Try Orchestra on a single machine first—no network setup or adapter downloads 
 
 ### 1. Build & Install
 
-Requires **Go 1.26+** (and optionally [`task`](https://taskfile.dev)):
+Install prebuilt binaries on macOS or Linux via Homebrew:
 
 ```bash
-# Build and install to ~/.local/bin/orchestra
+brew install cafecito-games/tap/orchestra
+orchestra version
+```
+
+Or build from source with **Go 1.26+** (and optionally [`task`](https://taskfile.dev)):
+
+```bash
+# Build with injected git version metadata and install to ~/.local/bin/orchestra
 task install
 
 # Or build directly with standard Go tools:
@@ -438,3 +446,17 @@ task system:test
 # Full CI pipeline: lint + unit & system tests (-race) + cross-platform release builds
 task ci
 ```
+
+### Releasing
+
+Releases are published through the **Release** GitHub Actions workflow (`.github/workflows/release.yml`):
+
+1. Trigger **Release** manually (`workflow_dispatch`) on `main` and select a SemVer bump (`patch`, `minor`, or `major`), or push an annotated `v*` tag directly.
+2. CI runs static analysis, unit tests, and multi-process system tests against the target commit before tagging `vMAJOR.MINOR.PATCH`.
+3. [GoReleaser](.goreleaser.yaml) cross-compiles `darwin`/`linux` (`amd64`/`arm64`) archives with version, commit, and build timestamp metadata injected via `-ldflags`, publishes SHA-256 checksums to GitHub Releases, and updates the `orchestra` cask in [`cafecito-games/homebrew-tap`](https://github.com/cafecito-games/homebrew-tap) using `HOMEBREW_TAP_TOKEN`.
+
+---
+
+## License
+
+MIT License — Copyright (c) 2026 Cafecito Games LLC. See [LICENSE](LICENSE) for details.

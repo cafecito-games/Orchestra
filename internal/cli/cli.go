@@ -132,12 +132,9 @@ func runVersion(arguments []string, standardOutput, standardError io.Writer) int
 		return 2
 	}
 	if *asJSON {
-		return writePrettyJSON(standardOutput, standardError, map[string]any{
-			"version":         protocol.BuildVersion,
-			"protocolVersion": protocol.ProtocolVersion,
-		})
+		return writePrettyJSON(standardOutput, standardError, protocol.CurrentBuildInfo())
 	}
-	fmt.Fprintf(standardOutput, "orchestra %s (protocol v%s)\n", protocol.BuildVersion, protocol.ProtocolVersion)
+	fmt.Fprintln(standardOutput, protocol.CurrentBuildInfo().String())
 	return 0
 }
 
@@ -171,7 +168,7 @@ func runMaster(
 	fmt.Fprintf(
 		standardError,
 		"orchestra master %s listening on %s (%s://%s, %s://%s/control-agent, local worker=%t)\n",
-		protocol.BuildVersion,
+		protocol.EffectiveBuildVersion(),
 		running.Address,
 		scheme,
 		running.Address,
@@ -250,7 +247,7 @@ func runSlave(
 	fmt.Fprintf(
 		standardError,
 		"orchestra slave %s (node=%s, harnesses=%s, roots=%s) connecting to %s\n",
-		protocol.BuildVersion,
+		protocol.EffectiveBuildVersion(),
 		runtimeWorker.Node.ID,
 		strings.Join(availableLabels, "; "),
 		strings.Join(runtimeWorker.Node.WorkspaceRoots, ","),
