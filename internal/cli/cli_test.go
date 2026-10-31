@@ -903,9 +903,23 @@ func TestCLIZeroConfigMasterDiscoveryAndMCPSetup(t *testing.T) {
 	require.NotContains(t, logOutput, persistedToken)
 }
 
+func installFakeClaudeOnPath(t *testing.T) {
+	t.Helper()
+	fakeBinDirectory := t.TempDir()
+	fakeClaudePath := filepath.Join(fakeBinDirectory, "claude")
+	require.NoError(t, os.WriteFile(fakeClaudePath, []byte("#!/bin/sh\necho 'Claude Code 2.1.0'\n"), 0o755))
+	t.Setenv("PATH", fakeBinDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func TestCLITailscaleAuthModeZeroTokenSlaveAndStatus(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell script fixture")
+	}
+	installFakeClaudeOnPath(t)
+
 	homeDirectory := t.TempDir()
 	dataRoot := filepath.Join(homeDirectory, ".local", "share", "orchestra")
+	slaveDataRoot := filepath.Join(t.TempDir(), "slave-data")
 	masterDataDirectory := filepath.Join(dataRoot, "master")
 	connectionFilePath := filepath.Join(dataRoot, "connection.json")
 	workspaceDirectory := t.TempDir()
@@ -1024,6 +1038,7 @@ exit 1
 				"--id", "tailnet-worker-01",
 				"--name", "Tailnet Worker",
 				"--workspace-root", workspaceDirectory,
+				"--data-root", slaveDataRoot,
 			},
 			nil,
 			&slaveStdout,
@@ -1078,6 +1093,12 @@ exit 1
 }
 
 func TestCLISlaveTailscaleAutoDiscoveryAndInteractiveSelection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell script fixture")
+	}
+	installFakeClaudeOnPath(t)
+	slaveDataRoot := filepath.Join(t.TempDir(), "slave-data")
+
 	var listenConfig net.ListenConfig
 	probeListener, err := listenConfig.Listen(t.Context(), "tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -1186,6 +1207,7 @@ exit 1
 				"--connection-file", "none",
 				"--id", "auto-slave-01",
 				"--workspace-root", workspaceDirectory,
+				"--data-root", slaveDataRoot,
 			},
 			strings.NewReader(""),
 			&slave1Output,
@@ -1259,6 +1281,7 @@ exit 1
 			"--connection-file", "none",
 			"--id", "auto-slave-noninteractive",
 			"--workspace-root", workspaceDirectory,
+			"--data-root", slaveDataRoot,
 		},
 		strings.NewReader(""),
 		&nonInteractiveOutput,
@@ -1285,6 +1308,7 @@ exit 1
 				"--connection-file", "none",
 				"--id", "auto-slave-picked-beta",
 				"--workspace-root", workspaceDirectory,
+				"--data-root", slaveDataRoot,
 			},
 			strings.NewReader("2\n"),
 			&slave2Output,
