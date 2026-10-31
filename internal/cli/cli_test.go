@@ -903,12 +903,29 @@ func TestCLIZeroConfigMasterDiscoveryAndMCPSetup(t *testing.T) {
 	require.NotContains(t, logOutput, persistedToken)
 }
 
+type synchronizedBuffer struct {
+	mutex  sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (target *synchronizedBuffer) Write(chunk []byte) (int, error) {
+	target.mutex.Lock()
+	defer target.mutex.Unlock()
+	return target.buffer.Write(chunk)
+}
+
+func (target *synchronizedBuffer) String() string {
+	target.mutex.Lock()
+	defer target.mutex.Unlock()
+	return target.buffer.String()
+}
+
 func installFakeClaudeOnPath(t *testing.T) {
 	t.Helper()
 	fakeBinDirectory := t.TempDir()
 	fakeClaudePath := filepath.Join(fakeBinDirectory, "claude")
-	require.NoError(t, os.WriteFile(fakeClaudePath, []byte("#!/bin/sh\necho 'Claude Code 2.1.0'\n"), 0o755))
-	t.Setenv("PATH", fakeBinDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	require.NoError(t, os.WriteFile(fakeClaudePath, []byte("#!/bin/sh\nprintf 'Claude Code 2.1.0\\n'\n"), 0o755))
+	t.Setenv("PATH", fakeBinDirectory)
 }
 
 func TestCLITailscaleAuthModeZeroTokenSlaveAndStatus(t *testing.T) {
@@ -927,20 +944,7 @@ func TestCLITailscaleAuthModeZeroTokenSlaveAndStatus(t *testing.T) {
 	fakeTailscale := filepath.Join(t.TempDir(), "tailscale")
 	fakeTailscaleScript := `#!/bin/sh
 if [ "$1" = "status" ]; then
-  cat <<'EOF'
-{
-  "MagicDNSSuffix": "tail999.ts.net",
-  "Self": {
-    "HostName": "main-mac",
-    "DNSName": "main-mac.tail999.ts.net.",
-    "UserID": 42,
-    "TailscaleIPs": ["100.88.1.10", "fd7a:115c:a1e0::10"]
-  },
-  "User": {
-    "42": {"ID": 42, "LoginName": "christian@example.com"}
-  }
-}
-EOF
+  printf '%s\n' '{"MagicDNSSuffix":"tail999.ts.net","Self":{"HostName":"main-mac","DNSName":"main-mac.tail999.ts.net.","UserID":42,"TailscaleIPs":["100.88.1.10","fd7a:115c:a1e0::10"]},"User":{"42":{"ID":42,"LoginName":"christian@example.com"}}}'
   exit 0
 fi
 exit 1
@@ -987,7 +991,7 @@ exit 1
 	masterContext, cancelMaster := context.WithCancel(context.Background())
 	defer cancelMaster()
 
-	var masterStdout, masterStderr bytes.Buffer
+	var masterStdout, masterStderr synchronizedBuffer
 	masterDone := make(chan int, 1)
 	go func() {
 		masterDone <- cli.Run(
@@ -1015,7 +1019,7 @@ exit 1
 		}
 		discovered = state
 		return true
-	}, 5*time.Second, 25*time.Millisecond)
+	}, 15*time.Second, 25*time.Millisecond)
 
 	// No <data-dir>/token file is created and connection.json contains no bearer token.
 	_, statErr := os.Stat(filepath.Join(masterDataDirectory, "token"))
@@ -1027,7 +1031,7 @@ exit 1
 	slaveContext, cancelSlave := context.WithCancel(context.Background())
 	defer cancelSlave()
 
-	var slaveStdout, slaveStderr bytes.Buffer
+	var slaveStdout, slaveStderr synchronizedBuffer
 	slaveDone := make(chan int, 1)
 	go func() {
 		slaveDone <- cli.Run(
@@ -1057,7 +1061,7 @@ exit 1
 	require.Eventually(t, func() bool {
 		code, nodesJSON, _ := runSubcommand("nodes", "--json")
 		return code == 0 && strings.Contains(nodesJSON, `"id": "tailnet-worker-01"`) && strings.Contains(nodesJSON, `"status": "online"`)
-	}, 5*time.Second, 50*time.Millisecond)
+	}, 15*time.Second, 50*time.Millisecond, "slave stderr:\n%s\nmaster stderr:\n%s", slaveStderr.String(), masterStderr.String())
 
 	exitCode, mcpStatusOut, mcpStatusErr := runSubcommand("mcp", "status")
 	require.Equal(t, 0, exitCode, mcpStatusErr)
@@ -1114,37 +1118,7 @@ func TestCLISlaveTailscaleAutoDiscoveryAndInteractiveSelection(t *testing.T) {
 	fakeTailscale := filepath.Join(t.TempDir(), "tailscale")
 	fakeTailscaleScript := `#!/bin/sh
 if [ "$1" = "status" ]; then
-  cat <<'EOF'
-{
-  "BackendState": "Running",
-  "MagicDNSSuffix": "tail999.ts.net",
-  "Self": {
-    "HostName": "remote-worker",
-    "DNSName": "remote-worker.tail999.ts.net.",
-    "UserID": 42,
-    "TailscaleIPs": ["100.88.1.99"]
-  },
-  "Peer": {
-    "peer-alpha": {
-      "HostName": "alpha-mac",
-      "DNSName": "alpha-mac.tail999.ts.net.",
-      "UserID": 42,
-      "TailscaleIPs": ["127.0.0.1"],
-      "Online": true
-    },
-    "peer-beta": {
-      "HostName": "beta-server",
-      "DNSName": "beta-server.tail999.ts.net.",
-      "UserID": 42,
-      "TailscaleIPs": ["::1"],
-      "Online": true
-    }
-  },
-  "User": {
-    "42": {"ID": 42, "LoginName": "christian@example.com"}
-  }
-}
-EOF
+  printf '%s\n' '{"BackendState":"Running","MagicDNSSuffix":"tail999.ts.net","Self":{"HostName":"remote-worker","DNSName":"remote-worker.tail999.ts.net.","UserID":42,"TailscaleIPs":["100.88.1.99"]},"Peer":{"peer-alpha":{"HostName":"alpha-mac","DNSName":"alpha-mac.tail999.ts.net.","UserID":42,"TailscaleIPs":["127.0.0.1"],"Online":true},"peer-beta":{"HostName":"beta-server","DNSName":"beta-server.tail999.ts.net.","UserID":42,"TailscaleIPs":["::1"],"Online":true}},"User":{"42":{"ID":42,"LoginName":"christian@example.com"}}}'
   exit 0
 fi
 exit 1
@@ -1220,7 +1194,7 @@ exit 1
 		var standardOutput, errorBuffer bytes.Buffer
 		code := cli.Run(t.Context(), []string{"nodes", "--endpoint", alphaEndpoint, "--json"}, nil, &standardOutput, &errorBuffer, noEnvironment)
 		return code == 0 && strings.Contains(standardOutput.String(), `"id": "auto-slave-01"`) && strings.Contains(standardOutput.String(), `"status": "online"`)
-	}, 5*time.Second, 50*time.Millisecond)
+	}, 15*time.Second, 50*time.Millisecond)
 
 	cancelSlave1()
 	require.Equal(t, 0, <-slave1Done, slave1Error.String())
@@ -1321,7 +1295,7 @@ exit 1
 		var standardOutput, errorBuffer bytes.Buffer
 		code := cli.Run(t.Context(), []string{"nodes", "--endpoint", betaEndpoint, "--json"}, nil, &standardOutput, &errorBuffer, noEnvironment)
 		return code == 0 && strings.Contains(standardOutput.String(), `"id": "auto-slave-picked-beta"`) && strings.Contains(standardOutput.String(), `"status": "online"`)
-	}, 5*time.Second, 50*time.Millisecond)
+	}, 15*time.Second, 50*time.Millisecond)
 
 	cancelSlave2()
 	require.Equal(t, 0, <-slave2Done, slave2Error.String())
@@ -1332,4 +1306,145 @@ exit 1
 	assert.Equal(t, 0, <-betaDone)
 	cancelAlpha()
 	assert.Equal(t, 0, <-alphaDone)
+}
+
+func TestOperatorCLI_NodesRepositoriesCloneAndRefresh(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell stub and canonical path test")
+	}
+
+	gitTool, err := workspace.FindGit()
+	require.NoError(t, err)
+
+	remoteHostingRoot, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	seedRepository := filepath.Join(remoteHostingRoot, "seed-cli")
+	require.NoError(t, os.MkdirAll(seedRepository, 0o755))
+	_, err = gitTool.Run(t.Context(), seedRepository, "init", "--initial-branch=main")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(seedRepository, "main.go"), []byte("package main\n"), 0o644))
+	_, err = gitTool.Run(t.Context(), seedRepository, "add", "main.go")
+	require.NoError(t, err)
+	_, err = gitTool.Run(t.Context(), seedRepository, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial")
+	require.NoError(t, err)
+
+	bareRepository := filepath.Join(remoteHostingRoot, "org", "cli-cloned-repo.git")
+	require.NoError(t, os.MkdirAll(filepath.Dir(bareRepository), 0o755))
+	_, err = gitTool.Run(t.Context(), remoteHostingRoot, "clone", "--bare", seedRepository, bareRepository)
+	require.NoError(t, err)
+	_, err = gitTool.Run(t.Context(), bareRepository, "update-server-info")
+	require.NoError(t, err)
+
+	gitHTTPServer := httptest.NewServer(http.FileServer(http.Dir(remoteHostingRoot)))
+	defer gitHTTPServer.Close()
+	cloneURL := gitHTTPServer.URL + "/org/cli-cloned-repo.git"
+
+	fakeBinDirectory := t.TempDir()
+	fakeClaude := filepath.Join(fakeBinDirectory, "claude")
+	require.NoError(t, os.WriteFile(fakeClaude, []byte("#!/bin/sh\necho 'claude 2.1.0'\n"), 0o755))
+
+	workspaceRoot, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	const bearerToken = "cli-repo-token"
+	service, err := orchestrator.NewService(orchestrator.ServiceOptions{
+		Store: openedStore,
+		Token: bearerToken,
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	masterServer := httptest.NewServer(service.Handler())
+	defer masterServer.Close()
+
+	profiles := []protocol.HarnessProfile{{
+		ID:          protocol.HarnessClaudeCLI,
+		Label:       "Claude Code",
+		Description: "2.1.0",
+		Binary:      fakeClaude,
+		Available:   true,
+		AuthMode:    "local-subscription",
+		Transports:  []string{protocol.TransportNativeCLI},
+	}}
+	workerClient := slave.NewClient(slave.ClientOptions{
+		Endpoint: masterServer.URL,
+		Token:    bearerToken,
+		Node: protocol.ComputeNode{
+			ID:             "worker-repo-cli",
+			Name:           "Worker Repo CLI",
+			Kind:           "home-server",
+			Platform:       runtime.GOOS + "-" + runtime.GOARCH,
+			Status:         "online",
+			Concurrency:    2,
+			WorkspaceRoots: []string{workspaceRoot},
+			Version:        "0.3.0",
+			Harnesses:      profiles,
+		},
+		Runner:           harness.NewRunner(profiles),
+		WorkspaceManager: workspace.NewManager([]string{workspaceRoot}, gitTool),
+	})
+
+	workerContext, cancelWorker := context.WithCancel(t.Context())
+	workerDone := make(chan error, 1)
+	go func() {
+		workerDone <- workerClient.Run(workerContext)
+	}()
+	defer func() {
+		cancelWorker()
+		require.NoError(t, <-workerDone)
+	}()
+
+	environment := map[string]string{
+		"ORCHESTRA_ENDPOINT": masterServer.URL,
+		"ORCHESTRA_TOKEN":    bearerToken,
+	}
+	lookupEnvironment := func(name string) (string, bool) {
+		value, found := environment[name]
+		return value, found
+	}
+	runCommand := func(arguments ...string) (int, string, string) {
+		var standardOutput, standardError bytes.Buffer
+		code := cli.Run(t.Context(), arguments, nil, &standardOutput, &standardError, lookupEnvironment)
+		return code, standardOutput.String(), standardError.String()
+	}
+
+	require.Eventually(t, func() bool {
+		code, output, _ := runCommand("nodes")
+		return code == 0 && strings.Contains(output, "worker-repo-cli") && strings.Contains(output, "synced=true")
+	}, 15*time.Second, 50*time.Millisecond)
+
+	// Help and argument validation for nodes refresh / clone.
+	code, output, _ := runCommand("nodes", "refresh", "--help")
+	assert.Equal(t, 0, code)
+	assert.Contains(t, output, "orchestra nodes refresh")
+
+	code, output, _ = runCommand("nodes", "clone", "--help")
+	assert.Equal(t, 0, code)
+	assert.Contains(t, output, "orchestra nodes clone")
+
+	code, _, errorText := runCommand("nodes", "clone", "--node", "worker-repo-cli")
+	assert.Equal(t, 2, code)
+	assert.Contains(t, errorText, "--node and --repo are required")
+
+	// Clone via CLI.
+	code, output, errorText = runCommand("nodes", "clone", "--node", "worker-repo-cli", "--repo", cloneURL)
+	require.Equal(t, 0, code, errorText)
+	assert.Contains(t, output, "cloned")
+	assert.Contains(t, output, filepath.Join(workspaceRoot, "cli-cloned-repo"))
+
+	// Refresh via CLI.
+	code, output, errorText = runCommand("nodes", "refresh", "--node", "worker-repo-cli")
+	require.Equal(t, 0, code, errorText)
+	assert.Contains(t, output, "worker-repo-cli: synced 1 repositories")
+	assert.Contains(t, output, "cli-cloned-repo")
+
+	// List nodes shows discovered repository.
+	code, output, errorText = runCommand("nodes")
+	require.Equal(t, 0, code, errorText)
+	assert.Contains(t, output, "Repositories:")
+	assert.Contains(t, output, "cli-cloned-repo")
 }

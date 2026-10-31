@@ -332,8 +332,19 @@ func runNodes(
 	standardError io.Writer,
 	lookupEnvironment func(string) (string, bool),
 ) int {
-	if len(arguments) > 0 && arguments[0] == "update" {
-		return runNodesUpdate(operationContext, arguments[1:], standardOutput, standardError, lookupEnvironment)
+	if len(arguments) > 0 {
+		switch arguments[0] {
+		case "update":
+			return runNodesUpdate(operationContext, arguments[1:], standardOutput, standardError, lookupEnvironment)
+		case "refresh":
+			return runNodesRefresh(operationContext, arguments[1:], standardOutput, standardError, lookupEnvironment)
+		case "clone":
+			return runNodesClone(operationContext, arguments[1:], standardOutput, standardError, lookupEnvironment)
+		}
+	}
+	if hasHelpFlag(arguments) {
+		printNodesUsage(standardOutput)
+		return 0
 	}
 	flagSet := flag.NewFlagSet("orchestra nodes", flag.ContinueOnError)
 	flagSet.SetOutput(standardError)
@@ -407,6 +418,23 @@ func runNodes(
 			)
 		}
 		fmt.Fprintf(standardOutput, "  Workspace Roots: %s\n", defaultIfEmpty(strings.Join(node.WorkspaceRoots, ", "), "none"))
+		if detail.RepositoryReport != nil && len(detail.RepositoryReport.Repositories) > 0 {
+			formattedRepositories := make([]string, 0, len(detail.RepositoryReport.Repositories))
+			for _, repository := range detail.RepositoryReport.Repositories {
+				branchLabel := defaultIfEmpty(repository.HeadBranch, repository.DefaultBranch)
+				switch {
+				case repository.Repository != "" && branchLabel != "":
+					formattedRepositories = append(formattedRepositories, fmt.Sprintf("%s (%s, branch=%s)", repository.RelativePath, repository.Repository, branchLabel))
+				case repository.Repository != "":
+					formattedRepositories = append(formattedRepositories, fmt.Sprintf("%s (%s)", repository.RelativePath, repository.Repository))
+				default:
+					formattedRepositories = append(formattedRepositories, repository.RelativePath)
+				}
+			}
+			fmt.Fprintf(standardOutput, "  Repositories:    %s\n", strings.Join(formattedRepositories, "; "))
+		} else if detail.RepositoryReport != nil {
+			fmt.Fprintln(standardOutput, "  Repositories:    none")
+		}
 		for _, harnessProfile := range node.Harnesses {
 			if !harnessProfile.Available {
 				continue
@@ -433,6 +461,200 @@ func runNodes(
 			}
 		}
 	}
+	return 0
+}
+
+func printNodesUsage(output io.Writer) {
+	fmt.Fprintf(output, `Usage:
+  orchestra nodes [flags]
+  orchestra nodes <refresh|clone|update> [flags]
+
+Subcommands:
+  refresh     Re-scan and refresh discovered Git repositories on connected slave nodes
+  clone       Git clone a repository beneath an authorized workspace root on a slave node
+  update      Roll out an Orchestra release to connected slave nodes
+
+Flags:
+  --endpoint string       Orchestra master HTTP or WebSocket endpoint (env ORCHESTRA_ENDPOINT)
+  --token string          Bearer token matching ORCHESTRA_TOKEN (env ORCHESTRA_TOKEN)
+  --tls-ca string         CA certificate PEM path for https:// (env ORCHESTRA_TLS_CA)
+  --tls-insecure          Skip TLS certificate verification (env ORCHESTRA_TLS_INSECURE)
+  --json                  Format output as JSON
+`)
+}
+
+func runNodesRefresh(
+	operationContext context.Context,
+	arguments []string,
+	standardOutput io.Writer,
+	standardError io.Writer,
+	lookupEnvironment func(string) (string, bool),
+) int {
+	if hasHelpFlag(arguments) {
+		fmt.Fprintf(standardOutput, `Usage: orchestra nodes refresh [flags]
+
+Re-scan and refresh discovered Git repositories under workspace roots on connected slave nodes.
+
+Flags:
+  --node value            Specific slave node ID to refresh (repeatable; defaults to all connected nodes)
+  --endpoint string       Orchestra master HTTP or WebSocket endpoint (env ORCHESTRA_ENDPOINT)
+  --token string          Bearer token matching ORCHESTRA_TOKEN (env ORCHESTRA_TOKEN)
+  --tls-ca string         CA certificate PEM path for https:// (env ORCHESTRA_TLS_CA)
+  --tls-insecure          Skip TLS certificate verification (env ORCHESTRA_TLS_INSECURE)
+  --json                  Format output as JSON
+`)
+		return 0
+	}
+
+	flagSet := flag.NewFlagSet("orchestra nodes refresh", flag.ContinueOnError)
+	flagSet.SetOutput(standardError)
+	connection := registerOperatorFlags(flagSet, lookupEnvironment)
+	var selectedNodes cliStringSliceFlag
+	flagSet.Var(&selectedNodes, "node", "Specific slave node ID to refresh (repeatable)")
+
+	if err := flagSet.Parse(normalizeFlagOrder(flagSet, arguments)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if flagSet.NArg() > 0 {
+		fmt.Fprintf(standardError, "orchestra nodes refresh: unexpected arguments: %s\n", strings.Join(flagSet.Args(), " "))
+		return 2
+	}
+
+	var response orchestrator.RefreshRepositoriesResponse
+	requestBody := orchestrator.RefreshRepositoriesInput{NodeIDs: selectedNodes.values}
+	if err := connection.requestJSON(operationContext, http.MethodPost, "/api/nodes/repositories/refresh", nil, requestBody, &response); err != nil {
+		fmt.Fprintf(standardError, "orchestra nodes refresh: %v\n", err)
+		return 1
+	}
+
+	exitCode := 0
+	for _, nodeResult := range response.Nodes {
+		if !nodeResult.Synced {
+			exitCode = 1
+			break
+		}
+	}
+
+	if *connection.asJSON {
+		if jsonCode := writePrettyJSON(standardOutput, standardError, response); jsonCode != 0 {
+			return jsonCode
+		}
+		return exitCode
+	}
+
+	if len(response.Nodes) == 0 {
+		fmt.Fprintln(standardOutput, "No connected worker nodes to refresh.")
+		return 0
+	}
+	for _, nodeResult := range response.Nodes {
+		if !nodeResult.Synced {
+			fmt.Fprintf(standardOutput, "%s: refresh failed (%s)\n", nodeResult.NodeID, defaultIfEmpty(nodeResult.Error, "unknown error"))
+			continue
+		}
+		repositoryCount := 0
+		if nodeResult.Report != nil {
+			repositoryCount = len(nodeResult.Report.Repositories)
+		}
+		fmt.Fprintf(standardOutput, "%s: synced %d repositories\n", nodeResult.NodeID, repositoryCount)
+		if nodeResult.Report != nil {
+			for _, repository := range nodeResult.Report.Repositories {
+				fmt.Fprintf(
+					standardOutput,
+					"  - %s -> %s (%s)\n",
+					repository.RelativePath,
+					repository.Path,
+					defaultIfEmpty(repository.Repository, "local-only"),
+				)
+			}
+		}
+	}
+	return exitCode
+}
+
+func runNodesClone(
+	operationContext context.Context,
+	arguments []string,
+	standardOutput io.Writer,
+	standardError io.Writer,
+	lookupEnvironment func(string) (string, bool),
+) int {
+	if hasHelpFlag(arguments) {
+		fmt.Fprintf(standardOutput, `Usage: orchestra nodes clone --node <node-id> --repo <repository-url> [flags]
+
+Instruct a connected slave node to git clone a repository beneath an authorized workspace root.
+
+Flags:
+  --node string           Target slave node ID (required)
+  --repo string           Git clone URL (https://, ssh://, git://, or git@host:org/repo.git) (required)
+  --workspace-root string Optional authorized workspace root on the target node (defaults to primary root)
+  --directory string      Optional relative target directory beneath workspace root (defaults to repository name)
+  --branch string         Optional branch to check out during clone
+  --endpoint string       Orchestra master HTTP or WebSocket endpoint (env ORCHESTRA_ENDPOINT)
+  --token string          Bearer token matching ORCHESTRA_TOKEN (env ORCHESTRA_TOKEN)
+  --tls-ca string         CA certificate PEM path for https:// (env ORCHESTRA_TLS_CA)
+  --tls-insecure          Skip TLS certificate verification (env ORCHESTRA_TLS_INSECURE)
+  --json                  Format output as JSON
+`)
+		return 0
+	}
+
+	flagSet := flag.NewFlagSet("orchestra nodes clone", flag.ContinueOnError)
+	flagSet.SetOutput(standardError)
+	connection := registerOperatorFlags(flagSet, lookupEnvironment)
+	nodeID := flagSet.String("node", "", "Target slave node ID")
+	repositoryURL := flagSet.String("repo", "", "Git clone URL")
+	workspaceRoot := flagSet.String("workspace-root", "", "Authorized workspace root on target node")
+	directory := flagSet.String("directory", "", "Relative directory beneath workspace root")
+	branch := flagSet.String("branch", "", "Optional branch to check out")
+
+	if err := flagSet.Parse(normalizeFlagOrder(flagSet, arguments)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if flagSet.NArg() > 0 {
+		fmt.Fprintf(standardError, "orchestra nodes clone: unexpected arguments: %s\n", strings.Join(flagSet.Args(), " "))
+		return 2
+	}
+	if strings.TrimSpace(*nodeID) == "" || strings.TrimSpace(*repositoryURL) == "" {
+		fmt.Fprintln(standardError, "orchestra nodes clone: --node and --repo are required")
+		return 2
+	}
+
+	var response orchestrator.CloneRepositoryResponse
+	requestBody := orchestrator.CloneRepositoryInput{
+		NodeID:        strings.TrimSpace(*nodeID),
+		RepositoryURL: strings.TrimSpace(*repositoryURL),
+		WorkspaceRoot: strings.TrimSpace(*workspaceRoot),
+		Directory:     strings.TrimSpace(*directory),
+		Branch:        strings.TrimSpace(*branch),
+	}
+	if err := connection.requestJSON(operationContext, http.MethodPost, "/api/nodes/repositories/clone", nil, requestBody, &response); err != nil {
+		fmt.Fprintf(standardError, "orchestra nodes clone: %v\n", err)
+		return 1
+	}
+
+	if *connection.asJSON {
+		return writePrettyJSON(standardOutput, standardError, response)
+	}
+
+	actionLabel := "already present"
+	if response.Created {
+		actionLabel = "cloned"
+	}
+	fmt.Fprintf(
+		standardOutput,
+		"%s: %s %s at %s (branch=%s)\n",
+		response.NodeID,
+		actionLabel,
+		defaultIfEmpty(response.Repository.Repository, requestBody.RepositoryURL),
+		response.Repository.Path,
+		defaultIfEmpty(response.Repository.HeadBranch, defaultIfEmpty(response.Repository.DefaultBranch, "HEAD")),
+	)
 	return 0
 }
 

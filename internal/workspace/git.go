@@ -12,10 +12,11 @@ import (
 )
 
 const (
-	DefaultGitTimeout     = 2 * time.Minute
-	DefaultGitOutputBytes = 1 << 20
-	gitErrorOutputBytes   = 64 << 10
-	gitWaitDelay          = 2 * time.Second
+	DefaultGitTimeout      = 2 * time.Minute
+	DefaultGitCloneTimeout = 5 * time.Minute
+	DefaultGitOutputBytes  = 1 << 20
+	gitErrorOutputBytes    = 64 << 10
+	gitWaitDelay           = 2 * time.Second
 )
 
 // Git invokes one fixed Git executable directly, never through a shell, with repository hooks
@@ -54,6 +55,7 @@ const (
 type GitError struct {
 	Kind     GitErrorKind
 	ExitCode int
+	Stderr   string
 }
 
 func (err *GitError) Error() string {
@@ -108,7 +110,10 @@ func (git *Git) environment() []string {
 }
 
 func (git *Git) Run(operationContext context.Context, directory string, arguments ...string) ([]byte, error) {
-	timeout := git.Timeout
+	return git.RunWithTimeout(operationContext, git.Timeout, directory, arguments...)
+}
+
+func (git *Git) RunWithTimeout(operationContext context.Context, timeout time.Duration, directory string, arguments ...string) ([]byte, error) {
 	if timeout <= 0 {
 		timeout = DefaultGitTimeout
 	}
@@ -124,8 +129,9 @@ func (git *Git) Run(operationContext context.Context, directory string, argument
 	command.Env = git.environment()
 	command.WaitDelay = gitWaitDelay
 	output := &boundedBuffer{limit: limit, cancel: cancel}
+	stderrOutput := &boundedBuffer{limit: gitErrorOutputBytes}
 	command.Stdout = output
-	command.Stderr = &boundedBuffer{limit: gitErrorOutputBytes}
+	command.Stderr = stderrOutput
 	err := command.Run()
 	switch {
 	case output.exceeded:
@@ -136,7 +142,11 @@ func (git *Git) Run(operationContext context.Context, directory string, argument
 		return output.buffer.Bytes(), nil
 	}
 	if exitError, ok := errors.AsType[*exec.ExitError](err); ok && exitError.ExitCode() >= 0 {
-		return output.buffer.Bytes(), &GitError{Kind: GitErrorExit, ExitCode: exitError.ExitCode()}
+		return output.buffer.Bytes(), &GitError{
+			Kind:     GitErrorExit,
+			ExitCode: exitError.ExitCode(),
+			Stderr:   strings.TrimSpace(stderrOutput.buffer.String()),
+		}
 	}
 	if operationContext.Err() != nil {
 		return nil, &GitError{Kind: GitErrorTimeout}

@@ -315,3 +315,54 @@ func TestLoadRejectsNonExecutableOverrideOnUnix(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "the file is not executable")
 }
+
+func TestLoadDiscoversExternalSymlinkedAdapterOnPATH(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell and symlink fixture")
+	}
+	manifest, err := setup.LoadDefaultManifest()
+	require.NoError(t, err)
+
+	temporaryDirectory := t.TempDir()
+	cellarEntryPoint := filepath.Join(
+		temporaryDirectory,
+		"Cellar", "codex-acp", "2.5.0", "libexec", "lib", "node_modules", "@agentclientprotocol", "codex-acp", "dist", "index.js",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(cellarEntryPoint), 0o755))
+	require.NoError(t, os.WriteFile(cellarEntryPoint, []byte("#!/bin/sh\necho 2.5.0\n"), 0o755))
+
+	homebrewBinDirectory := filepath.Join(temporaryDirectory, "bin")
+	require.NoError(t, os.MkdirAll(homebrewBinDirectory, 0o755))
+	symlinkBinary := filepath.Join(homebrewBinDirectory, "codex-acp")
+	require.NoError(t, os.Symlink(cellarEntryPoint, symlinkBinary))
+
+	t.Setenv("PATH", homebrewBinDirectory)
+
+	cleanDataRoot := t.TempDir()
+	result, err := Load(Options{
+		DataRoot:   cleanDataRoot,
+		Manifest:   manifest,
+		Platform:   setup.CurrentPlatform(),
+		Activation: setup.LoadActivationState(cleanDataRoot),
+	})
+	require.NoError(t, err)
+
+	codexAdapter, present := result.Adapters[protocol.HarnessCodexCLI]
+	require.True(t, present)
+	assert.Equal(t, "codex-acp", codexAdapter.ID)
+	assert.Equal(t, protocol.ACPAdapterSourceExternal, codexAdapter.Source)
+	assert.Equal(t, symlinkBinary, codexAdapter.Binary)
+	assert.Empty(t, codexAdapter.Version)
+
+	corruptedDataRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(corruptedDataRoot, "ownership.json"), []byte("{corrupted"), 0o600))
+	corruptedResult, err := Load(Options{
+		DataRoot:   corruptedDataRoot,
+		Manifest:   manifest,
+		Platform:   setup.CurrentPlatform(),
+		Activation: setup.LoadActivationState(cleanDataRoot),
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, corruptedResult.Adapters, protocol.HarnessCodexCLI)
+	assert.Contains(t, corruptedResult.Skipped[protocol.HarnessCodexCLI], "the ownership ledger could not be read")
+}

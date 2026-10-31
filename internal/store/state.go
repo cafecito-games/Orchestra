@@ -26,6 +26,7 @@ type State struct {
 	NodeUpdates         map[string]protocol.NodeUpdateState
 	CapabilityReports   map[string]protocol.NodeCapabilityReport
 	ComponentReports    map[string]protocol.ComponentInventoryReport
+	RepositoryReports   map[string]protocol.NodeRepositoryReport
 	ProjectProfiles     map[string]protocol.ProjectProfile
 	Threads             map[string]protocol.Thread
 	Attachments         map[string]protocol.ThreadAttachment
@@ -64,6 +65,7 @@ func NewState() *State {
 		NodeUpdates:         map[string]protocol.NodeUpdateState{},
 		CapabilityReports:   map[string]protocol.NodeCapabilityReport{},
 		ComponentReports:    map[string]protocol.ComponentInventoryReport{},
+		RepositoryReports:   map[string]protocol.NodeRepositoryReport{},
 		ProjectProfiles:     map[string]protocol.ProjectProfile{},
 		Threads:             map[string]protocol.Thread{},
 		Attachments:         map[string]protocol.ThreadAttachment{},
@@ -122,6 +124,9 @@ func (state *State) ensureInitialized() {
 	}
 	if state.ComponentReports == nil {
 		state.ComponentReports = map[string]protocol.ComponentInventoryReport{}
+	}
+	if state.RepositoryReports == nil {
+		state.RepositoryReports = map[string]protocol.NodeRepositoryReport{}
 	}
 	if state.ProjectProfiles == nil {
 		state.ProjectProfiles = map[string]protocol.ProjectProfile{}

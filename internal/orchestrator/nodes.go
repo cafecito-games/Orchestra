@@ -25,12 +25,15 @@ const (
 )
 
 type slaveSession struct {
-	nodeID     string
-	connection *websocket.Conn
-	writeMutex sync.Mutex
-	synced     atomic.Bool
-	lastPong   atomic.Int64
-	cancel     context.CancelFunc
+	nodeID          string
+	connection      *websocket.Conn
+	writeMutex      sync.Mutex
+	synced          atomic.Bool
+	lastPong        atomic.Int64
+	cancel          context.CancelFunc
+	pendingMutex    sync.Mutex
+	pendingClosed   bool
+	pendingRequests map[string]chan protocol.SlaveControlMessage
 }
 
 func (session *slaveSession) send(operationContext context.Context, message protocol.MasterControlMessage) error {
@@ -43,6 +46,73 @@ func (session *slaveSession) send(operationContext context.Context, message prot
 	timedContext, cancel := context.WithTimeout(operationContext, socketWriteTimeout)
 	defer cancel()
 	return session.connection.Write(timedContext, websocket.MessageText, encodedBytes)
+}
+
+func (session *slaveSession) awaitRequest(
+	operationContext context.Context,
+	requestID string,
+	message protocol.MasterControlMessage,
+) (protocol.SlaveControlMessage, error) {
+	responseChannel := make(chan protocol.SlaveControlMessage, 1)
+	session.pendingMutex.Lock()
+	if session.pendingClosed {
+		session.pendingMutex.Unlock()
+		return protocol.SlaveControlMessage{}, errors.New("slave node connection is closed")
+	}
+	if session.pendingRequests == nil {
+		session.pendingRequests = map[string]chan protocol.SlaveControlMessage{}
+	}
+	session.pendingRequests[requestID] = responseChannel
+	session.pendingMutex.Unlock()
+
+	defer func() {
+		session.pendingMutex.Lock()
+		delete(session.pendingRequests, requestID)
+		session.pendingMutex.Unlock()
+	}()
+
+	if err := session.send(operationContext, message); err != nil {
+		return protocol.SlaveControlMessage{}, err
+	}
+
+	select {
+	case response, ok := <-responseChannel:
+		if !ok {
+			return protocol.SlaveControlMessage{}, errors.New("slave node disconnected before completing request")
+		}
+		return response, nil
+	case <-operationContext.Done():
+		return protocol.SlaveControlMessage{}, operationContext.Err()
+	}
+}
+
+func (session *slaveSession) deliverResponse(requestID string, message protocol.SlaveControlMessage) {
+	if requestID == "" {
+		return
+	}
+	session.pendingMutex.Lock()
+	channel, exists := session.pendingRequests[requestID]
+	if exists {
+		delete(session.pendingRequests, requestID)
+	}
+	session.pendingMutex.Unlock()
+	if exists {
+		select {
+		case channel <- message:
+		default:
+		}
+	}
+}
+
+func (session *slaveSession) closePendingRequests() {
+	session.pendingMutex.Lock()
+	session.pendingClosed = true
+	pending := session.pendingRequests
+	session.pendingRequests = nil
+	session.pendingMutex.Unlock()
+	for _, channel := range pending {
+		close(channel)
+	}
 }
 
 type ExecutionInventoryResponse struct {
@@ -113,6 +183,13 @@ func (service *Service) ListNodeDetails() ([]protocol.NodeDetail, error) {
 				reportCopy := report
 				componentReport = &reportCopy
 			}
+			var repositoryReport *protocol.NodeRepositoryReport
+			if report, exists := state.RepositoryReports[nodeID]; exists {
+				reportCopy := report
+				reportCopy.Roots = slices.Clone(report.Roots)
+				reportCopy.Repositories = slices.Clone(report.Repositories)
+				repositoryReport = &reportCopy
+			}
 			var updateStatus *protocol.NodeUpdateState
 			if update, exists := state.NodeUpdates[nodeID]; exists {
 				updateCopy := update
@@ -133,6 +210,7 @@ func (service *Service) ListNodeDetails() ([]protocol.NodeDetail, error) {
 				Synced:            synced,
 				CapabilityReport:  capabilityReport,
 				ComponentReport:   componentReport,
+				RepositoryReport:  repositoryReport,
 				ResidentInstances: residentIDs,
 				UpdateStatus:      updateStatus,
 			})
@@ -278,6 +356,7 @@ func (service *Service) serveSlaveConnection(requestContext context.Context, con
 
 	defer func() {
 		cancelSession()
+		session.closePendingRequests()
 		removedCurrent := false
 		service.slavesMutex.Lock()
 		if service.slaves[node.ID] == session {
@@ -412,6 +491,10 @@ func (service *Service) dispatchSlaveMessage(
 		service.handleNodeHeartbeat(nodeID, message)
 	case "component.inventory":
 		service.handleComponentInventory(nodeID, message)
+	case "workspace.repositories":
+		service.handleNodeRepositories(session, message)
+	case "workspace.repository.clone.result":
+		service.handleRepositoryCloneResult(session, message)
 	case "node.capabilities":
 		service.handleNodeCapabilities(nodeID, message)
 	case "sync.complete":
@@ -486,6 +569,48 @@ func (service *Service) handleComponentInventory(nodeID string, message protocol
 		state.ComponentReports[nodeID] = report
 		return nil
 	})
+}
+
+func (service *Service) handleNodeRepositories(session *slaveSession, message protocol.SlaveControlMessage) {
+	nodeID := session.nodeID
+	if message.RepositoryReport != nil && message.RepositoryReport.NodeID == nodeID && message.RepositoryReport.Validate() == nil {
+		report := *message.RepositoryReport
+		report.Roots = slices.Clone(report.Roots)
+		report.Repositories = slices.Clone(report.Repositories)
+		_, _ = service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
+			state.RepositoryReports[nodeID] = report
+			mutation.OnCommit(func() {
+				service.TriggerSchedule()
+			})
+			return nil
+		})
+	}
+	session.deliverResponse(message.RequestID, message)
+}
+
+func (service *Service) handleRepositoryCloneResult(session *slaveSession, message protocol.SlaveControlMessage) {
+	nodeID := session.nodeID
+	var validReport *protocol.NodeRepositoryReport
+	if message.RepositoryReport != nil && message.RepositoryReport.NodeID == nodeID && message.RepositoryReport.Validate() == nil {
+		reportCopy := *message.RepositoryReport
+		validReport = &reportCopy
+	} else if message.CloneResult != nil && message.CloneResult.Report != nil && message.CloneResult.Report.NodeID == nodeID && message.CloneResult.Report.Validate() == nil {
+		reportCopy := *message.CloneResult.Report
+		validReport = &reportCopy
+	}
+	if validReport != nil {
+		report := *validReport
+		report.Roots = slices.Clone(report.Roots)
+		report.Repositories = slices.Clone(report.Repositories)
+		_, _ = service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
+			state.RepositoryReports[nodeID] = report
+			mutation.OnCommit(func() {
+				service.TriggerSchedule()
+			})
+			return nil
+		})
+	}
+	session.deliverResponse(message.RequestID, message)
 }
 
 func (service *Service) handleNodeCapabilities(nodeID string, message protocol.SlaveControlMessage) {

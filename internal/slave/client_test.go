@@ -357,6 +357,20 @@ echo '{"type":"result","result":"completed cleanly"}'
 	require.NoError(t, <-done)
 }
 
+func TestParseConfiguration_DefaultsWorkspaceRootToWorkingDirectory(t *testing.T) {
+	workingDirectory, err := os.Getwd()
+	require.NoError(t, err)
+	expectedRoots, err := CanonicalizeWorkspaceRoots([]string{workingDirectory})
+	require.NoError(t, err)
+
+	configuration, err := ParseConfiguration(
+		nil,
+		func(string) (string, bool) { return "", false },
+	)
+	require.NoError(t, err)
+	require.Equal(t, expectedRoots, configuration.WorkspaceRoots)
+}
+
 func TestParseConfiguration_RequireACPAndFallbackConflict(t *testing.T) {
 	workspaceRoot := t.TempDir()
 

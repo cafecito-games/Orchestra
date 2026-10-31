@@ -337,6 +337,8 @@ func (service *Service) Handler() http.Handler {
 	mux.Handle("/mcp", service.requireBearerHandler(service.mcpHandler))
 	mux.HandleFunc("/api/status", service.requireBearer(service.handleAPIStatus))
 	mux.HandleFunc("/api/nodes", service.requireBearer(service.handleAPINodes))
+	mux.HandleFunc("/api/nodes/repositories/refresh", service.requireBearer(service.handleAPINodesRefresh))
+	mux.HandleFunc("/api/nodes/repositories/clone", service.requireBearer(service.handleAPINodesClone))
 	mux.HandleFunc("/api/nodes/update", service.requireBearer(service.handleAPINodesUpdate))
 	mux.HandleFunc("/api/updates/bundles/", service.requireBearer(service.handleAPIUpdateBundle))
 	mux.HandleFunc("/api/threads", service.requireBearer(service.handleAPIThreads))

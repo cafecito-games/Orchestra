@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 )
 
@@ -70,4 +73,39 @@ func (installed InstalledComponent) Verify() error {
 		return errors.New("component executable content no longer matches the ownership ledger")
 	}
 	return nil
+}
+
+// DiscoverExternalACPAdapter searches PATH for a package-manager-installed ACP
+// adapter executable matching the manifest entry, following symlinks created by
+// Homebrew, Linuxbrew, or npm global shims to verify an executable target file.
+func DiscoverExternalACPAdapter(entry ComponentManifestEntry, platform string) (string, bool) {
+	if entry.Kind != ComponentKindACPAdapter {
+		return "", false
+	}
+	var candidateNames []string
+	if distribution, supported := entry.Platforms[platform]; supported && distribution.ExecutablePath != "" {
+		baseName := filepath.Base(distribution.ExecutablePath)
+		if baseName != "" && baseName != "." && baseName != "/" {
+			candidateNames = append(candidateNames, baseName)
+		}
+	}
+	if entry.ID != "" && !slices.Contains(candidateNames, entry.ID) {
+		candidateNames = append(candidateNames, entry.ID)
+	}
+	for _, candidateName := range candidateNames {
+		lookedUpPath, err := exec.LookPath(candidateName)
+		if err != nil {
+			continue
+		}
+		absolutePath, err := filepath.Abs(lookedUpPath)
+		if err != nil {
+			continue
+		}
+		information, err := os.Stat(absolutePath)
+		if err != nil || !information.Mode().IsRegular() || (runtime.GOOS != "windows" && information.Mode().Perm()&0o111 == 0) {
+			continue
+		}
+		return filepath.Clean(absolutePath), true
+	}
+	return "", false
 }

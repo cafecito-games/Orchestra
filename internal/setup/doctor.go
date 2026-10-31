@@ -140,7 +140,7 @@ func screenedActivationDetail(detail string) string {
 	return bounded
 }
 
-func describeActivation(entry *ComponentDoctorEntry, activation ActivationState, activeErr error, harnessAvailable bool) {
+func describeActivation(entry *ComponentDoctorEntry, activation ActivationState, activeErr error, harnessAvailable bool, externalAdapterAvailable bool) {
 	if activation.Rejection != nil {
 		entry.Provenance = ComponentProvenanceRejected
 		return
@@ -164,6 +164,10 @@ func describeActivation(entry *ComponentDoctorEntry, activation ActivationState,
 		return
 	}
 	if entry.Component.Kind == ComponentKindHarness && harnessAvailable {
+		entry.Provenance = ComponentProvenanceExternal
+		return
+	}
+	if entry.Component.Kind == ComponentKindACPAdapter && externalAdapterAvailable {
 		entry.Provenance = ComponentProvenanceExternal
 		return
 	}

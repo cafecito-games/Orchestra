@@ -197,3 +197,52 @@ exit 1
 	capturedDiagnostic := err.Error()[separatorIndex+len(adapterStderrSeparator):]
 	assert.LessOrEqual(t, len(capturedDiagnostic), acp.MaximumDiagnosticBytes)
 }
+
+func TestACPDriver_ExternalSymlinkedAdapterNegotiatesRuntimeVersion(t *testing.T) {
+	if os.PathSeparator == '\\' {
+		t.Skip("POSIX shell and symlink fixture")
+	}
+	temporaryDirectory := t.TempDir()
+	cellarScript := filepath.Join(temporaryDirectory, "Cellar", "codex-acp", "2.5.0", "dist", "index.js")
+	require.NoError(t, os.MkdirAll(filepath.Dir(cellarScript), 0o755))
+
+	adapterScript := `#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":true}},"agentInfo":{"name":"codex-acp","version":"2.5.0"}}}\n'
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-probe","configOptions":[{"id":"model","options":[{"value":"gpt-5.4"}]}]}}\n'
+      ;;
+  esac
+done
+`
+	require.NoError(t, os.WriteFile(cellarScript, []byte(adapterScript), 0o755))
+	symlinkBinary := filepath.Join(temporaryDirectory, "codex-acp")
+	require.NoError(t, os.Symlink(cellarScript, symlinkBinary))
+
+	driver := NewACPDriver(ACPDriverOptions{
+		Adapters: map[string]ACPAdapter{
+			protocol.HarnessCodexCLI: {
+				Binary: symlinkBinary,
+				ID:     "codex-acp",
+				Source: protocol.ACPAdapterSourceExternal,
+			},
+		},
+		Providers:     DefaultACPProviders(),
+		ClientVersion: "0.3.0",
+	})
+
+	probe, err := driver.Probe(t.Context(), protocol.HarnessCodexCLI)
+	require.NoError(t, err)
+	assert.Equal(t, "codex-acp", probe.Capabilities.AdapterName)
+	assert.Equal(t, "2.5.0", probe.Capabilities.AdapterVersion)
+	assert.Contains(t, probe.Models, "gpt-5.4")
+
+	provenance := driver.provenance(protocol.HarnessCodexCLI)
+	require.NotNil(t, provenance)
+	assert.Equal(t, "codex-acp", provenance.ID)
+	assert.Equal(t, "2.5.0", provenance.Version)
+	assert.Equal(t, protocol.ACPAdapterSourceExternal, provenance.Source)
+}
