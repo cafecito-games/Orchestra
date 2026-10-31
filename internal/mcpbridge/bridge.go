@@ -235,10 +235,88 @@ func (transport *capturingTransport) Connect(operationContext context.Context) (
 	if err != nil {
 		return nil, err
 	}
+	wrapped := &capturingConnection{
+		bridge:   transport.bridge,
+		delegate: connection,
+	}
 	transport.bridge.mcpConnectionMutex.Lock()
-	transport.bridge.mcpConnection = connection
+	transport.bridge.mcpConnection = wrapped
 	transport.bridge.mcpConnectionMutex.Unlock()
-	return connection, nil
+	return wrapped, nil
+}
+
+type capturingConnection struct {
+	bridge   *Bridge
+	delegate mcp.Connection
+}
+
+func (connection *capturingConnection) Read(operationContext context.Context) (jsonrpc.Message, error) {
+	message, err := connection.delegate.Read(operationContext)
+	if err == nil {
+		if incomingRequest, ok := message.(*jsonrpc.Request); ok && incomingRequest != nil {
+			if clientName := extractMCPClientName(incomingRequest.Method, incomingRequest.Params); clientName != "" {
+				connection.bridge.recordDiscoveredHarness(operationContext, clientName)
+			}
+		}
+	}
+	return message, err
+}
+
+func (connection *capturingConnection) Write(operationContext context.Context, message jsonrpc.Message) error {
+	return connection.delegate.Write(operationContext, message)
+}
+
+func (connection *capturingConnection) Close() error {
+	return connection.delegate.Close()
+}
+
+func (connection *capturingConnection) SessionID() string {
+	return connection.delegate.SessionID()
+}
+
+func extractMCPClientName(method string, rawParameters json.RawMessage) string {
+	if method != "initialize" && method != "server/discover" {
+		return ""
+	}
+	if len(rawParameters) == 0 {
+		return ""
+	}
+	var payload struct {
+		ClientInfo *struct {
+			Name string `json:"name"`
+		} `json:"clientInfo"`
+		Meta map[string]json.RawMessage `json:"_meta"`
+	}
+	if json.Unmarshal(rawParameters, &payload) != nil {
+		return ""
+	}
+	if payload.ClientInfo != nil && strings.TrimSpace(payload.ClientInfo.Name) != "" {
+		return strings.TrimSpace(payload.ClientInfo.Name)
+	}
+	if rawMetaClient, exists := payload.Meta["io.modelcontextprotocol/clientInfo"]; exists {
+		var metaClient struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(rawMetaClient, &metaClient) == nil && strings.TrimSpace(metaClient.Name) != "" {
+			return strings.TrimSpace(metaClient.Name)
+		}
+	}
+	return ""
+}
+
+func (bridge *Bridge) recordDiscoveredHarness(operationContext context.Context, clientName string) {
+	trimmed := strings.TrimSpace(clientName)
+	if trimmed == "" {
+		return
+	}
+	bridge.mailMutex.Lock()
+	changed := bridge.mailRegistration.Harness != trimmed || !bridge.mailIdentified
+	bridge.mailRegistration.Harness = trimmed
+	bridge.mailIdentified = true
+	bridge.mailMutex.Unlock()
+	if changed {
+		bridge.identifyMailbox(operationContext)
+	}
 }
 
 const bridgeInstructions = "Orchestra connects coding agents across machines. " +
@@ -261,14 +339,7 @@ func (bridge *Bridge) newProtocolServer() *mcp.Server {
 		return func(operationContext context.Context, method string, request mcp.Request) (mcp.Result, error) {
 			if method == "initialize" && request != nil {
 				if initializeParameters, ok := request.GetParams().(*mcp.InitializeParams); ok && initializeParameters != nil && initializeParameters.ClientInfo != nil {
-					clientName := strings.TrimSpace(initializeParameters.ClientInfo.Name)
-					if clientName != "" {
-						bridge.mailMutex.Lock()
-						bridge.mailRegistration.Harness = clientName
-						bridge.mailIdentified = true
-						bridge.mailMutex.Unlock()
-						bridge.identifyMailbox(operationContext)
-					}
+					bridge.recordDiscoveredHarness(operationContext, initializeParameters.ClientInfo.Name)
 				}
 			}
 			return next(operationContext, method, request)
