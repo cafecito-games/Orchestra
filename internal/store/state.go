@@ -22,62 +22,70 @@ type InstanceDelivery struct {
 }
 
 type State struct {
-	Nodes              map[string]protocol.ComputeNode
-	CapabilityReports  map[string]protocol.NodeCapabilityReport
-	ComponentReports   map[string]protocol.ComponentInventoryReport
-	ProjectProfiles    map[string]protocol.ProjectProfile
-	Threads            map[string]protocol.Thread
-	Attachments        map[string]protocol.ThreadAttachment
-	Tasks              map[string]protocol.Task
-	TaskSubmissions    map[string]protocol.TaskSubmissionReceipt
-	TaskUpdates        map[string]protocol.TaskUpdateReceipt
-	Instances          map[string]protocol.AgentInstance
-	Allocations        map[string]protocol.InstanceAllocation
-	InstanceReceipts   map[string]protocol.InstanceLifecycleReceipt
-	ReleaseIntents     map[string]protocol.InstanceReleaseIntent
-	InstanceDeliveries map[string]InstanceDelivery
-	Runs               map[string]protocol.Run
-	SessionBindings    map[string]protocol.HarnessSessionBinding
-	WorkspaceLeases    map[string]protocol.WorkspaceLease
-	Approvals          map[string]protocol.ApprovalRequest
-	Artifacts          map[string]protocol.Artifact
-	ArtifactGrants     map[string]protocol.ArtifactUploadGrantRecord
-	Messages           map[string]protocol.TaskMessage
-	MessageAcks        map[string]protocol.TaskMessageAck
-	RunActivities      map[string]protocol.RunActivity
-	RunTranscripts     map[string]protocol.RunTranscript
-	EventStreams       map[string]protocol.ThreadEventStream
-	ThreadEvents       map[string][]protocol.TaskEventEntry
+	Nodes               map[string]protocol.ComputeNode
+	CapabilityReports   map[string]protocol.NodeCapabilityReport
+	ComponentReports    map[string]protocol.ComponentInventoryReport
+	ProjectProfiles     map[string]protocol.ProjectProfile
+	Threads             map[string]protocol.Thread
+	Attachments         map[string]protocol.ThreadAttachment
+	Tasks               map[string]protocol.Task
+	TaskSubmissions     map[string]protocol.TaskSubmissionReceipt
+	TaskUpdates         map[string]protocol.TaskUpdateReceipt
+	Instances           map[string]protocol.AgentInstance
+	Allocations         map[string]protocol.InstanceAllocation
+	InstanceReceipts    map[string]protocol.InstanceLifecycleReceipt
+	ReleaseIntents      map[string]protocol.InstanceReleaseIntent
+	InstanceDeliveries  map[string]InstanceDelivery
+	Runs                map[string]protocol.Run
+	SessionBindings     map[string]protocol.HarnessSessionBinding
+	WorkspaceLeases     map[string]protocol.WorkspaceLease
+	Approvals           map[string]protocol.ApprovalRequest
+	Artifacts           map[string]protocol.Artifact
+	ArtifactGrants      map[string]protocol.ArtifactUploadGrantRecord
+	Messages            map[string]protocol.TaskMessage
+	MessageAcks         map[string]protocol.TaskMessageAck
+	RunActivities       map[string]protocol.RunActivity
+	RunTranscripts      map[string]protocol.RunTranscript
+	RoomHeads           map[string]protocol.ThreadRoomHead
+	RoomMessages        map[string][]protocol.RoomMessage
+	RoomMessageReceipts map[string]protocol.RoomMessageReceipt
+	RoomNudgeReceipts   map[string]protocol.RoomNudgeReceipt
+	EventStreams        map[string]protocol.ThreadEventStream
+	ThreadEvents        map[string][]protocol.TaskEventEntry
 }
 
 func NewState() *State {
 	return &State{
-		Nodes:              map[string]protocol.ComputeNode{},
-		CapabilityReports:  map[string]protocol.NodeCapabilityReport{},
-		ComponentReports:   map[string]protocol.ComponentInventoryReport{},
-		ProjectProfiles:    map[string]protocol.ProjectProfile{},
-		Threads:            map[string]protocol.Thread{},
-		Attachments:        map[string]protocol.ThreadAttachment{},
-		Tasks:              map[string]protocol.Task{},
-		TaskSubmissions:    map[string]protocol.TaskSubmissionReceipt{},
-		TaskUpdates:        map[string]protocol.TaskUpdateReceipt{},
-		Instances:          map[string]protocol.AgentInstance{},
-		Allocations:        map[string]protocol.InstanceAllocation{},
-		InstanceReceipts:   map[string]protocol.InstanceLifecycleReceipt{},
-		ReleaseIntents:     map[string]protocol.InstanceReleaseIntent{},
-		InstanceDeliveries: map[string]InstanceDelivery{},
-		Runs:               map[string]protocol.Run{},
-		SessionBindings:    map[string]protocol.HarnessSessionBinding{},
-		WorkspaceLeases:    map[string]protocol.WorkspaceLease{},
-		Approvals:          map[string]protocol.ApprovalRequest{},
-		Artifacts:          map[string]protocol.Artifact{},
-		ArtifactGrants:     map[string]protocol.ArtifactUploadGrantRecord{},
-		Messages:           map[string]protocol.TaskMessage{},
-		MessageAcks:        map[string]protocol.TaskMessageAck{},
-		RunActivities:      map[string]protocol.RunActivity{},
-		RunTranscripts:     map[string]protocol.RunTranscript{},
-		EventStreams:       map[string]protocol.ThreadEventStream{},
-		ThreadEvents:       map[string][]protocol.TaskEventEntry{},
+		Nodes:               map[string]protocol.ComputeNode{},
+		CapabilityReports:   map[string]protocol.NodeCapabilityReport{},
+		ComponentReports:    map[string]protocol.ComponentInventoryReport{},
+		ProjectProfiles:     map[string]protocol.ProjectProfile{},
+		Threads:             map[string]protocol.Thread{},
+		Attachments:         map[string]protocol.ThreadAttachment{},
+		Tasks:               map[string]protocol.Task{},
+		TaskSubmissions:     map[string]protocol.TaskSubmissionReceipt{},
+		TaskUpdates:         map[string]protocol.TaskUpdateReceipt{},
+		Instances:           map[string]protocol.AgentInstance{},
+		Allocations:         map[string]protocol.InstanceAllocation{},
+		InstanceReceipts:    map[string]protocol.InstanceLifecycleReceipt{},
+		ReleaseIntents:      map[string]protocol.InstanceReleaseIntent{},
+		InstanceDeliveries:  map[string]InstanceDelivery{},
+		Runs:                map[string]protocol.Run{},
+		SessionBindings:     map[string]protocol.HarnessSessionBinding{},
+		WorkspaceLeases:     map[string]protocol.WorkspaceLease{},
+		Approvals:           map[string]protocol.ApprovalRequest{},
+		Artifacts:           map[string]protocol.Artifact{},
+		ArtifactGrants:      map[string]protocol.ArtifactUploadGrantRecord{},
+		Messages:            map[string]protocol.TaskMessage{},
+		MessageAcks:         map[string]protocol.TaskMessageAck{},
+		RunActivities:       map[string]protocol.RunActivity{},
+		RunTranscripts:      map[string]protocol.RunTranscript{},
+		RoomHeads:           map[string]protocol.ThreadRoomHead{},
+		RoomMessages:        map[string][]protocol.RoomMessage{},
+		RoomMessageReceipts: map[string]protocol.RoomMessageReceipt{},
+		RoomNudgeReceipts:   map[string]protocol.RoomNudgeReceipt{},
+		EventStreams:        map[string]protocol.ThreadEventStream{},
+		ThreadEvents:        map[string][]protocol.TaskEventEntry{},
 	}
 }
 
@@ -167,11 +175,48 @@ func (state *State) ensureInitialized() {
 	if state.RunTranscripts == nil {
 		state.RunTranscripts = map[string]protocol.RunTranscript{}
 	}
+	if state.RoomHeads == nil {
+		state.RoomHeads = map[string]protocol.ThreadRoomHead{}
+	}
+	if state.RoomMessages == nil {
+		state.RoomMessages = map[string][]protocol.RoomMessage{}
+	}
+	if state.RoomMessageReceipts == nil {
+		state.RoomMessageReceipts = map[string]protocol.RoomMessageReceipt{}
+	}
+	if state.RoomNudgeReceipts == nil {
+		state.RoomNudgeReceipts = map[string]protocol.RoomNudgeReceipt{}
+	}
 	if state.EventStreams == nil {
 		state.EventStreams = map[string]protocol.ThreadEventStream{}
 	}
 	if state.ThreadEvents == nil {
 		state.ThreadEvents = map[string][]protocol.TaskEventEntry{}
+	}
+}
+
+func (state *State) ensureRoomHeads() {
+	for _, threadID := range sortedKeys(state.Threads) {
+		thread := state.Threads[threadID]
+		head, exists := state.RoomHeads[threadID]
+		if !exists {
+			head = protocol.ThreadRoomHead{
+				ThreadID:      threadID,
+				DirectoryName: protocol.RoomDirectoryName(threadID, thread.CreatedAt),
+				HeadSequence:  0,
+				CreatedAt:     thread.CreatedAt,
+				UpdatedAt:     thread.UpdatedAt,
+			}
+		} else if head.DirectoryName == "" {
+			head.DirectoryName = protocol.RoomDirectoryName(threadID, thread.CreatedAt)
+		}
+		if messages := state.RoomMessages[threadID]; len(messages) > 0 {
+			lastSequence := messages[len(messages)-1].Sequence
+			if lastSequence > head.HeadSequence {
+				head.HeadSequence = lastSequence
+			}
+		}
+		state.RoomHeads[threadID] = head
 	}
 }
 

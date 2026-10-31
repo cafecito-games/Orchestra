@@ -18,6 +18,9 @@ const (
 	MaximumArtifactSizeBytes  = 10 * 1024 * 1024
 	MaximumWaitMilliseconds   = 20000
 	MaximumEventsPerWait      = 100
+	RoomTopicMaximumBytes     = 256
+	DefaultRoomReadLimit      = 100
+	MaximumRoomReadLimit      = 200
 
 	MinimumInstanceIdleTimeoutSeconds = 60
 	DefaultInstanceIdleTimeoutSeconds = 1800
@@ -47,6 +50,8 @@ var (
 	InstanceCreatorKinds        = []string{"operator", "run", "orchestrator-client"}
 	InstanceLifecycleOperations = []string{"create", "release", "renew"}
 	TaskMessageKinds            = []string{"progress", "question", "guidance", "blocker", "result"}
+	RoomMessageKinds            = []string{"finding", "contract", "decision", "gotcha", "guidance", "question", "answer"}
+	RoomAuthorKinds             = []string{"task", "orchestrator", "operator"}
 	ArtifactKinds               = []string{"patch", "report", "test-results", "log", "image", "other"}
 )
 
@@ -229,29 +234,35 @@ type TaskOrigin struct {
 }
 
 type Task struct {
-	ID                  string                `json:"id"`
-	ThreadID            string                `json:"threadId"`
-	ClientTaskID        string                `json:"clientTaskId,omitempty"`
-	ParentTaskID        string                `json:"parentTaskId,omitempty"`
-	CreatedByRunID      string                `json:"createdByRunId,omitempty"`
-	Origin              TaskOrigin            `json:"origin"`
-	Title               string                `json:"title"`
-	Instructions        string                `json:"instructions"`
-	Status              string                `json:"status"`
-	AttemptCount        int                   `json:"attemptCount"`
-	MaxAttempts         int                   `json:"maxAttempts"`
-	Dependencies        []TaskDependency      `json:"dependencies"`
-	Requirements        ExecutionRequirements `json:"requirements"`
-	PlacementOverride   *PlacementOverride    `json:"placementOverride,omitempty"`
-	PlacementInstanceID string                `json:"placementInstanceId,omitempty"`
-	PlacementDiagnostic *PlacementDiagnostic  `json:"placementDiagnostic,omitempty"`
-	Assignment          *TaskAssignment       `json:"assignment,omitempty"`
-	Summary             string                `json:"summary,omitempty"`
-	BlockerReason       string                `json:"blockerReason,omitempty"`
-	ArtifactIDs         []string              `json:"artifactIds,omitempty"`
-	CreatedAt           string                `json:"createdAt"`
-	UpdatedAt           string                `json:"updatedAt"`
-	FinishedAt          string                `json:"finishedAt,omitempty"`
+	ID                   string                `json:"id"`
+	ThreadID             string                `json:"threadId"`
+	ClientTaskID         string                `json:"clientTaskId,omitempty"`
+	ParentTaskID         string                `json:"parentTaskId,omitempty"`
+	CreatedByRunID       string                `json:"createdByRunId,omitempty"`
+	Origin               TaskOrigin            `json:"origin"`
+	Title                string                `json:"title"`
+	Instructions         string                `json:"instructions"`
+	Status               string                `json:"status"`
+	AttemptCount         int                   `json:"attemptCount"`
+	MaxAttempts          int                   `json:"maxAttempts"`
+	Dependencies         []TaskDependency      `json:"dependencies"`
+	Requirements         ExecutionRequirements `json:"requirements"`
+	PlacementOverride    *PlacementOverride    `json:"placementOverride,omitempty"`
+	PlacementInstanceID  string                `json:"placementInstanceId,omitempty"`
+	PreferredInstanceID  string                `json:"preferredInstanceId,omitempty"`
+	PlacementDiagnostic  *PlacementDiagnostic  `json:"placementDiagnostic,omitempty"`
+	Assignment           *TaskAssignment       `json:"assignment,omitempty"`
+	Summary              string                `json:"summary,omitempty"`
+	Progress             string                `json:"progress,omitempty"`
+	BlockerReason        string                `json:"blockerReason,omitempty"`
+	ArtifactIDs          []string              `json:"artifactIds,omitempty"`
+	LastRunOutput        string                `json:"lastRunOutput,omitempty"`
+	LastReadRoomSequence int64                 `json:"lastReadRoomSequence"`
+	RequiredRoomSequence int64                 `json:"requiredRoomSequence"`
+	NudgedAtRoomSequence int64                 `json:"nudgedAtRoomSequence"`
+	CreatedAt            string                `json:"createdAt"`
+	UpdatedAt            string                `json:"updatedAt"`
+	FinishedAt           string                `json:"finishedAt,omitempty"`
 }
 
 type TaskSubmissionReceipt struct {
@@ -506,6 +517,88 @@ type TaskMessageAck struct {
 	MessageID      string `json:"messageId"`
 	ReaderKey      string `json:"readerKey"`
 	AcknowledgedAt string `json:"acknowledgedAt"`
+}
+
+type RoomAuthor struct {
+	Kind       string `json:"kind"`
+	TaskID     string `json:"taskId,omitempty"`
+	RunID      string `json:"runId,omitempty"`
+	Title      string `json:"title,omitempty"`
+	ClientID   string `json:"clientId,omitempty"`
+	OperatorID string `json:"operatorId,omitempty"`
+}
+
+type RoomMessage struct {
+	Sequence           int64      `json:"seq"`
+	ID                 string     `json:"id"`
+	ThreadID           string     `json:"threadId"`
+	CreatedAt          string     `json:"createdAt"`
+	Author             RoomAuthor `json:"author"`
+	Kind               string     `json:"kind"`
+	Topic              string     `json:"topic,omitempty"`
+	Body               string     `json:"body"`
+	ReplyToSequence    *int64     `json:"replyToSequence,omitempty"`
+	SupersedesSequence *int64     `json:"supersedesSequence,omitempty"`
+	ArtifactIDs        []string   `json:"artifactIds,omitempty"`
+}
+
+type ThreadRoomHead struct {
+	ThreadID      string `json:"threadId"`
+	DirectoryName string `json:"directoryName"`
+	HeadSequence  int64  `json:"headSequence"`
+	CreatedAt     string `json:"createdAt"`
+	UpdatedAt     string `json:"updatedAt"`
+}
+
+type TaskRoomSummary struct {
+	HeadSequence     int64 `json:"headSequence"`
+	LastReadSequence int64 `json:"lastReadSequence"`
+	RequiredSequence int64 `json:"requiredSequence"`
+	UnreadNudge      bool  `json:"unreadNudge"`
+}
+
+type RoomMessageReceipt struct {
+	ID             string   `json:"id"`
+	ThreadID       string   `json:"threadId"`
+	SourceKey      string   `json:"sourceKey"`
+	IdempotencyKey string   `json:"idempotencyKey"`
+	Digest         string   `json:"digest"`
+	Sequence       int64    `json:"sequence"`
+	NudgedTaskIDs  []string `json:"nudgedTaskIds,omitempty"`
+	CreatedAt      string   `json:"createdAt"`
+}
+
+type RoomNudgeReceipt struct {
+	ID               string   `json:"id"`
+	ThreadID         string   `json:"threadId"`
+	SourceKey        string   `json:"sourceKey"`
+	IdempotencyKey   string   `json:"idempotencyKey"`
+	Digest           string   `json:"digest"`
+	RequiredSequence int64    `json:"requiredSequence"`
+	NudgedTaskIDs    []string `json:"nudgedTaskIds,omitempty"`
+	CreatedAt        string   `json:"createdAt"`
+}
+
+func RoomDirectoryName(threadID string, createdAt string) string {
+	dateSegment := "19700101"
+	if parsed, ok := ParseTimestamp(createdAt); ok {
+		dateSegment = parsed.UTC().Format("20060102")
+	}
+	rawSuffix := strings.TrimPrefix(strings.TrimSpace(threadID), "thread-")
+	var suffixBuilder strings.Builder
+	for _, character := range rawSuffix {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			character == '-' || character == '_' {
+			suffixBuilder.WriteRune(character)
+		}
+	}
+	suffix := suffixBuilder.String()
+	if suffix == "" {
+		suffix = "unknown"
+	}
+	return "room_" + dateSegment + "_" + suffix
 }
 
 type TaskEventEntry struct {

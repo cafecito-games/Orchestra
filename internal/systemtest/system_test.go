@@ -1823,3 +1823,262 @@ func TestAntigravityBuiltInACPAndNativeEndToEnd(t *testing.T) {
 	}
 	require.True(t, sawResumedAgyRun)
 }
+
+func TestSystemAgentRoomsJSONLMirrorAndEndOfTurnNudgeFollowUp(t *testing.T) {
+	binaries := ensureCompiledBinaries(t)
+	fakeHarnesses := installFakeHarnesses(t, binaries.fakeHarnessPath)
+
+	const bearerToken = "room-system-test-token-445566"
+	listenAddress := allocateFreeLoopbackAddress(t)
+	masterBaseURL := "http://" + listenAddress
+	masterDataDirectory := filepath.Join(t.TempDir(), "room-master-sqlite")
+
+	rawWorkspaceRoot := filepath.Join(t.TempDir(), "room-workspace-root")
+	require.NoError(t, os.MkdirAll(rawWorkspaceRoot, 0o755))
+	canonicalRoots, err := slave.CanonicalizeWorkspaceRoots([]string{rawWorkspaceRoot})
+	require.NoError(t, err)
+	repositoryAlpha := filepath.Join(canonicalRoots[0], "repo-alpha")
+	repositoryBeta := filepath.Join(canonicalRoots[0], "repo-beta")
+	initializeGitRepository(t, repositoryAlpha)
+	initializeGitRepository(t, repositoryBeta)
+
+	workerDataRoot := filepath.Join(t.TempDir(), "room-worker-data")
+	workerEnvironment := buildWorkerEnvironment(fakeHarnesses, "ORCHESTRA_DATA_ROOT="+workerDataRoot)
+
+	masterProcess := startManagedProcess(t, "room-master", binaries.orchestraPath, []string{
+		"master",
+		"--listen", listenAddress,
+		"--token", bearerToken,
+		"--data-dir", masterDataDirectory,
+	}, workerEnvironment)
+	waitForMasterReady(t, masterBaseURL, masterProcess)
+
+	workerProcess := startManagedProcess(t, "room-slave", binaries.orchestraPath, []string{
+		"slave",
+		"--endpoint", masterBaseURL,
+		"--token", bearerToken,
+		"--id", "worker-room",
+		"--name", "Room Worker",
+		"--concurrency", "2",
+		"--instance-capacity", "4",
+		"--workspace-root", canonicalRoots[0],
+		"--data-root", workerDataRoot,
+		"--claude-acp-auth-mode", "local-subscription",
+		"--acp-adapter", fakeHarnesses.claudeACPArgument,
+	}, workerEnvironment)
+
+	mcpSession := startMCPStdioSession(t, binaries.orchestraPath, masterBaseURL, bearerToken, "room-orchestrator")
+
+	require.Eventually(t, func() bool {
+		var inventory struct {
+			Nodes []protocol.NodeDetail `json:"nodes"`
+		}
+		mcpSession.callTool(t, "get_execution_inventory", map[string]any{}, &inventory)
+		for _, detail := range inventory.Nodes {
+			if detail.Node.ID == "worker-room" && detail.Connected && detail.Synced {
+				return true
+			}
+		}
+		return false
+	}, 12*time.Second, 100*time.Millisecond)
+
+	var createdThread struct {
+		Thread protocol.Thread `json:"thread"`
+	}
+	mcpSession.callTool(t, "create_thread", map[string]any{
+		"title": "Agent Rooms End-to-End Verification",
+	}, &createdThread)
+	threadID := createdThread.Thread.ID
+
+	taskAlphaScript := formatFakeScript(t,
+		map[string]any{
+			"call": "get_task_context",
+			"as":   "context",
+		},
+		map[string]any{
+			"when": map[string]any{"path": "context.room.unreadNudge", "equals": false},
+			"call": "post_room_message",
+			"arguments": map[string]any{
+				"idempotencyKey": "alpha-contract-1",
+				"kind":           "contract",
+				"topic":          "api-version",
+				"body":           "Expose /v1/items with cursor pagination",
+			},
+		},
+		map[string]any{
+			"when": map[string]any{"path": "context.room.unreadNudge", "equals": false},
+			"gate": "alpha-finish-turn-1",
+		},
+		map[string]any{
+			"when":    map[string]any{"path": "context.room.unreadNudge", "equals": false},
+			"message": "alpha-turn1 session={{session}}",
+		},
+		map[string]any{
+			"when": map[string]any{"path": "context.room.unreadNudge", "equals": true},
+			"call": "read_room",
+			"as":   "nudgeRead",
+		},
+		map[string]any{
+			"when": map[string]any{"path": "context.room.unreadNudge", "equals": true},
+			"call": "update_task",
+			"arguments": map[string]any{
+				"idempotencyKey": "alpha-reconciled-1",
+				"completion": map[string]any{
+					"summary": "Reconciled contract after reading operator nudge",
+				},
+			},
+		},
+		map[string]any{
+			"when":    map[string]any{"path": "context.room.unreadNudge", "equals": true},
+			"message": "alpha-followup session={{session}} head={{nudgeRead.headSequence}}",
+		},
+	)
+
+	taskBetaScript := formatFakeScript(t,
+		map[string]any{
+			"gate": "beta-after-nudge",
+		},
+		map[string]any{
+			"call":            "update_task",
+			"expectErrorCode": "unread_room_nudge",
+			"arguments": map[string]any{
+				"idempotencyKey": "beta-complete-early",
+				"completion": map[string]any{
+					"summary": "Premature completion before reading room",
+				},
+			},
+		},
+		map[string]any{
+			"call": "read_room",
+			"as":   "betaRoom",
+		},
+		map[string]any{
+			"call": "update_task",
+			"arguments": map[string]any{
+				"idempotencyKey": "beta-complete-after-read",
+				"completion": map[string]any{
+					"summary": "Read sibling contract={{betaRoom.messages.0.topic}} and guidance={{betaRoom.messages.1.topic}}",
+				},
+			},
+		},
+		map[string]any{
+			"message": "beta-done count={{betaRoom.headSequence}}",
+		},
+	)
+
+	var submitted struct {
+		Tasks         []protocol.Task   `json:"tasks"`
+		ClientTaskMap map[string]string `json:"clientTaskMap"`
+	}
+	mcpSession.callTool(t, "submit_tasks", map[string]any{
+		"threadId":       threadID,
+		"idempotencyKey": "submit-room-siblings",
+		"tasks": []map[string]any{
+			{
+				"clientTaskId": "alpha",
+				"title":        "API Producer",
+				"instructions": "Publish API contract\n" + taskAlphaScript,
+				"requirements": map[string]any{
+					"harnessIds": []string{"claude-cli"},
+					"transports": []string{"acp-v1"},
+					"workspace":  map[string]any{"path": repositoryAlpha, "writable": true},
+				},
+			},
+			{
+				"clientTaskId": "beta",
+				"title":        "API Consumer",
+				"instructions": "Consume API contract\n" + taskBetaScript,
+				"requirements": map[string]any{
+					"harnessIds": []string{"claude-cli"},
+					"transports": []string{"acp-v1"},
+					"workspace":  map[string]any{"path": repositoryBeta, "writable": true},
+				},
+			},
+		},
+	}, &submitted)
+	alphaTaskID := submitted.ClientTaskMap["alpha"]
+	betaTaskID := submitted.ClientTaskMap["beta"]
+
+	cliEnvironment := append(slices.Clone(workerEnvironment), "ORCHESTRA_ENDPOINT="+masterBaseURL, "ORCHESTRA_TOKEN="+bearerToken)
+
+	require.Eventually(t, func() bool {
+		var roomRead struct {
+			HeadSequence int64 `json:"headSequence"`
+		}
+		mcpSession.callTool(t, "read_room", map[string]any{"threadId": threadID}, &roomRead)
+		if roomRead.HeadSequence < 1 {
+			return false
+		}
+		var threadContext struct {
+			Tasks []protocol.Task `json:"tasks"`
+		}
+		mcpSession.callTool(t, "get_thread_context", map[string]any{"threadId": threadID}, &threadContext)
+		runningCount := 0
+		for _, candidate := range threadContext.Tasks {
+			if candidate.Status == "running" {
+				runningCount++
+			}
+		}
+		return runningCount == 2
+	}, 15*time.Second, 100*time.Millisecond)
+
+	postOutput, _ := invokeOrchestraCLI(
+		t,
+		binaries.orchestraPath,
+		cliEnvironment,
+		"room", "post", threadID, "Include X-Trace-ID in /v1/items responses",
+		"--kind", "guidance",
+		"--topic", "trace-header",
+		"--nudge",
+	)
+	require.Contains(t, postOutput, "Posted room message #2")
+
+	fakeHarnesses.openGate(t, "beta-after-nudge")
+	fakeHarnesses.openGate(t, "alpha-finish-turn-1")
+
+	require.Eventually(t, func() bool {
+		var threadContext struct {
+			Tasks []protocol.Task `json:"tasks"`
+		}
+		mcpSession.callTool(t, "get_thread_context", map[string]any{"threadId": threadID}, &threadContext)
+		completed := 0
+		for _, candidate := range threadContext.Tasks {
+			if (candidate.ID == alphaTaskID || candidate.ID == betaTaskID) && candidate.Status == "completed" {
+				completed++
+			}
+		}
+		return completed == 2
+	}, 20*time.Second, 100*time.Millisecond, "master:\n%s\nworker:\n%s", masterProcess.logs(), workerProcess.logs())
+
+	var detail protocol.ThreadDetailResponse
+	detailOutput, _ := invokeOrchestraCLI(t, binaries.orchestraPath, cliEnvironment, "thread", threadID, "--json")
+	require.NoError(t, json.Unmarshal([]byte(detailOutput), &detail))
+
+	var alphaRuns []protocol.Run
+	for _, runCandidate := range detail.Runs {
+		if runCandidate.TaskID != nil && *runCandidate.TaskID == alphaTaskID {
+			alphaRuns = append(alphaRuns, runCandidate)
+		}
+	}
+	require.Len(t, alphaRuns, 2, "alpha should have run initial turn + single nudge follow-up turn")
+	require.NotNil(t, alphaRuns[0].ProviderSessionID)
+	require.NotNil(t, alphaRuns[1].ProviderSessionID)
+	require.Equal(t, *alphaRuns[0].ProviderSessionID, *alphaRuns[1].ProviderSessionID, "nudge follow-up should resume exact ACP session")
+	require.Contains(t, alphaRuns[1].Output, "alpha-followup")
+
+	for _, candidate := range detail.Tasks {
+		if candidate.ID == betaTaskID {
+			require.Equal(t, "Read sibling contract=api-version and guidance=trace-header", candidate.Summary)
+		}
+		if candidate.ID == alphaTaskID {
+			require.Equal(t, "Reconciled contract after reading operator nudge", candidate.Summary)
+		}
+	}
+
+	roomPathOutput, _ := invokeOrchestraCLI(t, binaries.orchestraPath, cliEnvironment, "room", "path", threadID)
+	roomJSONLPath := strings.TrimSpace(roomPathOutput)
+	rawJSONL, err := os.ReadFile(roomJSONLPath)
+	require.NoError(t, err)
+	jsonlLines := strings.Split(strings.TrimSuffix(string(rawJSONL), "\n"), "\n")
+	require.Len(t, jsonlLines, 2)
+}

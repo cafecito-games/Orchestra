@@ -29,30 +29,32 @@ var (
 )
 
 const (
-	collectionNodes              = "nodes"
-	collectionCapabilityReports  = "capability_reports"
-	collectionComponentReports   = "component_reports"
-	collectionProjectProfiles    = "project_profiles"
-	collectionThreads            = "threads"
-	collectionAttachments        = "attachments"
-	collectionTasks              = "tasks"
-	collectionTaskSubmissions    = "task_submissions"
-	collectionTaskUpdates        = "task_updates"
-	collectionInstances          = "instances"
-	collectionAllocations        = "allocations"
-	collectionInstanceReceipts   = "instance_receipts"
-	collectionReleaseIntents     = "release_intents"
-	collectionInstanceDeliveries = "instance_deliveries"
-	collectionRuns               = "runs"
-	collectionSessionBindings    = "session_bindings"
-	collectionWorkspaceLeases    = "workspace_leases"
-	collectionApprovals          = "approvals"
-	collectionArtifacts          = "artifacts"
-	collectionArtifactGrants     = "artifact_grants"
-	collectionMessages           = "messages"
-	collectionMessageAcks        = "message_acks"
-	collectionRunActivities      = "run_activities"
-	collectionRunTranscripts     = "run_transcripts"
+	collectionNodes               = "nodes"
+	collectionCapabilityReports   = "capability_reports"
+	collectionComponentReports    = "component_reports"
+	collectionProjectProfiles     = "project_profiles"
+	collectionThreads             = "threads"
+	collectionAttachments         = "attachments"
+	collectionTasks               = "tasks"
+	collectionTaskSubmissions     = "task_submissions"
+	collectionTaskUpdates         = "task_updates"
+	collectionInstances           = "instances"
+	collectionAllocations         = "allocations"
+	collectionInstanceReceipts    = "instance_receipts"
+	collectionReleaseIntents      = "release_intents"
+	collectionInstanceDeliveries  = "instance_deliveries"
+	collectionRuns                = "runs"
+	collectionSessionBindings     = "session_bindings"
+	collectionWorkspaceLeases     = "workspace_leases"
+	collectionApprovals           = "approvals"
+	collectionArtifacts           = "artifacts"
+	collectionArtifactGrants      = "artifact_grants"
+	collectionMessages            = "messages"
+	collectionMessageAcks         = "message_acks"
+	collectionRunActivities       = "run_activities"
+	collectionRunTranscripts      = "run_transcripts"
+	collectionRoomMessageReceipts = "room_message_receipts"
+	collectionRoomNudgeReceipts   = "room_nudge_receipts"
 )
 
 type Mutation struct {
@@ -73,12 +75,17 @@ func (mutation *Mutation) OnCommit(callback func()) {
 type Store struct {
 	dataDirectory      string
 	artifactsDirectory string
+	roomsDirectory     string
 	database           *sql.DB
 
 	mutex      sync.RWMutex
 	state      *State
 	serialized map[string]map[string]string
 	now        func() time.Time
+
+	roomMirrorMutex    sync.Mutex
+	mirroredRoomCounts map[string]int
+	mirroredRoomSizes  map[string]int64
 
 	subscriberSequence atomic.Int64
 	subscriberMutex    sync.Mutex
@@ -104,6 +111,13 @@ func Open(dataDirectory string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prepare artifacts directory: %w", err)
 	}
+	roomsDirectory, err := safepath.EnsureDirectoryWithinRoot(canonicalRoot, filepath.Join(canonicalRoot, "rooms"), 0o700)
+	if err != nil {
+		return nil, fmt.Errorf("prepare rooms directory: %w", err)
+	}
+	if err := os.Chmod(roomsDirectory, 0o700); err != nil {
+		return nil, fmt.Errorf("chmod rooms directory: %w", err)
+	}
 
 	databasePath := filepath.Join(canonicalRoot, "orchestra.db")
 	database, err := sql.Open("sqlite", databasePath)
@@ -121,13 +135,20 @@ func Open(dataDirectory string) (*Store, error) {
 	store := &Store{
 		dataDirectory:      canonicalRoot,
 		artifactsDirectory: artifactsDirectory,
+		roomsDirectory:     roomsDirectory,
 		database:           database,
 		state:              NewState(),
 		serialized:         map[string]map[string]string{},
 		now:                time.Now,
+		mirroredRoomCounts: map[string]int{},
+		mirroredRoomSizes:  map[string]int64{},
 		subscribers:        map[int64]chan []protocol.TaskEventEntry{},
 	}
 	if err := store.loadFromDatabase(); err != nil {
+		_ = database.Close()
+		return nil, err
+	}
+	if err := store.reconcileAllRooms(); err != nil {
 		_ = database.Close()
 		return nil, err
 	}
@@ -186,6 +207,19 @@ func (store *Store) Mutate(mutator func(state *State, mutation *Mutation) error)
 		return nil, err
 	}
 	working.ensureInitialized()
+	working.ensureRoomHeads()
+
+	changedRoomHeads, newRoomMessages, mirrorUpdates, err := collectRoomDiff(store.state, working)
+	if err != nil {
+		store.mutex.Unlock()
+		return nil, err
+	}
+	for _, mirrorUpdate := range mirrorUpdates {
+		if verifyErr := store.verifyRoomMirrorTarget(mirrorUpdate.head); verifyErr != nil {
+			store.mutex.Unlock()
+			return nil, verifyErr
+		}
+	}
 
 	occurredAt := store.now().UTC().Format(time.RFC3339Nano)
 	committedEvents, prunedBelow := synthesizeThreadEvents(store.state, working, mutation.explicitEvents, occurredAt)
@@ -196,13 +230,19 @@ func (store *Store) Mutate(mutator func(state *State, mutation *Mutation) error)
 		return nil, err
 	}
 
-	if err := store.commitDiff(nextSerialized, working.EventStreams, committedEvents, prunedBelow); err != nil {
+	if err := store.commitDiff(nextSerialized, working.EventStreams, committedEvents, prunedBelow, changedRoomHeads, newRoomMessages); err != nil {
 		store.mutex.Unlock()
 		return nil, err
 	}
 
 	store.state = working
 	store.serialized = nextSerialized
+	var mirrorSyncErr error
+	for _, mirrorUpdate := range mirrorUpdates {
+		if syncErr := store.syncRoomMirror(mirrorUpdate, false); syncErr != nil && mirrorSyncErr == nil {
+			mirrorSyncErr = syncErr
+		}
+	}
 	hooks := mutation.commitHooks
 	store.mutex.Unlock()
 
@@ -211,6 +251,9 @@ func (store *Store) Mutate(mutator func(state *State, mutation *Mutation) error)
 	}
 	for _, hook := range hooks {
 		hook()
+	}
+	if mirrorSyncErr != nil {
+		return committedEvents, mirrorSyncErr
 	}
 	return committedEvents, nil
 }
@@ -361,6 +404,24 @@ CREATE TABLE IF NOT EXISTS thread_events (
 	payload_json TEXT NOT NULL,
 	PRIMARY KEY (thread_id, sequence)
 );
+
+CREATE TABLE IF NOT EXISTS thread_room_heads (
+	thread_id TEXT PRIMARY KEY,
+	directory_name TEXT NOT NULL,
+	head_sequence INTEGER NOT NULL,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS thread_room_messages (
+	thread_id TEXT NOT NULL,
+	sequence INTEGER NOT NULL,
+	message_id TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	payload_json TEXT NOT NULL,
+	PRIMARY KEY (thread_id, sequence)
+);
 `
 	if _, err := database.Exec(schema); err != nil {
 		return fmt.Errorf("initialize sqlite schema: %w", err)
@@ -431,6 +492,58 @@ func (store *Store) loadFromDatabase() error {
 		return err
 	}
 
+	roomHeadRows, err := store.database.Query(`SELECT thread_id, directory_name, head_sequence, created_at, updated_at FROM thread_room_heads`)
+	if err != nil {
+		return fmt.Errorf("query thread_room_heads: %w", err)
+	}
+	defer roomHeadRows.Close()
+	for roomHeadRows.Next() {
+		var head protocol.ThreadRoomHead
+		if scanErr := roomHeadRows.Scan(&head.ThreadID, &head.DirectoryName, &head.HeadSequence, &head.CreatedAt, &head.UpdatedAt); scanErr != nil {
+			return scanErr
+		}
+		loaded.RoomHeads[head.ThreadID] = head
+	}
+	if err := roomHeadRows.Err(); err != nil {
+		return err
+	}
+
+	roomMessageRows, err := store.database.Query(`SELECT thread_id, payload_json FROM thread_room_messages ORDER BY thread_id, sequence ASC`)
+	if err != nil {
+		return fmt.Errorf("query thread_room_messages: %w", err)
+	}
+	defer roomMessageRows.Close()
+	for roomMessageRows.Next() {
+		var threadID, payload string
+		if scanErr := roomMessageRows.Scan(&threadID, &payload); scanErr != nil {
+			return scanErr
+		}
+		var message protocol.RoomMessage
+		if decodeErr := json.Unmarshal([]byte(payload), &message); decodeErr != nil {
+			return fmt.Errorf("decode room message in %s: %w", threadID, decodeErr)
+		}
+		loaded.RoomMessages[threadID] = append(loaded.RoomMessages[threadID], message)
+	}
+	if err := roomMessageRows.Err(); err != nil {
+		return err
+	}
+
+	loaded.ensureRoomHeads()
+	for _, threadID := range sortedKeys(loaded.RoomHeads) {
+		head := loaded.RoomHeads[threadID]
+		if _, execErr := store.database.Exec(`
+INSERT INTO thread_room_heads (thread_id, directory_name, head_sequence, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(thread_id) DO UPDATE SET
+	directory_name = excluded.directory_name,
+	head_sequence = excluded.head_sequence,
+	created_at = excluded.created_at,
+	updated_at = excluded.updated_at
+`, head.ThreadID, head.DirectoryName, head.HeadSequence, head.CreatedAt, head.UpdatedAt); execErr != nil {
+			return fmt.Errorf("backfill thread_room_heads for %s: %w", threadID, execErr)
+		}
+	}
+
 	store.state = loaded
 	store.serialized = serialized
 	return nil
@@ -441,6 +554,8 @@ func (store *Store) commitDiff(
 	eventStreams map[string]protocol.ThreadEventStream,
 	newEvents []protocol.TaskEventEntry,
 	prunedBelow map[string]int64,
+	changedRoomHeads map[string]protocol.ThreadRoomHead,
+	newRoomMessages map[string][]protocol.RoomMessage,
 ) error {
 	transaction, err := store.database.BeginTx(context.Background(), nil)
 	if err != nil {
@@ -550,6 +665,63 @@ ON CONFLICT(thread_id) DO UPDATE SET
 		}
 	}
 
+	if len(changedRoomHeads) > 0 || len(newRoomMessages) > 0 {
+		upsertRoomHeadStatement, prepErr := transaction.Prepare(`
+INSERT INTO thread_room_heads (thread_id, directory_name, head_sequence, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(thread_id) DO UPDATE SET
+	directory_name = excluded.directory_name,
+	head_sequence = excluded.head_sequence,
+	created_at = excluded.created_at,
+	updated_at = excluded.updated_at
+`)
+		if prepErr != nil {
+			return prepErr
+		}
+		defer upsertRoomHeadStatement.Close()
+
+		insertRoomMessageStatement, prepErr := transaction.Prepare(`
+INSERT INTO thread_room_messages (thread_id, sequence, message_id, kind, created_at, payload_json)
+VALUES (?, ?, ?, ?, ?, ?)
+`)
+		if prepErr != nil {
+			return prepErr
+		}
+		defer insertRoomMessageStatement.Close()
+
+		for _, threadID := range sortedKeys(newRoomMessages) {
+			for _, message := range newRoomMessages[threadID] {
+				encodedMessage, marshalErr := json.Marshal(message)
+				if marshalErr != nil {
+					return marshalErr
+				}
+				if _, execErr := insertRoomMessageStatement.Exec(
+					message.ThreadID,
+					message.Sequence,
+					message.ID,
+					message.Kind,
+					message.CreatedAt,
+					string(encodedMessage),
+				); execErr != nil {
+					return execErr
+				}
+			}
+		}
+
+		for _, threadID := range sortedKeys(changedRoomHeads) {
+			head := changedRoomHeads[threadID]
+			if _, execErr := upsertRoomHeadStatement.Exec(
+				head.ThreadID,
+				head.DirectoryName,
+				head.HeadSequence,
+				head.CreatedAt,
+				head.UpdatedAt,
+			); execErr != nil {
+				return execErr
+			}
+		}
+	}
+
 	return transaction.Commit()
 }
 
@@ -640,6 +812,12 @@ func serializeCollections(state *State) (map[string]map[string]string, error) {
 	if result[collectionRunTranscripts], err = serializeMap(state.RunTranscripts); err != nil {
 		return nil, err
 	}
+	if result[collectionRoomMessageReceipts], err = serializeMap(state.RoomMessageReceipts); err != nil {
+		return nil, err
+	}
+	if result[collectionRoomNudgeReceipts], err = serializeMap(state.RoomNudgeReceipts); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -702,6 +880,10 @@ func decodeRecordIntoState(state *State, collection, recordID string, data []byt
 		return decodeInto(state.RunActivities, recordID, data)
 	case collectionRunTranscripts:
 		return decodeInto(state.RunTranscripts, recordID, data)
+	case collectionRoomMessageReceipts:
+		return decodeInto(state.RoomMessageReceipts, recordID, data)
+	case collectionRoomNudgeReceipts:
+		return decodeInto(state.RoomNudgeReceipts, recordID, data)
 	default:
 		return nil
 	}

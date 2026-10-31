@@ -233,11 +233,12 @@ func (service *Service) findReusableResident(
 	requirements protocol.ExecutionRequirements,
 ) (protocol.AgentInstance, protocol.InstanceAllocation, bool) {
 	type candidate struct {
-		instance      protocol.AgentInstance
-		allocation    protocol.InstanceAllocation
-		hasBinding    bool
-		preferenceHit int
-		activeRuns    int
+		instance          protocol.AgentInstance
+		allocation        protocol.InstanceAllocation
+		preferredInstance bool
+		hasBinding        bool
+		preferenceHit     int
+		activeRuns        int
 	}
 
 	var candidates []candidate
@@ -308,11 +309,12 @@ func (service *Service) findReusableResident(
 		}
 
 		candidates = append(candidates, candidate{
-			instance:      instance,
-			allocation:    allocation,
-			hasBinding:    hasBinding,
-			preferenceHit: scorePreferences(node, report, allocation.HarnessID, allocation.Model, requirements.Preferences),
-			activeRuns:    activeRuns,
+			instance:          instance,
+			allocation:        allocation,
+			preferredInstance: task.PreferredInstanceID != "" && instance.ID == task.PreferredInstanceID,
+			hasBinding:        hasBinding,
+			preferenceHit:     scorePreferences(node, report, allocation.HarnessID, allocation.Model, requirements.Preferences),
+			activeRuns:        activeRuns,
 		})
 	}
 
@@ -321,6 +323,12 @@ func (service *Service) findReusableResident(
 	}
 
 	slices.SortFunc(candidates, func(left, right candidate) int {
+		if left.preferredInstance != right.preferredInstance {
+			if left.preferredInstance {
+				return -1
+			}
+			return 1
+		}
 		if left.instance.AutoManaged != right.instance.AutoManaged {
 			if !left.instance.AutoManaged {
 				return -1
@@ -1020,6 +1028,31 @@ func composeTaskPrompt(state *store.State, task protocol.Task) string {
 			if depTask, exists := state.Tasks[dependency.TaskID]; exists {
 				builder.WriteString(fmt.Sprintf("- %s [%s]: %s\n", depTask.Title, depTask.Status, depTask.Summary))
 			}
+		}
+	}
+	roomHead := state.RoomHeads[task.ThreadID]
+	hasUnreadNudge := task.RequiredRoomSequence > task.LastReadRoomSequence
+	if roomHead.HeadSequence > 0 || hasUnreadNudge {
+		builder.WriteString(fmt.Sprintf(
+			"\nThread Room: headSequence=%d, lastReadSequence=%d, requiredSequence=%d, unreadNudge=%t\n",
+			roomHead.HeadSequence,
+			task.LastReadRoomSequence,
+			task.RequiredRoomSequence,
+			hasUnreadNudge,
+		))
+		builder.WriteString("Use `read_room` to inspect shared thread findings, contracts, decisions, gotchas, and guidance, and `post_room_message` to publish discoveries for sibling tasks.\n")
+		if hasUnreadNudge {
+			builder.WriteString(fmt.Sprintf(
+				"Action Required: Unread room nudge through sequence %d. Call `read_room` before finalizing, reconcile your work if needed, and then complete the task.\n",
+				task.RequiredRoomSequence,
+			))
+		}
+	}
+	if task.LastRunOutput != "" && (hasUnreadNudge || task.NudgedAtRoomSequence > 0) {
+		builder.WriteString("\nPrior Run Output:\n")
+		builder.WriteString(task.LastRunOutput)
+		if !strings.HasSuffix(task.LastRunOutput, "\n") {
+			builder.WriteByte('\n')
 		}
 	}
 	builder.WriteString("\nInstructions:\n")

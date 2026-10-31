@@ -522,18 +522,109 @@ func (service *Service) handleAPIThreads(writer http.ResponseWriter, request *ht
 }
 
 func (service *Service) handleAPIThreadSubroutes(writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodGet {
-		writer.WriteHeader(http.StatusMethodNotAllowed)
+	remainder := strings.TrimPrefix(request.URL.Path, "/api/threads/")
+	remainder = strings.TrimSuffix(remainder, "/")
+	threadID, subroute, hasSubroute := strings.Cut(remainder, "/")
+	if !hasSubroute {
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		detail, err := service.GetThreadDetail(threadID)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, detail)
 		return
 	}
-	threadID := strings.TrimPrefix(request.URL.Path, "/api/threads/")
-	threadID = strings.TrimSuffix(threadID, "/")
-	detail, err := service.GetThreadDetail(threadID)
-	if err != nil {
-		writeOperationError(writer, err)
-		return
+
+	operatorCaller := CallerIdentity{Kind: "operator", OperatorID: "cli"}
+	switch subroute {
+	case "room":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var afterSequence int64
+		if rawAfter := strings.TrimSpace(request.URL.Query().Get("after")); rawAfter != "" {
+			parsedAfter, parseErr := strconv.ParseInt(rawAfter, 10, 64)
+			if parseErr != nil {
+				writeOperationError(writer, invalidRequest("after must be an integer"))
+				return
+			}
+			afterSequence = parsedAfter
+		}
+		var limit int
+		if rawLimit := strings.TrimSpace(request.URL.Query().Get("limit")); rawLimit != "" {
+			parsedLimit, parseErr := strconv.Atoi(rawLimit)
+			if parseErr != nil {
+				writeOperationError(writer, invalidRequest("limit must be an integer"))
+				return
+			}
+			limit = parsedLimit
+		}
+		var kinds []string
+		for _, rawKind := range request.URL.Query()["kind"] {
+			for part := range strings.SplitSeq(rawKind, ",") {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					kinds = append(kinds, trimmed)
+				}
+			}
+		}
+		result, err := service.ReadRoom(operatorCaller, ReadRoomInput{
+			ThreadID:      threadID,
+			AfterSequence: afterSequence,
+			Kinds:         kinds,
+			Limit:         limit,
+		})
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	case "room/messages":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input PostRoomMessageInput
+		if err := json.NewDecoder(io.LimitReader(request.Body, 256*1024)).Decode(&input); err != nil {
+			writeOperationError(writer, invalidRequest("malformed JSON body"))
+			return
+		}
+		input.ThreadID = threadID
+		result, err := service.PostRoomMessage(operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		statusCode := http.StatusCreated
+		if result.Replayed {
+			statusCode = http.StatusOK
+		}
+		writeJSONResponse(writer, statusCode, result)
+	case "room/nudge":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input NudgeRoomInput
+		if err := json.NewDecoder(io.LimitReader(request.Body, 64*1024)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+			writeOperationError(writer, invalidRequest("malformed JSON body"))
+			return
+		}
+		input.ThreadID = threadID
+		result, err := service.NudgeRoom(operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	default:
+		writer.WriteHeader(http.StatusNotFound)
 	}
-	writeJSONResponse(writer, http.StatusOK, detail)
 }
 
 func (service *Service) handleAPIRunSubroutes(writer http.ResponseWriter, request *http.Request) {

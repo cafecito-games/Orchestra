@@ -51,6 +51,7 @@ type ThreadContextResponse struct {
 	PendingApprovals []protocol.ApprovalRequest `json:"pendingApprovals"`
 	Artifacts        []protocol.Artifact        `json:"artifacts"`
 	RecentMessages   []protocol.TaskMessage     `json:"recentMessages"`
+	Room             protocol.ThreadRoomHead    `json:"room"`
 	EventStream      protocol.ThreadEventStream `json:"eventStream"`
 }
 
@@ -356,6 +357,16 @@ func (service *Service) GetThreadContext(threadID string) (ThreadContextResponse
 			messages = messages[len(messages)-50:]
 		}
 		response.RecentMessages = messages
+		if roomHead, hasRoom := state.RoomHeads[threadID]; hasRoom {
+			response.Room = roomHead
+		} else {
+			response.Room = protocol.ThreadRoomHead{
+				ThreadID:      threadID,
+				DirectoryName: protocol.RoomDirectoryName(threadID, thread.CreatedAt),
+				CreatedAt:     thread.CreatedAt,
+				UpdatedAt:     thread.UpdatedAt,
+			}
+		}
 		stream, hasStream := state.EventStreams[threadID]
 		if !hasStream {
 			stream = protocol.ThreadEventStream{ThreadID: threadID}
@@ -436,6 +447,16 @@ func (service *Service) GetThreadDetail(threadID string) (protocol.ThreadDetailR
 			}
 		}
 		detail.Messages = collectThreadMessages(state, threadID)
+		if roomHead, hasRoom := state.RoomHeads[threadID]; hasRoom {
+			detail.Room = roomHead
+		} else {
+			detail.Room = protocol.ThreadRoomHead{
+				ThreadID:      threadID,
+				DirectoryName: protocol.RoomDirectoryName(threadID, thread.CreatedAt),
+				CreatedAt:     thread.CreatedAt,
+				UpdatedAt:     thread.UpdatedAt,
+			}
+		}
 		for _, run := range detail.Runs {
 			if activity, exists := state.RunActivities[run.ID]; exists {
 				detail.Activities = append(detail.Activities, activity)

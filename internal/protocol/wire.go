@@ -8,6 +8,8 @@ import (
 // HubToolNames are the worker MCP tools exposed on the slave's ephemeral `orchestra_hub` server.
 var HubToolNames = []string{
 	"get_task_context",
+	"read_room",
+	"post_room_message",
 	"send_task_message",
 	"wait_for_task_events",
 	"update_task",
@@ -33,7 +35,7 @@ var DelegationHubToolNames = []string{
 	"release_instance",
 }
 
-// OrchestratorToolNames are the 17 tools exposed on the master's orchestrator MCP surface.
+// OrchestratorToolNames are the tools exposed on the master's orchestrator MCP surface.
 var OrchestratorToolNames = []string{
 	"get_execution_inventory",
 	"create_thread",
@@ -42,6 +44,9 @@ var OrchestratorToolNames = []string{
 	"detach_thread",
 	"get_thread_context",
 	"get_thread_events",
+	"read_room",
+	"post_room_message",
+	"nudge_room",
 	"submit_tasks",
 	"update_task",
 	"send_task_message",
@@ -216,6 +221,7 @@ type ThreadDetailResponse struct {
 	WorkspaceLeases []WorkspaceLease        `json:"workspaceLeases"`
 	SessionBindings []HarnessSessionBinding `json:"sessionBindings"`
 	Messages        []TaskMessage           `json:"messages"`
+	Room            ThreadRoomHead          `json:"room"`
 	Activities      []RunActivity           `json:"activities"`
 	Transcripts     []RunTranscript         `json:"transcripts"`
 	EventStream     ThreadEventStream       `json:"eventStream"`

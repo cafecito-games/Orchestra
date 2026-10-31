@@ -89,7 +89,41 @@ func TestMCPServerGrantDelegationAndPostArtifact(t *testing.T) {
 	require.Equal(t, http.StatusOK, statusCode)
 	<-workerConfiguration.Connected
 	listedTools := listResult["result"].(map[string]any)["tools"].([]any)
-	require.Len(t, listedTools, 6)
+	require.Len(t, listedTools, 8)
+	var leafPostRoomSchema map[string]any
+	for _, rawTool := range listedTools {
+		toolMap := rawTool.(map[string]any)
+		if toolMap["name"] == "post_room_message" {
+			leafPostRoomSchema = toolMap["inputSchema"].(map[string]any)
+		}
+	}
+	require.NotNil(t, leafPostRoomSchema)
+	require.NotContains(t, leafPostRoomSchema["properties"].(map[string]any), "nudgeTaskIds")
+
+	_, leafNudgeDenied := callMCP(workerConfiguration, "tools/call", map[string]any{
+		"name": "post_room_message",
+		"arguments": map[string]any{
+			"idempotencyKey": "k-nudge",
+			"kind":           "guidance",
+			"body":           "attempt nudge",
+			"nudgeTaskIds":   []string{"task-1"},
+		},
+	})
+	require.Equal(t, true, leafNudgeDenied["result"].(map[string]any)["isError"])
+
+	delegatingConfiguration, err := server.Grant("run-delegator", workspaceDirectory, true)
+	require.NoError(t, err)
+	defer server.Revoke(delegatingConfiguration.Token)
+	_, delegatingList := callMCP(delegatingConfiguration, "tools/list", map[string]any{})
+	var delegatingPostRoomSchema map[string]any
+	for _, rawTool := range delegatingList["result"].(map[string]any)["tools"].([]any) {
+		toolMap := rawTool.(map[string]any)
+		if toolMap["name"] == "post_room_message" {
+			delegatingPostRoomSchema = toolMap["inputSchema"].(map[string]any)
+		}
+	}
+	require.NotNil(t, delegatingPostRoomSchema)
+	require.Contains(t, delegatingPostRoomSchema["properties"].(map[string]any), "nudgeTaskIds")
 
 	_, delegateDenied := callMCP(workerConfiguration, "tools/call", map[string]any{
 		"name":      "submit_tasks",
