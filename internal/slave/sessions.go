@@ -128,11 +128,28 @@ func (session *runSession) execute(
 	dispatchedBinding *protocol.DispatchSessionBinding,
 	dispatchedLease *protocol.WorkspaceLeaseGrant,
 ) {
+	var terminalMessage *protocol.SlaveControlMessage
 	defer func() {
 		session.cancelAllApprovals()
 		session.cancel()
 		session.client.finishSession(session.run.ID)
-		session.client.releaseResidentRun(session.resident.instance.ID, session.resident.allocation.ID, session.run.ID)
+		emitReleased, releaseReason := session.client.completeResidentRun(
+			session.resident.instance.ID,
+			session.resident.allocation.ID,
+			session.run.ID,
+		)
+		if terminalMessage != nil {
+			session.client.sendOrQueue(*terminalMessage)
+		}
+		if emitReleased {
+			session.client.sendOrQueue(protocol.SlaveControlMessage{
+				Type:         "instance.released",
+				InstanceID:   session.resident.instance.ID,
+				AllocationID: session.resident.allocation.ID,
+				Reason:       releaseReason,
+				At:           session.client.nowUTC(),
+			})
+		}
 		session.client.sendHeartbeat()
 	}()
 
@@ -145,7 +162,7 @@ func (session *runSession) execute(
 	if dispatchedLease != nil {
 		leaseHandle, provisionedPath, err := session.client.leases.provisionForRun(runContext, session.run, *dispatchedLease)
 		if err != nil {
-			session.emitTerminalFailure(err)
+			terminalMessage = session.buildTerminalFailure(err)
 			return
 		}
 		activeLease = leaseHandle
@@ -154,14 +171,14 @@ func (session *runSession) execute(
 	} else {
 		canonicalWorkspace, err := VerifyWorkspaceWithinRoots(session.client.node.WorkspaceRoots, workingDirectory)
 		if err != nil {
-			session.emitTerminalFailure(err)
+			terminalMessage = session.buildTerminalFailure(err)
 			return
 		}
 		workingDirectory = canonicalWorkspace
 	}
 
 	if session.client.runner == nil {
-		session.emitTerminalFailure(errors.New("harness runner is not configured on this slave node"))
+		terminalMessage = session.buildTerminalFailure(errors.New("harness runner is not configured on this slave node"))
 		return
 	}
 
@@ -170,11 +187,11 @@ func (session *runSession) execute(
 		fallbackTransport = *session.run.FallbackTransport
 	}
 	if err := session.client.runner.AdmitModel(session.run.HarnessID, session.run.Model); err != nil {
-		session.emitTerminalFailure(err)
+		terminalMessage = session.buildTerminalFailure(err)
 		return
 	}
 	if err := session.client.runner.Admit(session.run.HarnessID, session.run.Transport, fallbackTransport); err != nil {
-		session.emitTerminalFailure(err)
+		terminalMessage = session.buildTerminalFailure(err)
 		return
 	}
 
@@ -186,11 +203,11 @@ func (session *runSession) execute(
 	var resume *harness.SessionResume
 	if dispatchedBinding != nil {
 		if err := dispatchedBinding.Validate(); err != nil {
-			session.emitTerminalFailure(err)
+			terminalMessage = session.buildTerminalFailure(err)
 			return
 		}
 		if dispatchedBinding.Transport != "" && dispatchedBinding.Transport != effectiveTransport {
-			session.emitTerminalFailure(errors.New(protocol.SessionResumeUnavailableReason))
+			terminalMessage = session.buildTerminalFailure(errors.New(protocol.SessionResumeUnavailableReason))
 			return
 		}
 		if err := session.client.runner.AdmitResume(session.run.HarnessID, effectiveTransport); err != nil {
@@ -207,7 +224,7 @@ func (session *runSession) execute(
 				Binding: &failedBinding,
 				At:      session.client.nowUTC(),
 			})
-			session.emitTerminalFailure(errors.New(protocol.SessionResumeUnavailableReason))
+			terminalMessage = session.buildTerminalFailure(errors.New(protocol.SessionResumeUnavailableReason))
 			return
 		}
 		resume = &harness.SessionResume{
@@ -220,7 +237,7 @@ func (session *runSession) execute(
 	if session.client.mcpServer != nil {
 		granted, err := session.client.mcpServer.Grant(session.run.ID, workingDirectory, session.resident.instance.Delegation.CanDelegate)
 		if err != nil {
-			session.emitTerminalFailure(err)
+			terminalMessage = session.buildTerminalFailure(err)
 			return
 		}
 		mcpGrant = granted
@@ -376,53 +393,52 @@ func (session *runSession) execute(
 
 	if wasCancelled {
 		redactedOutput := protocol.BoundedTextValue(protocol.RedactText(output), protocol.TextMaximumBytes)
-		session.client.sendOrQueue(protocol.SlaveControlMessage{
+		terminalMessage = &protocol.SlaveControlMessage{
 			Type:              "run.cancelled",
 			RunID:             session.run.ID,
 			Output:            &redactedOutput,
 			ProviderSessionID: providerSessionID,
 			At:                session.client.nowUTC(),
-		})
+		}
 		return
 	}
 	if executeErr != nil {
-		session.emitTerminalFailureWithSession(executeErr, providerSessionID)
+		terminalMessage = session.buildTerminalFailureWithSession(executeErr, providerSessionID)
 		return
 	}
 
 	redactedOutput := protocol.BoundedTextValue(protocol.RedactText(output), protocol.TextMaximumBytes)
-	session.client.sendOrQueue(protocol.SlaveControlMessage{
+	terminalMessage = &protocol.SlaveControlMessage{
 		Type:              "run.completed",
 		RunID:             session.run.ID,
 		Output:            &redactedOutput,
 		ProviderSessionID: providerSessionID,
 		At:                session.client.nowUTC(),
-	})
+	}
 }
 
-func (session *runSession) emitTerminalFailure(err error) {
-	session.emitTerminalFailureWithSession(err, "")
+func (session *runSession) buildTerminalFailure(err error) *protocol.SlaveControlMessage {
+	return session.buildTerminalFailureWithSession(err, "")
 }
 
-func (session *runSession) emitTerminalFailureWithSession(err error, providerSessionID string) {
+func (session *runSession) buildTerminalFailureWithSession(err error, providerSessionID string) *protocol.SlaveControlMessage {
 	if session.cancelled.Load() || errors.Is(err, context.Canceled) {
 		empty := ""
-		session.client.sendOrQueue(protocol.SlaveControlMessage{
+		return &protocol.SlaveControlMessage{
 			Type:              "run.cancelled",
 			RunID:             session.run.ID,
 			Output:            &empty,
 			ProviderSessionID: providerSessionID,
 			At:                session.client.nowUTC(),
-		})
-		return
+		}
 	}
-	session.client.sendOrQueue(protocol.SlaveControlMessage{
+	return &protocol.SlaveControlMessage{
 		Type:              "run.failed",
 		RunID:             session.run.ID,
 		Error:             new(protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))),
 		ProviderSessionID: providerSessionID,
 		At:                session.client.nowUTC(),
-	})
+	}
 }
 
 func (session *runSession) scopedApprovalID(rawApprovalID string) string {
