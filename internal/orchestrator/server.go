@@ -22,11 +22,14 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
+	"github.com/cafecito-games/Orchestra/internal/localstate"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/selfupdate"
 	"github.com/cafecito-games/Orchestra/internal/setup"
 	"github.com/cafecito-games/Orchestra/internal/slave"
 	"github.com/cafecito-games/Orchestra/internal/store"
+	"github.com/cafecito-games/Orchestra/internal/tailscaleauth"
 )
 
 const (
@@ -34,19 +37,31 @@ const (
 )
 
 type Configuration struct {
-	ListenAddress      string
-	Token              string
-	DataDirectory      string
-	TLSCertPath        string
-	TLSKeyPath         string
-	ProjectProfilePath string
-	WithLocalWorker    bool
-	LocalWorker        slave.Configuration
+	ListenAddress       string
+	ListenExplicit      bool
+	AuthMode            string
+	Token               string
+	TokenExplicit       bool
+	TailscaleBinary     string
+	TailscaleAllowUsers []string
+	TailscaleAllowTags  []string
+	TailscaleVerifier   *tailscaleauth.Verifier
+	DataDirectory       string
+	ConnectionFilePath  string
+	TLSCertPath         string
+	TLSKeyPath          string
+	ProjectProfilePath  string
+	WithLocalWorker     bool
+	LocalWorker         slave.Configuration
+	LogLevel            activitylog.Level
+	LogFormat           activitylog.Format
+	Logger              *activitylog.Logger
 }
 
 type ServiceOptions struct {
 	Store                *store.Store
 	Token                string
+	TailscaleVerifier    *tailscaleauth.Verifier
 	ProjectProfiles      []protocol.ProjectProfile
 	DoorbellDebounce     time.Duration
 	PingInterval         time.Duration
@@ -55,6 +70,7 @@ type ServiceOptions struct {
 	NodeUpdateTimeout    time.Duration
 	ReleaseClient        *selfupdate.ReleaseClient
 	UpdateCacheDirectory string
+	Logger               *activitylog.Logger
 	Now                  func() time.Time
 }
 
@@ -87,7 +103,11 @@ type Service struct {
 	baseContext       context.Context
 	store             *store.Store
 	token             string
+	authMode          string
+	hostName          string
+	tailscaleVerifier *tailscaleauth.Verifier
 	redactor          *protocol.Redactor
+	logger            *activitylog.Logger
 	doorbellDebounce  time.Duration
 	pingInterval      time.Duration
 	pongTimeout       time.Duration
@@ -164,11 +184,24 @@ func NewService(options ServiceOptions) (*Service, error) {
 		return nil, cacheErr
 	}
 
+	authMode := tailscaleauth.AuthModeToken
+	hostName, _ := os.Hostname()
+	if options.TailscaleVerifier != nil {
+		authMode = tailscaleauth.AuthModeTailscale
+		if selfHost := strings.TrimSpace(options.TailscaleVerifier.Self().HostName); selfHost != "" {
+			hostName = selfHost
+		}
+	}
+
 	service := &Service{
 		baseContext:       context.Background(),
 		store:             options.Store,
 		token:             options.Token,
+		authMode:          authMode,
+		hostName:          strings.TrimSpace(hostName),
+		tailscaleVerifier: options.TailscaleVerifier,
 		redactor:          protocol.NewRedactor(options.Token),
+		logger:            options.Logger,
 		doorbellDebounce:  debounce,
 		pingInterval:      pingInterval,
 		pongTimeout:       pongTimeout,
@@ -322,9 +355,9 @@ func (service *Service) Handler() http.Handler {
 	return mux
 }
 
-func (service *Service) isBearerAuthorized(request *http.Request) bool {
-	if service.token == "" {
-		return true
+func (service *Service) matchesBearerToken(request *http.Request) bool {
+	if service.token == "" || request == nil {
+		return false
 	}
 	header := request.Header.Get("Authorization")
 	const bearerPrefix = "Bearer "
@@ -335,10 +368,56 @@ func (service *Service) isBearerAuthorized(request *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(service.token)) == 1
 }
 
+func (service *Service) authorizeRequest(request *http.Request) (bool, string) {
+	if service.tailscaleVerifier != nil {
+		if tailscaleauth.IsBrowserRequest(request) {
+			return false, "browser-origin requests are not permitted in tailscale auth mode"
+		}
+		if tailscaleauth.IsProxiedOrFunnelRequest(request) {
+			return false, "proxied or Tailscale Funnel requests are not permitted in tailscale auth mode"
+		}
+		if service.matchesBearerToken(request) {
+			return true, ""
+		}
+		peer, err := service.tailscaleVerifier.AuthorizeHTTPRequest(request)
+		if err != nil {
+			service.logger.Warn(
+				"auth",
+				"tailscale peer rejected",
+				activitylog.String("remote", request.RemoteAddr),
+				activitylog.String("path", request.URL.Path),
+				activitylog.String("error", err.Error()),
+			)
+			return false, err.Error()
+		}
+		service.logger.Debug(
+			"auth",
+			"tailscale peer verified",
+			activitylog.String("node", peer.NodeName),
+			activitylog.String("user", peer.LoginName),
+			activitylog.String("remote", request.RemoteAddr),
+		)
+		return true, ""
+	}
+	if service.token == "" {
+		return true, ""
+	}
+	if service.matchesBearerToken(request) {
+		return true, ""
+	}
+	return false, "missing or invalid bearer token"
+}
+
+func (service *Service) isBearerAuthorized(request *http.Request) bool {
+	authorized, _ := service.authorizeRequest(request)
+	return authorized
+}
+
 func (service *Service) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
-		if !service.isBearerAuthorized(request) {
-			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+		authorized, reason := service.authorizeRequest(request)
+		if !authorized {
+			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
 			return
 		}
 		next(writer, request)
@@ -347,8 +426,9 @@ func (service *Service) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 
 func (service *Service) requireBearerHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if !service.isBearerAuthorized(request) {
-			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+		authorized, reason := service.authorizeRequest(request)
+		if !authorized {
+			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
 			return
 		}
 		next.ServeHTTP(writer, request)
@@ -362,13 +442,17 @@ func (service *Service) handleHealth(writer http.ResponseWriter, request *http.R
 	}
 	writeJSONResponse(writer, http.StatusOK, map[string]any{
 		"ok":              true,
+		"service":         "orchestra-master",
+		"version":         protocol.EffectiveBuildVersion(),
 		"protocolVersion": protocol.ProtocolVersion,
+		"hostName":        service.hostName,
+		"authMode":        service.authMode,
 	})
 }
 
 func (service *Service) handleControlAgentUpgrade(writer http.ResponseWriter, request *http.Request) {
-	if !service.isBearerAuthorized(request) {
-		writeJSONError(writer, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+	if authorized, reason := service.authorizeRequest(request); !authorized {
+		writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
 		return
 	}
 	connection, err := websocket.Accept(writer, request, nil)
@@ -381,8 +465,8 @@ func (service *Service) handleControlAgentUpgrade(writer http.ResponseWriter, re
 }
 
 func (service *Service) handleOrchestratorClientUpgrade(writer http.ResponseWriter, request *http.Request) {
-	if !service.isBearerAuthorized(request) {
-		writeJSONError(writer, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+	if authorized, reason := service.authorizeRequest(request); !authorized {
+		writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
 		return
 	}
 	connection, err := websocket.Accept(writer, request, nil)
@@ -451,13 +535,21 @@ func (service *Service) serveOrchestratorClientConnection(requestContext context
 		service.clientsMutex.Unlock()
 		if removedCurrent {
 			service.DisconnectClientMailbox(sessionID)
+			service.logger.Info(
+				"client",
+				"disconnected",
+				activitylog.String("client", clientID),
+				activitylog.String("session", sessionID),
+			)
 		}
 		_ = connection.Close(websocket.StatusNormalClosure, "closed")
 	}()
 
 	var mailboxPointer *protocol.AgentMailbox
+	mailboxAddress := ""
 	if registeredMailbox, regErr := service.RegisterClientMailbox(clientID, sessionID, registration.Mail); regErr == nil {
 		mailboxPointer = &registeredMailbox
+		mailboxAddress = registeredMailbox.Address
 	}
 
 	if err := session.send(sessionContext, protocol.OrchestratorServerMessage{
@@ -471,6 +563,18 @@ func (service *Service) serveOrchestratorClientConnection(requestContext context
 	}); err != nil {
 		return
 	}
+
+	harnessLabel := ""
+	if registration.Mail != nil {
+		harnessLabel = registration.Mail.Harness
+	}
+	service.logger.Info(
+		"client",
+		"connected",
+		activitylog.String("client", clientID),
+		activitylog.String("harness", harnessLabel),
+		activitylog.String("mail", mailboxAddress),
+	)
 
 	caller := CallerIdentity{
 		Kind:      "orchestrator-client",
@@ -505,6 +609,17 @@ func (service *Service) serveOrchestratorClientConnection(requestContext context
 				response.Error = toHubRPCError(identifyErr)
 			} else {
 				response.Mailbox = &identifiedMailbox
+				identifiedHarness := ""
+				if message.Mail != nil {
+					identifiedHarness = message.Mail.Harness
+				}
+				service.logger.Info(
+					"client",
+					"identified",
+					activitylog.String("client", clientID),
+					activitylog.String("harness", identifiedHarness),
+					activitylog.String("mail", identifiedMailbox.Address),
+				)
 			}
 			_ = session.send(sessionContext, response)
 		case "tool.call":
@@ -512,6 +627,7 @@ func (service *Service) serveOrchestratorClientConnection(requestContext context
 			toolName := message.Tool
 			arguments := slices.Clone(message.Arguments)
 			go func() {
+				startedAt := service.now()
 				resultBytes, callErr := service.ExecuteOrchestratorTool(sessionContext, caller, toolName, arguments)
 				response := protocol.OrchestratorServerMessage{
 					Type:      "tool.result",
@@ -520,8 +636,23 @@ func (service *Service) serveOrchestratorClientConnection(requestContext context
 				}
 				if callErr != nil {
 					response.Error = toHubRPCError(callErr)
+					service.logger.Debug(
+						"client",
+						"tool failed",
+						activitylog.String("client", clientID),
+						activitylog.String("tool", toolName),
+						activitylog.String("error", response.Error.Message),
+						activitylog.Duration("duration", service.now().Sub(startedAt)),
+					)
 				} else {
 					response.Result = resultBytes
+					service.logger.Debug(
+						"client",
+						"tool completed",
+						activitylog.String("client", clientID),
+						activitylog.String("tool", toolName),
+						activitylog.Duration("duration", service.now().Sub(startedAt)),
+					)
 				}
 				_ = session.send(sessionContext, response)
 			}()
@@ -835,6 +966,16 @@ func (service *Service) handleAPIArtifactSubroutes(writer http.ResponseWriter, r
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
+	if service.tailscaleVerifier != nil {
+		if tailscaleauth.IsBrowserRequest(request) {
+			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", "browser-origin requests are not permitted in tailscale auth mode")
+			return
+		}
+		if tailscaleauth.IsProxiedOrFunnelRequest(request) {
+			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", "proxied or Tailscale Funnel requests are not permitted in tailscale auth mode")
+			return
+		}
+	}
 	switch request.Method {
 	case http.MethodPut:
 		bearerAuthorized := service.isBearerAuthorized(request)
@@ -849,8 +990,8 @@ func (service *Service) handleAPIArtifactSubroutes(writer http.ResponseWriter, r
 		}
 		writeJSONResponse(writer, http.StatusOK, map[string]any{"artifact": updated})
 	case http.MethodGet:
-		if !service.isBearerAuthorized(request) {
-			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+		if authorized, reason := service.authorizeRequest(request); !authorized {
+			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
 			return
 		}
 		artifact, file, size, err := service.OpenUploadedArtifact(artifactID)
@@ -1082,15 +1223,22 @@ func (flagValue *repeatStringFlag) Set(raw string) error {
 }
 
 func ParseConfiguration(arguments []string, lookupEnvironment func(string) (string, bool)) (Configuration, error) {
+	defaultConnectionFile := localstate.ResolveConnectionFilePath(lookupEnvironment)
 	if lookupEnvironment == nil {
 		lookupEnvironment = os.LookupEnv
 	}
 
-	defaultListen := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_LISTEN")
+	environmentListen := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_LISTEN")
+	defaultListen := environmentListen
 	if defaultListen == "" {
 		defaultListen = DefaultListenAddress
 	}
+	defaultAuthModeRaw := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_AUTH_MODE")
+	if defaultAuthModeRaw == "" {
+		defaultAuthModeRaw = tailscaleauth.AuthModeToken
+	}
 	defaultToken := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_TOKEN")
+	defaultTailscaleBinary := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_TAILSCALE_BINARY")
 	defaultDataDirectory := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_DATA_DIR", "ORCHESTRA_DATA_ROOT")
 	if defaultDataDirectory == "" {
 		defaultDataDirectory = filepath.Join(setup.DefaultDataRoot(), "master")
@@ -1100,25 +1248,40 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	defaultProfiles := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_PROJECT_PROFILES")
 	defaultWithLocal := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_WITH_LOCAL_WORKER") == "1" ||
 		strings.EqualFold(firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_WITH_LOCAL_WORKER"), "true")
+	defaultVerbose := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_VERBOSE") == "1" ||
+		strings.EqualFold(firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_VERBOSE"), "true")
+	defaultLogLevelRaw := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_LOG_LEVEL")
+	defaultLogFormatRaw := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_LOG_FORMAT")
 
 	var workspaceRootsFlag repeatStringFlag
 	var approvalPolicyFlag repeatStringFlag
 	var acpAdapterFlag repeatStringFlag
 	var workerLabelsFlag repeatStringFlag
+	var tailscaleAllowUsersFlag repeatStringFlag
+	var tailscaleAllowTagsFlag repeatStringFlag
 
 	flagSet := flag.NewFlagSet("orchestra master", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
 
 	var configuration Configuration
+	var authModeRaw string
 	var workerName string
 	var workerID string
 	var workerConcurrency int
 	var workerInstanceCapacity int
 	var claudeAuthMode string
+	var verbose bool
+	var logLevelRaw string
+	var logFormatRaw string
 
-	flagSet.StringVar(&configuration.ListenAddress, "listen", defaultListen, "HTTP/WebSocket listen address (e.g. 0.0.0.0:8787)")
-	flagSet.StringVar(&configuration.Token, "token", defaultToken, "Bearer token matching ORCHESTRA_TOKEN")
+	flagSet.StringVar(&configuration.ListenAddress, "listen", defaultListen, "HTTP/WebSocket listen address (e.g. 127.0.0.1:8787)")
+	flagSet.StringVar(&authModeRaw, "auth", defaultAuthModeRaw, "Authentication mode: token or tailscale (env ORCHESTRA_AUTH_MODE)")
+	flagSet.StringVar(&configuration.Token, "token", defaultToken, "Bearer token matching ORCHESTRA_TOKEN (auto-persisted in <data-dir>/token in token auth mode)")
+	flagSet.StringVar(&configuration.TailscaleBinary, "tailscale-binary", defaultTailscaleBinary, "Explicit path to the tailscale CLI binary")
+	flagSet.Var(&tailscaleAllowUsersFlag, "tailscale-allow-user", "Allowed Tailscale user login in tailscale auth mode (repeatable)")
+	flagSet.Var(&tailscaleAllowTagsFlag, "tailscale-allow-tag", "Allowed Tailscale ACL tag in tailscale auth mode (repeatable, e.g. tag:orchestra)")
 	flagSet.StringVar(&configuration.DataDirectory, "data-dir", defaultDataDirectory, "SQLite state and artifact storage directory")
+	flagSet.StringVar(&configuration.ConnectionFilePath, "connection-file", defaultConnectionFile, "Local connection discovery state file path")
 	flagSet.StringVar(&configuration.TLSCertPath, "tls-cert", defaultTLSCert, "Optional TLS certificate PEM path for wss:// / https://")
 	flagSet.StringVar(&configuration.TLSKeyPath, "tls-key", defaultTLSKey, "Optional TLS private key PEM path for wss:// / https://")
 	flagSet.StringVar(&configuration.ProjectProfilePath, "project-profiles", defaultProfiles, "Optional JSON file containing project profiles")
@@ -1132,6 +1295,9 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	flagSet.Var(&workerLabelsFlag, "worker-label", "Label for embedded local worker (repeatable)")
 	flagSet.Var(&approvalPolicyFlag, "approval-policy", "Approval policy for embedded local worker")
 	flagSet.Var(&acpAdapterFlag, "acp-adapter", "ACP adapter override for embedded local worker")
+	flagSet.BoolVar(&verbose, "verbose", defaultVerbose, "Enable debug-level operational logs")
+	flagSet.StringVar(&logLevelRaw, "log-level", defaultLogLevelRaw, "Operational log level: debug, info, warn, error, or quiet")
+	flagSet.StringVar(&logFormatRaw, "log-format", defaultLogFormatRaw, "Operational log format: text or json")
 
 	if err := flagSet.Parse(arguments); err != nil {
 		return Configuration{}, err
@@ -1140,16 +1306,55 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 		return Configuration{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flagSet.Args(), " "))
 	}
 
+	explicitFlags := map[string]bool{}
+	flagSet.Visit(func(visited *flag.Flag) {
+		explicitFlags[visited.Name] = true
+	})
+
+	parsedAuthMode, authErr := tailscaleauth.ParseAuthMode(authModeRaw)
+	if authErr != nil {
+		return Configuration{}, authErr
+	}
+	configuration.AuthMode = parsedAuthMode
+	configuration.ListenExplicit = explicitFlags["listen"] || environmentListen != ""
+	configuration.TokenExplicit = explicitFlags["token"] || defaultToken != ""
+
+	if !tailscaleAllowUsersFlag.set {
+		if rawUsers := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_TAILSCALE_ALLOW_USERS"); rawUsers != "" {
+			_ = tailscaleAllowUsersFlag.Set(rawUsers)
+		}
+	}
+	if !tailscaleAllowTagsFlag.set {
+		if rawTags := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_TAILSCALE_ALLOW_TAGS"); rawTags != "" {
+			_ = tailscaleAllowTagsFlag.Set(rawTags)
+		}
+	}
+	configuration.TailscaleAllowUsers = tailscaleAllowUsersFlag.values
+	configuration.TailscaleAllowTags = tailscaleAllowTagsFlag.values
+
 	if (configuration.TLSCertPath == "") != (configuration.TLSKeyPath == "") {
 		return Configuration{}, errors.New("--tls-cert and --tls-key must be provided together")
 	}
-	if configuration.Token == "" {
-		return Configuration{}, errors.New("ORCHESTRA_TOKEN or --token is required to start orchestra master")
+
+	parsedLevel, levelErr := activitylog.ParseLevel(logLevelRaw)
+	if levelErr != nil {
+		return Configuration{}, levelErr
 	}
+	if verbose && logLevelRaw == "" {
+		parsedLevel = activitylog.LevelDebug
+	}
+	parsedFormat, formatErr := activitylog.ParseFormat(logFormatRaw)
+	if formatErr != nil {
+		return Configuration{}, formatErr
+	}
+	configuration.LogLevel = parsedLevel
+	configuration.LogFormat = parsedFormat
 
 	if configuration.WithLocalWorker {
 		var workerArgs []string
-		workerArgs = append(workerArgs, "--token", configuration.Token)
+		if configuration.Token != "" {
+			workerArgs = append(workerArgs, "--token", configuration.Token)
+		}
 		if workerName != "" {
 			workerArgs = append(workerArgs, "--name", workerName)
 		}
@@ -1192,15 +1397,78 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 }
 
 type RunningMaster struct {
-	Service  *Service
-	Store    *store.Store
-	Address  string
-	BaseURL  string
-	Wait     func() error
-	Shutdown func(context.Context) error
+	Service            *Service
+	Store              *store.Store
+	Address            string
+	BaseURL            string
+	AuthMode           string
+	TailscaleSelf      tailscaleauth.SelfIdentity
+	Token              string
+	TokenPath          string
+	TokenGenerated     bool
+	ConnectionFilePath string
+	Wait               func() error
+	Shutdown           func(context.Context) error
 }
 
 func StartMaster(operationContext context.Context, configuration Configuration) (*RunningMaster, error) {
+	authMode, authErr := tailscaleauth.ParseAuthMode(configuration.AuthMode)
+	if authErr != nil {
+		return nil, authErr
+	}
+	configuration.AuthMode = authMode
+
+	var verifier *tailscaleauth.Verifier
+	var tailscaleSelf tailscaleauth.SelfIdentity
+	var tokenPath string
+	var tokenGenerated bool
+
+	if authMode == tailscaleauth.AuthModeTailscale {
+		verifier = configuration.TailscaleVerifier
+		if verifier == nil {
+			builtVerifier, verifierErr := tailscaleauth.NewVerifier(operationContext, tailscaleauth.Options{
+				BinaryPath:   configuration.TailscaleBinary,
+				AllowedUsers: configuration.TailscaleAllowUsers,
+				AllowedTags:  configuration.TailscaleAllowTags,
+			})
+			if verifierErr != nil {
+				return nil, verifierErr
+			}
+			verifier = builtVerifier
+		}
+		tailscaleSelf = verifier.Self()
+		if (strings.TrimSpace(configuration.ListenAddress) == "" ||
+			(!configuration.ListenExplicit && configuration.ListenAddress == DefaultListenAddress)) &&
+			tailscaleSelf.PrimaryIPv4 != "" {
+			configuration.ListenAddress = net.JoinHostPort(tailscaleSelf.PrimaryIPv4, "8787")
+		}
+		if validateErr := tailscaleauth.ValidateListenAddress(configuration.ListenAddress, tailscaleSelf.TailscaleIPs); validateErr != nil {
+			return nil, validateErr
+		}
+		if configuration.TokenExplicit || strings.TrimSpace(configuration.Token) != "" {
+			resolvedToken, resolvedPath, generated, tokenErr := localstate.EnsureMasterToken(configuration.DataDirectory, configuration.Token)
+			if tokenErr != nil {
+				return nil, tokenErr
+			}
+			configuration.Token = resolvedToken
+			tokenPath = resolvedPath
+			tokenGenerated = generated
+		} else {
+			configuration.Token = ""
+		}
+	} else {
+		resolvedToken, resolvedPath, generated, tokenErr := localstate.EnsureMasterToken(configuration.DataDirectory, configuration.Token)
+		if tokenErr != nil {
+			return nil, tokenErr
+		}
+		configuration.Token = resolvedToken
+		tokenPath = resolvedPath
+		tokenGenerated = generated
+	}
+	if configuration.Logger != nil {
+		configuration.Logger = configuration.Logger.WithSecrets(configuration.Token)
+	}
+
 	var profiles []protocol.ProjectProfile
 	if configuration.ProjectProfilePath != "" {
 		profileBytes, readErr := os.ReadFile(configuration.ProjectProfilePath)
@@ -1218,9 +1486,11 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 	}
 
 	service, err := NewService(ServiceOptions{
-		Store:           openedStore,
-		Token:           configuration.Token,
-		ProjectProfiles: profiles,
+		Store:             openedStore,
+		Token:             configuration.Token,
+		TailscaleVerifier: verifier,
+		ProjectProfiles:   profiles,
+		Logger:            configuration.Logger,
 	})
 	if err != nil {
 		_ = openedStore.Close()
@@ -1254,8 +1524,24 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 	}
 
 	boundAddress := listener.Addr().String()
-	_, boundPort, _ := net.SplitHostPort(boundAddress)
-	loopbackBaseURL := scheme + "://127.0.0.1:" + boundPort
+	localDialURL := localstate.LocalDialEndpoint(scheme, boundAddress)
+
+	writtenConnectionFile := ""
+	if !localstate.IsDisabledConnectionFilePath(configuration.ConnectionFilePath) {
+		writeErr := localstate.WriteConnectionState(configuration.ConnectionFilePath, localstate.ConnectionState{
+			Endpoint:      localDialURL,
+			AuthMode:      authMode,
+			Token:         configuration.Token,
+			TLSInsecure:   tlsConfiguration != nil,
+			DataDirectory: configuration.DataDirectory,
+			ProcessID:     os.Getpid(),
+		})
+		if writeErr != nil {
+			service.logger.Warn("config", "failed writing local connection state", activitylog.String("path", configuration.ConnectionFilePath), activitylog.String("error", writeErr.Error()))
+		} else {
+			writtenConnectionFile = configuration.ConnectionFilePath
+		}
+	}
 
 	serverBaseContext, cancelServerBase := context.WithCancel(operationContext)
 	httpServer := &http.Server{
@@ -1280,7 +1566,7 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 	workerDone := make(chan struct{})
 	if configuration.WithLocalWorker {
 		localConfig := configuration.LocalWorker
-		localConfig.ControlEndpoint = loopbackBaseURL
+		localConfig.ControlEndpoint = localDialURL
 		localConfig.Token = configuration.Token
 		localConfig.DisableSelfUpdate = true
 		if tlsConfiguration != nil {
@@ -1291,6 +1577,11 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 						InsecureSkipVerify: true,
 					},
 				},
+			}
+		}
+		if configuration.Logger != nil {
+			if configuration.Logger.Enabled(activitylog.LevelDebug) {
+				localConfig.ActivityLogger = configuration.Logger.WithComponent("worker")
 			}
 		}
 		runtimeWorker, buildErr := slave.BuildRuntime(workerContext, localConfig)
@@ -1304,6 +1595,9 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 			_ = openedStore.Close()
 			return nil, fmt.Errorf("build embedded local worker: %w", buildErr)
 		}
+		for _, warning := range runtimeWorker.Warnings {
+			service.logger.Warn("worker", warning)
+		}
 		go func() {
 			defer close(workerDone)
 			_ = runtimeWorker.Client.Run(workerContext)
@@ -1316,6 +1610,7 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 	var shutdownErr error
 	shutdownFunction := func(shutdownContext context.Context) error {
 		shutdownOnce.Do(func() {
+			service.logger.Info("master", "shutting down")
 			cancelWorker()
 			<-workerDone
 			cancelServerBase()
@@ -1336,12 +1631,18 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 	}()
 
 	return &RunningMaster{
-		Service:  service,
-		Store:    openedStore,
-		Address:  boundAddress,
-		BaseURL:  loopbackBaseURL,
-		Wait:     func() error { return <-serverErrChannel },
-		Shutdown: shutdownFunction,
+		Service:            service,
+		Store:              openedStore,
+		Address:            boundAddress,
+		BaseURL:            localDialURL,
+		AuthMode:           authMode,
+		TailscaleSelf:      tailscaleSelf,
+		Token:              configuration.Token,
+		TokenPath:          tokenPath,
+		TokenGenerated:     tokenGenerated,
+		ConnectionFilePath: writtenConnectionFile,
+		Wait:               func() error { return <-serverErrChannel },
+		Shutdown:           shutdownFunction,
 	}, nil
 }
 

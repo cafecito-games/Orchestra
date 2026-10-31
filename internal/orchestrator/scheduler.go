@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
@@ -211,16 +212,45 @@ func (service *Service) scheduleReadyTasks() {
 					})
 				}
 				for _, provisionItem := range provisions {
-					instCopy := provisionItem.instance
-					allocCopy := provisionItem.allocation
+					instanceCopy := provisionItem.instance
+					allocationCopy := provisionItem.allocation
+					service.logger.Info(
+						"schedule",
+						"provisioning instance",
+						activitylog.String("instance", instanceCopy.ID),
+						activitylog.String("node", provisionItem.nodeID),
+						activitylog.String("harness", allocationCopy.HarnessID),
+						activitylog.String("model", allocationCopy.Model),
+						activitylog.String("thread", instanceCopy.ThreadID),
+					)
 					_ = service.sendToSlave(provisionItem.nodeID, protocol.MasterControlMessage{
 						Type:       "instance.provision",
-						Instance:   &instCopy,
-						Allocation: &allocCopy,
+						Instance:   &instanceCopy,
+						Allocation: &allocationCopy,
 						At:         service.nowUTC(),
 					})
 				}
 				for _, dispatchItem := range dispatches {
+					taskID := ""
+					harnessID := ""
+					modelName := ""
+					if dispatchItem.message.Run != nil {
+						harnessID = dispatchItem.message.Run.HarnessID
+						modelName = dispatchItem.message.Run.Model
+						if dispatchItem.message.Run.TaskID != nil {
+							taskID = *dispatchItem.message.Run.TaskID
+						}
+					}
+					service.logger.Info(
+						"run",
+						"dispatched",
+						activitylog.String("run", dispatchItem.message.RunID),
+						activitylog.String("task", taskID),
+						activitylog.String("node", dispatchItem.nodeID),
+						activitylog.String("harness", harnessID),
+						activitylog.String("model", modelName),
+						activitylog.String("instance", dispatchItem.message.InstanceID),
+					)
 					_ = service.sendToSlave(dispatchItem.nodeID, dispatchItem.message)
 				}
 			})

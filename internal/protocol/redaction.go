@@ -75,6 +75,15 @@ func NewRedactor(secrets ...string) *Redactor {
 	return &Redactor{exactSecrets: exactSecrets}
 }
 
+func (redactor *Redactor) WithSecrets(secrets ...string) *Redactor {
+	combined := make([]string, 0, len(secrets))
+	if redactor != nil {
+		combined = append(combined, redactor.exactSecrets...)
+	}
+	combined = append(combined, secrets...)
+	return NewRedactor(combined...)
+}
+
 func (redactor *Redactor) Redact(value string) string {
 	if value == "" {
 		return ""

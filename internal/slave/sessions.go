@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cafecito-games/Orchestra/internal/acp"
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/harness"
 	"github.com/cafecito-games/Orchestra/internal/mcpserver"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
@@ -41,6 +42,8 @@ type runSession struct {
 	sequence atomic.Int64
 
 	mutex                sync.Mutex
+	startedAt            time.Time
+	loggedToolStatuses   map[string]string
 	providerSessionID    string
 	sessionBindingID     string
 	selectedTransport    string
@@ -78,10 +81,18 @@ func (client *Client) handleDispatch(message protocol.MasterControlMessage) {
 
 	resident, err := client.acquireResidentForRun(run, message.Instance, message.Allocation)
 	if err != nil {
+		errorMessage := protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))
+		client.activityLogger.Error(
+			"run",
+			"rejected",
+			activitylog.String("run", run.ID),
+			activitylog.String("instance", run.InstanceID),
+			activitylog.String("error", errorMessage),
+		)
 		client.sendOrQueue(protocol.SlaveControlMessage{
 			Type:  "run.failed",
 			RunID: run.ID,
-			Error: new(protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))),
+			Error: new(errorMessage),
 			At:    client.nowUTC(),
 		})
 		return
@@ -89,12 +100,13 @@ func (client *Client) handleDispatch(message protocol.MasterControlMessage) {
 
 	runContext, cancelRun := context.WithCancel(client.rootContext)
 	session := &runSession{
-		client:            client,
-		run:               run,
-		resident:          resident,
-		cancel:            cancelRun,
-		pendingApprovals:  map[string]*pendingApprovalWaiter{},
-		bufferedDecisions: map[string]protocol.ApprovalDecision{},
+		client:             client,
+		run:                run,
+		resident:           resident,
+		cancel:             cancelRun,
+		loggedToolStatuses: map[string]string{},
+		pendingApprovals:   map[string]*pendingApprovalWaiter{},
+		bufferedDecisions:  map[string]protocol.ApprovalDecision{},
 	}
 	if message.SessionBinding != nil {
 		session.sessionBindingID = message.SessionBinding.ID
@@ -116,6 +128,20 @@ func (client *Client) handleDispatch(message protocol.MasterControlMessage) {
 	client.sessions[run.ID] = session
 	client.inFlightSessions++
 	client.mutex.Unlock()
+
+	taskID := ""
+	if run.TaskID != nil {
+		taskID = *run.TaskID
+	}
+	client.activityLogger.Info(
+		"run",
+		"accepted",
+		activitylog.String("run", run.ID),
+		activitylog.String("task", taskID),
+		activitylog.String("instance", run.InstanceID),
+		activitylog.String("harness", run.HarnessID),
+		activitylog.String("model", run.Model),
+	)
 
 	client.waitGroup.Go(func() {
 		session.execute(runContext, message.SessionBinding, message.WorkspaceLease)
@@ -272,9 +298,19 @@ func (session *runSession) execute(
 		Started: func(selection protocol.RunTransportSelection) {
 			startedOnce.Do(func() {
 				session.mutex.Lock()
+				session.startedAt = session.client.now()
 				session.selectedTransport = selection.SelectedTransport
 				providerSessionID := session.providerSessionID
 				session.mutex.Unlock()
+				session.client.activityLogger.Info(
+					"run",
+					"started",
+					activitylog.String("run", session.run.ID),
+					activitylog.String("harness", session.run.HarnessID),
+					activitylog.String("model", session.run.Model),
+					activitylog.String("transport", selection.SelectedTransport),
+					activitylog.String("workspace", workingDirectory),
+				)
 				selectionCopy := selection
 				session.client.sendOrQueue(protocol.SlaveControlMessage{
 					Type:              "run.started",
@@ -404,6 +440,12 @@ func (session *runSession) execute(
 	}
 
 	if wasCancelled {
+		session.client.activityLogger.Warn(
+			"run",
+			"cancelled",
+			activitylog.String("run", session.run.ID),
+			activitylog.String("harness", session.run.HarnessID),
+		)
 		redactedOutput := protocol.BoundedTextValue(protocol.RedactText(output), protocol.TextMaximumBytes)
 		terminalMessage = &protocol.SlaveControlMessage{
 			Type:              "run.cancelled",
@@ -418,6 +460,21 @@ func (session *runSession) execute(
 		terminalMessage = session.buildTerminalFailureWithSession(executeErr, providerSessionID)
 		return
 	}
+
+	session.mutex.Lock()
+	startedAt := session.startedAt
+	session.mutex.Unlock()
+	var runDuration time.Duration
+	if !startedAt.IsZero() {
+		runDuration = session.client.now().Sub(startedAt)
+	}
+	session.client.activityLogger.Info(
+		"run",
+		"completed",
+		activitylog.String("run", session.run.ID),
+		activitylog.String("harness", session.run.HarnessID),
+		activitylog.Duration("duration", runDuration),
+	)
 
 	redactedOutput := protocol.BoundedTextValue(protocol.RedactText(output), protocol.TextMaximumBytes)
 	terminalMessage = &protocol.SlaveControlMessage{
@@ -435,6 +492,12 @@ func (session *runSession) buildTerminalFailure(err error) *protocol.SlaveContro
 
 func (session *runSession) buildTerminalFailureWithSession(err error, providerSessionID string) *protocol.SlaveControlMessage {
 	if session.cancelled.Load() || errors.Is(err, context.Canceled) {
+		session.client.activityLogger.Warn(
+			"run",
+			"cancelled",
+			activitylog.String("run", session.run.ID),
+			activitylog.String("harness", session.run.HarnessID),
+		)
 		empty := ""
 		return &protocol.SlaveControlMessage{
 			Type:              "run.cancelled",
@@ -444,10 +507,18 @@ func (session *runSession) buildTerminalFailureWithSession(err error, providerSe
 			At:                session.client.nowUTC(),
 		}
 	}
+	errorMessage := protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))
+	session.client.activityLogger.Error(
+		"run",
+		"failed",
+		activitylog.String("run", session.run.ID),
+		activitylog.String("harness", session.run.HarnessID),
+		activitylog.String("error", errorMessage),
+	)
 	return &protocol.SlaveControlMessage{
 		Type:              "run.failed",
 		RunID:             session.run.ID,
-		Error:             new(protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))),
+		Error:             new(errorMessage),
 		ProviderSessionID: providerSessionID,
 		At:                session.client.nowUTC(),
 	}
@@ -540,6 +611,7 @@ func (session *runSession) forwardHarnessEvent(event protocol.HarnessEvent) {
 	if err := event.Validate(); err != nil {
 		return
 	}
+	session.logHarnessEvent(event)
 	eventCopy := event
 	session.client.sendOrQueue(protocol.SlaveControlMessage{
 		Type:  "harness.event",
@@ -547,6 +619,79 @@ func (session *runSession) forwardHarnessEvent(event protocol.HarnessEvent) {
 		Event: &eventCopy,
 		At:    event.At,
 	})
+}
+
+func (session *runSession) logHarnessEvent(event protocol.HarnessEvent) {
+	switch event.Type {
+	case "tool.call":
+		shouldLog := true
+		if event.ToolCallID != "" {
+			session.mutex.Lock()
+			if session.loggedToolStatuses[event.ToolCallID] == event.Status {
+				shouldLog = false
+			} else {
+				if len(session.loggedToolStatuses) >= 256 {
+					clear(session.loggedToolStatuses)
+				}
+				session.loggedToolStatuses[event.ToolCallID] = event.Status
+			}
+			session.mutex.Unlock()
+		}
+		if shouldLog {
+			session.client.activityLogger.Info(
+				"tool",
+				event.Status,
+				activitylog.String("run", session.run.ID),
+				activitylog.String("kind", event.Kind),
+				activitylog.String("title", event.Title),
+			)
+		}
+	case "plan.updated":
+		session.client.activityLogger.Info(
+			"plan",
+			"updated",
+			activitylog.String("run", session.run.ID),
+			activitylog.Int("steps", len(event.Entries)),
+		)
+	case "diff":
+		session.client.activityLogger.Info(
+			"diff",
+			"modified",
+			activitylog.String("run", session.run.ID),
+			activitylog.String("path", event.Path),
+		)
+	case "permission.requested":
+		session.client.activityLogger.Warn(
+			"approval",
+			"awaiting decision",
+			activitylog.String("approval", event.ApprovalID),
+			activitylog.String("run", session.run.ID),
+			activitylog.String("title", event.Title),
+		)
+	case "warning":
+		session.client.activityLogger.Warn(
+			"harness",
+			event.Message,
+			activitylog.String("run", session.run.ID),
+			activitylog.String("code", event.Code),
+		)
+	case "usage":
+		var inputTokens int64
+		if event.InputTokens != nil {
+			inputTokens = *event.InputTokens
+		}
+		var outputTokens int64
+		if event.OutputTokens != nil {
+			outputTokens = *event.OutputTokens
+		}
+		session.client.activityLogger.Debug(
+			"usage",
+			"reported",
+			activitylog.String("run", session.run.ID),
+			activitylog.Int64("inputTokens", inputTokens),
+			activitylog.Int64("outputTokens", outputTokens),
+		)
+	}
 }
 
 func (session *runSession) flushDroppedEventsWarning() {
@@ -686,7 +831,16 @@ func (client *Client) handleApprovalDecision(decision *protocol.ApprovalDecision
 			Error:      &errorMessage,
 			At:         client.nowUTC(),
 		})
+		return
 	}
+	client.activityLogger.Info(
+		"approval",
+		"decision received",
+		activitylog.String("approval", decision.ApprovalID),
+		activitylog.String("run", decision.RunID),
+		activitylog.String("status", decision.Status),
+		activitylog.String("option", decision.SelectedOptionID),
+	)
 }
 
 func (client *Client) callHubRPC(

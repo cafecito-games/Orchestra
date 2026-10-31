@@ -22,6 +22,7 @@ import (
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/slave"
 	"github.com/cafecito-games/Orchestra/internal/store"
+	"github.com/cafecito-games/Orchestra/internal/tailscaleauth"
 	"github.com/cafecito-games/Orchestra/internal/workspace"
 )
 
@@ -703,4 +704,87 @@ esac
 
 	cancelWorker()
 	require.NoError(t, <-workerDone)
+}
+
+func TestTailscaleAuthModeHTTPAndWebSocketEnforcement(t *testing.T) {
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	verifier, err := tailscaleauth.NewVerifier(context.Background(), tailscaleauth.Options{
+		CommandRunner: func(_ context.Context, _ string, arguments ...string) ([]byte, error) {
+			if len(arguments) >= 2 && arguments[0] == "status" {
+				return []byte(`{
+					"MagicDNSSuffix": "tail999.ts.net",
+					"Self": {
+						"HostName": "main-mac",
+						"DNSName": "main-mac.tail999.ts.net.",
+						"UserID": 42,
+						"TailscaleIPs": ["100.88.1.10"]
+					},
+					"User": {
+						"42": {"ID": 42, "LoginName": "christian@example.com"}
+					}
+				}`), nil
+			}
+			if len(arguments) >= 3 && arguments[0] == "whois" {
+				switch arguments[2] {
+				case "100.88.1.25:51000":
+					return []byte(`{
+						"Node": {"Name": "worker.tail999.ts.net.", "Addresses": ["100.88.1.25/32"]},
+						"UserProfile": {"ID": 42, "LoginName": "christian@example.com"}
+					}`), nil
+				case "100.88.1.40:52000":
+					return []byte(`{
+						"Node": {"Name": "guest.tail999.ts.net.", "Addresses": ["100.88.1.40/32"]},
+						"UserProfile": {"ID": 99, "LoginName": "guest@example.com"}
+					}`), nil
+				}
+			}
+			return nil, io.EOF
+		},
+	})
+	require.NoError(t, err)
+
+	service, err := NewService(ServiceOptions{
+		Store:             openedStore,
+		TailscaleVerifier: verifier,
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	handler := service.Handler()
+
+	// Authorized remote tailnet peer succeeds with zero Authorization header.
+	allowedRequest := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://100.88.1.10:8787/api/status", nil)
+	allowedRequest.RemoteAddr = "100.88.1.25:51000"
+	allowedRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(allowedRecorder, allowedRequest)
+	require.Equal(t, http.StatusOK, allowedRecorder.Code)
+
+	// Shared/other tailnet user is rejected with 401.
+	guestRequest := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://100.88.1.10:8787/api/status", nil)
+	guestRequest.RemoteAddr = "100.88.1.40:52000"
+	guestRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(guestRecorder, guestRequest)
+	require.Equal(t, http.StatusUnauthorized, guestRecorder.Code)
+	require.Contains(t, guestRecorder.Body.String(), "guest@example.com")
+
+	// Browser Origin request is rejected even from Self/loopback across REST, /mcp, and WebSocket endpoints.
+	for _, path := range []string{"/api/status", "/mcp", "/control-agent", "/orchestrator-client"} {
+		browserRequest := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://100.88.1.10:8787"+path, nil)
+		browserRequest.RemoteAddr = "100.88.1.10:53000"
+		browserRequest.Header.Set("Origin", "https://evil.example")
+		browserRecorder := httptest.NewRecorder()
+		handler.ServeHTTP(browserRecorder, browserRequest)
+		require.Equal(t, http.StatusUnauthorized, browserRecorder.Code, "expected 401 on %s", path)
+		require.Contains(t, browserRecorder.Body.String(), "browser-origin")
+	}
+
+	// Non-Tailscale LAN IP is rejected.
+	lanRequest := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://100.88.1.10:8787/api/status", nil)
+	lanRequest.RemoteAddr = "192.168.1.50:54000"
+	lanRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(lanRecorder, lanRequest)
+	require.Equal(t, http.StatusUnauthorized, lanRecorder.Code)
 }

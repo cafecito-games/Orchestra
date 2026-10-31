@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 )
 
@@ -45,6 +46,12 @@ func (client *Client) handleInstanceProvision(instance *protocol.AgentInstance, 
 		}
 		client.mutex.Unlock()
 		errorMessage := "another allocation is already resident for this instance"
+		client.activityLogger.Error(
+			"instance",
+			"provision failed",
+			activitylog.String("instance", instance.ID),
+			activitylog.String("error", errorMessage),
+		)
 		client.sendOrQueue(protocol.SlaveControlMessage{
 			Type:         "instance.failed",
 			InstanceID:   instance.ID,
@@ -61,11 +68,18 @@ func (client *Client) handleInstanceProvision(instance *protocol.AgentInstance, 
 	capacity := client.instanceCapacity()
 	if capacity >= 0 && len(client.instances) >= capacity {
 		client.mutex.Unlock()
+		errorMessage := "instance capacity on this slave node is exhausted"
+		client.activityLogger.Error(
+			"instance",
+			"provision failed",
+			activitylog.String("instance", instance.ID),
+			activitylog.String("error", errorMessage),
+		)
 		client.sendOrQueue(protocol.SlaveControlMessage{
 			Type:         "instance.failed",
 			InstanceID:   instance.ID,
 			AllocationID: allocation.ID,
-			Error:        new("instance capacity on this slave node is exhausted"),
+			Error:        new(errorMessage),
 			At:           client.nowUTC(),
 		})
 		return
@@ -73,11 +87,18 @@ func (client *Client) handleInstanceProvision(instance *protocol.AgentInstance, 
 	client.mutex.Unlock()
 
 	if err := client.validateProvision(*instance, *allocation); err != nil {
+		errorMessage := protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))
+		client.activityLogger.Error(
+			"instance",
+			"provision failed",
+			activitylog.String("instance", instance.ID),
+			activitylog.String("error", errorMessage),
+		)
 		client.sendOrQueue(protocol.SlaveControlMessage{
 			Type:         "instance.failed",
 			InstanceID:   instance.ID,
 			AllocationID: allocation.ID,
-			Error:        new(protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))),
+			Error:        new(errorMessage),
 			At:           client.nowUTC(),
 		})
 		return
@@ -108,6 +129,15 @@ func (client *Client) handleInstanceProvision(instance *protocol.AgentInstance, 
 	}
 	client.mutex.Unlock()
 
+	client.activityLogger.Info(
+		"instance",
+		"ready",
+		activitylog.String("instance", instance.ID),
+		activitylog.String("harness", allocation.HarnessID),
+		activitylog.String("model", allocation.Model),
+		activitylog.String("transport", allocation.Transport),
+		activitylog.String("workspace", allocation.Workspace),
+	)
 	client.sendOrQueue(protocol.SlaveControlMessage{
 		Type:         "instance.ready",
 		InstanceID:   instance.ID,
@@ -196,6 +226,12 @@ func (client *Client) handleInstanceRelease(instanceID, allocationID, mode strin
 		client.cancelRun(runIDToCancel)
 	}
 	if shouldEmitReleased {
+		client.activityLogger.Info(
+			"instance",
+			"released",
+			activitylog.String("instance", instanceID),
+			activitylog.String("mode", mode),
+		)
 		client.sendOrQueue(protocol.SlaveControlMessage{
 			Type:         "instance.released",
 			InstanceID:   instanceID,
@@ -298,6 +334,12 @@ func (client *Client) releaseResidentRun(instanceID, allocationID, runID string)
 	emitReleased, releaseReason := client.completeResidentRun(instanceID, allocationID, runID)
 
 	if emitReleased {
+		client.activityLogger.Info(
+			"instance",
+			"released",
+			activitylog.String("instance", instanceID),
+			activitylog.String("mode", releaseReason),
+		)
 		client.sendOrQueue(protocol.SlaveControlMessage{
 			Type:         "instance.released",
 			InstanceID:   instanceID,

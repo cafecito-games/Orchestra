@@ -13,12 +13,13 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/mcpbridge"
 	"github.com/cafecito-games/Orchestra/internal/orchestrator"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/slave"
+	"github.com/cafecito-games/Orchestra/internal/tailscaleauth"
 )
 
 func Run(
@@ -53,7 +54,7 @@ func Run(
 	case "master":
 		return runMaster(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "slave":
-		return runSlave(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
+		return runSlave(operationContext, remaining, standardInput, standardOutput, standardError, lookupEnvironment)
 	case "mcp":
 		return runMCPBridge(operationContext, remaining, standardInput, standardOutput, standardError, lookupEnvironment)
 	case "acp-bridge":
@@ -97,7 +98,7 @@ func printTopLevelUsage(output io.Writer) {
 Runtime Modes:
   master      Start the Orchestra control-plane server (HTTP, WebSocket, SQLite, Streamable HTTP MCP)
   slave       Start an Orchestra remote worker daemon connecting to a master
-  mcp         Run the stdio Model Context Protocol bridge for local coding agents
+  mcp         Run the stdio MCP bridge or configure local harnesses (install, uninstall, status)
   acp-bridge  Run a built-in stdio Agent Client Protocol bridge (antigravity)
 
 Operator Commands:
@@ -157,30 +158,64 @@ func runMaster(
 		fmt.Fprintf(standardError, "orchestra master: %v\n", err)
 		return 2
 	}
+	logger := activitylog.New(activitylog.Options{
+		Writer:            standardError,
+		Level:             configuration.LogLevel,
+		Format:            configuration.LogFormat,
+		Redactor:          protocol.NewRedactor(configuration.Token),
+		LookupEnvironment: lookupEnvironment,
+	})
+	configuration.Logger = logger
+
 	running, err := orchestrator.StartMaster(operationContext, configuration)
 	if err != nil {
 		fmt.Fprintf(standardError, "orchestra master: %v\n", err)
 		return 1
 	}
-	scheme := "http"
-	wsScheme := "ws"
-	if configuration.TLSCertPath != "" {
-		scheme = "https"
-		wsScheme = "wss"
-	}
-	fmt.Fprintf(
-		standardError,
-		"orchestra master %s listening on %s (%s://%s, %s://%s/control-agent, local worker=%t)\n",
-		protocol.EffectiveBuildVersion(),
-		running.Address,
-		scheme,
-		running.Address,
-		wsScheme,
-		running.Address,
-		configuration.WithLocalWorker,
+	logger = logger.WithSecrets(running.Token)
+	logger.Info(
+		"master",
+		fmt.Sprintf("orchestra master %s listening", protocol.EffectiveBuildVersion()),
+		activitylog.String("listen", running.Address),
+		activitylog.String("endpoint", running.BaseURL),
+		activitylog.String("auth", running.AuthMode),
+		activitylog.Bool("localWorker", configuration.WithLocalWorker),
 	)
+	if running.AuthMode == tailscaleauth.AuthModeTailscale {
+		nodeLabel := running.TailscaleSelf.DNSName
+		if nodeLabel == "" {
+			nodeLabel = running.TailscaleSelf.HostName
+		}
+		logger.Info(
+			"auth",
+			"tailscale peer identity verification enabled",
+			activitylog.String("node", nodeLabel),
+			activitylog.String("owner", running.TailscaleSelf.LoginName),
+			activitylog.String("tailnet", running.TailscaleSelf.MagicDNSSuffix),
+		)
+	}
+	if running.TokenGenerated {
+		logger.Info(
+			"auth",
+			"generated persistent bearer token",
+			activitylog.String("file", running.TokenPath),
+		)
+	} else if running.TokenPath != "" {
+		logger.Info(
+			"auth",
+			"bearer token ready",
+			activitylog.String("file", running.TokenPath),
+		)
+	}
+	if running.ConnectionFilePath != "" {
+		logger.Info(
+			"config",
+			"wrote local discovery state",
+			activitylog.String("file", running.ConnectionFilePath),
+		)
+	}
 	if waitErr := running.Wait(); waitErr != nil && !errors.Is(waitErr, context.Canceled) {
-		fmt.Fprintf(standardError, "orchestra master stopped with error: %v\n", waitErr)
+		logger.Error("master", "stopped with error", activitylog.String("error", waitErr.Error()))
 		return 1
 	}
 	return 0
@@ -190,28 +225,37 @@ func printMasterUsage(output io.Writer) {
 	fmt.Fprintf(output, `Usage: orchestra master [flags]
 
 Flags:
-  --listen string               HTTP/WebSocket listen address (default 127.0.0.1:8787, env ORCHESTRA_LISTEN)
-  --token string                Bearer token required for API, MCP, and slave connections (env ORCHESTRA_TOKEN)
-  --data-dir string             SQLite state and artifact storage directory (env ORCHESTRA_DATA_DIR)
-  --tls-cert string             TLS certificate PEM path for https:// and wss:// (env ORCHESTRA_TLS_CERT)
-  --tls-key string              TLS private key PEM path for https:// and wss:// (env ORCHESTRA_TLS_KEY)
-  --project-profiles string     Optional JSON file containing project profiles (env ORCHESTRA_PROJECT_PROFILES)
-  --with-local-worker           Run an embedded slave worker connected to loopback (env ORCHESTRA_WITH_LOCAL_WORKER)
-  --worker-name string          Display name for embedded local worker
-  --worker-id string            Node ID for embedded local worker
-  --worker-concurrency int      Maximum concurrent runs for embedded local worker (default 2)
+  --listen string                HTTP/WebSocket listen address (default 127.0.0.1:8787, or <tailscale-ip>:8787 with --auth tailscale, env ORCHESTRA_LISTEN)
+  --auth string                  Authentication mode: token or tailscale (default token, env ORCHESTRA_AUTH_MODE)
+  --token string                 Bearer token (auto-generated in <data-dir>/token in token mode, env ORCHESTRA_TOKEN)
+  --tailscale-allow-user value   Allowed Tailscale user login in tailscale auth mode (repeatable, env ORCHESTRA_TAILSCALE_ALLOW_USERS)
+  --tailscale-allow-tag value    Allowed Tailscale ACL tag in tailscale auth mode (repeatable, env ORCHESTRA_TAILSCALE_ALLOW_TAGS)
+  --tailscale-binary string      Explicit path to tailscale CLI binary (env ORCHESTRA_TAILSCALE_BINARY)
+  --data-dir string              SQLite state and artifact storage directory (env ORCHESTRA_DATA_DIR)
+  --connection-file string       Local discovery state file written on startup (env ORCHESTRA_CONNECTION_FILE)
+  --tls-cert string              TLS certificate PEM path for https:// and wss:// (env ORCHESTRA_TLS_CERT)
+  --tls-key string               TLS private key PEM path for https:// and wss:// (env ORCHESTRA_TLS_KEY)
+  --project-profiles string      Optional JSON file containing project profiles (env ORCHESTRA_PROJECT_PROFILES)
+  --verbose                      Enable debug operational logs (env ORCHESTRA_VERBOSE)
+  --log-level string             Operational log level: debug, info, warn, error, quiet (default info, env ORCHESTRA_LOG_LEVEL)
+  --log-format string            Operational log format: text or json (default text, env ORCHESTRA_LOG_FORMAT)
+  --with-local-worker            Run an embedded slave worker connected to this master (env ORCHESTRA_WITH_LOCAL_WORKER)
+  --worker-name string           Display name for embedded local worker
+  --worker-id string             Node ID for embedded local worker
+  --worker-concurrency int       Maximum concurrent runs for embedded local worker (default 2)
   --worker-instance-capacity int Maximum resident instances for embedded local worker (default 4)
-  --workspace-root value        Canonical workspace root for embedded local worker (repeatable)
-  --worker-label value          Capability label for embedded local worker (repeatable)
-  --approval-policy value       Approval policy for embedded local worker (repeatable)
-  --acp-adapter value           Pinned ACP adapter override for embedded local worker (repeatable)
-  --claude-acp-auth-mode string Claude ACP auth mode (local-subscription or api)
+  --workspace-root value         Canonical workspace root for embedded local worker (repeatable)
+  --worker-label value           Capability label for embedded local worker (repeatable)
+  --approval-policy value        Approval policy for embedded local worker (repeatable)
+  --acp-adapter value            Pinned ACP adapter override for embedded local worker (repeatable)
+  --claude-acp-auth-mode string  Claude ACP auth mode (local-subscription or api)
 `)
 }
 
 func runSlave(
 	operationContext context.Context,
 	arguments []string,
+	standardInput io.Reader,
 	standardOutput io.Writer,
 	standardError io.Writer,
 	lookupEnvironment func(string) (string, bool),
@@ -225,13 +269,22 @@ func runSlave(
 		fmt.Fprintf(standardError, "orchestra slave: %v\n", err)
 		return 2
 	}
+	logger := activitylog.New(activitylog.Options{
+		Writer:            standardError,
+		Level:             configuration.LogLevel,
+		Format:            configuration.LogFormat,
+		Redactor:          protocol.NewRedactor(configuration.Token),
+		LookupEnvironment: lookupEnvironment,
+	})
+	configuration.ActivityLogger = logger
+
 	runtimeWorker, err := slave.BuildRuntime(operationContext, configuration)
 	if err != nil {
 		fmt.Fprintf(standardError, "orchestra slave: %v\n", err)
 		return 1
 	}
 	for _, warning := range runtimeWorker.Warnings {
-		fmt.Fprintf(standardError, "orchestra slave warning: %s\n", warning)
+		logger.Warn("startup", warning)
 	}
 	var availableLabels []string
 	for _, profile := range runtimeWorker.Node.Harnesses {
@@ -247,23 +300,31 @@ func runSlave(
 		}
 		return 1
 	}
-	fmt.Fprintf(
-		standardError,
-		"orchestra slave %s (node=%s, harnesses=%s, roots=%s) connecting to %s\n",
-		protocol.EffectiveBuildVersion(),
-		runtimeWorker.Node.ID,
-		strings.Join(availableLabels, "; "),
-		strings.Join(runtimeWorker.Node.WorkspaceRoots, ","),
-		configuration.ControlEndpoint,
+	if !configuration.EndpointExplicit {
+		if discoverErr := resolveSlaveMasterEndpoint(operationContext, &configuration, standardInput, standardError, logger); discoverErr != nil {
+			if errors.Is(discoverErr, context.Canceled) {
+				return 0
+			}
+			fmt.Fprintf(standardError, "orchestra slave: %v\n", discoverErr)
+			return 1
+		}
+		runtimeWorker.Client.SetTarget(configuration.ControlEndpoint, configuration.Token)
+		logger = logger.WithSecrets(configuration.Token)
+	}
+
+	logger.Info(
+		"slave",
+		fmt.Sprintf("orchestra slave %s starting", protocol.EffectiveBuildVersion()),
+		activitylog.String("node", runtimeWorker.Node.ID),
+		activitylog.String("endpoint", configuration.ControlEndpoint),
+		activitylog.String("harnesses", strings.Join(availableLabels, "; ")),
+		activitylog.String("roots", strings.Join(runtimeWorker.Node.WorkspaceRoots, ",")),
 	)
-	var logMutex sync.Mutex
 	runtimeWorker.Client.SetLogger(func(message string) {
-		logMutex.Lock()
-		defer logMutex.Unlock()
-		fmt.Fprintf(standardError, "orchestra slave: %s\n", message)
+		logger.Info("update", message)
 	})
 	if runErr := runtimeWorker.Client.Run(operationContext); runErr != nil && !errors.Is(runErr, context.Canceled) {
-		fmt.Fprintf(standardError, "orchestra slave stopped: %v\n", runErr)
+		logger.Error("slave", "stopped with error", activitylog.String("error", runErr.Error()))
 		return 1
 	}
 	return 0
@@ -273,8 +334,11 @@ func printSlaveUsage(output io.Writer) {
 	fmt.Fprintf(output, `Usage: orchestra slave [flags]
 
 Flags:
-  --endpoint string             Orchestrator HTTP/WebSocket endpoint (default http://127.0.0.1:8787, env ORCHESTRA_ENDPOINT)
+  --endpoint string             Orchestrator HTTP/WebSocket endpoint (auto-discovered via localhost/Tailscale if omitted, env ORCHESTRA_ENDPOINT)
+  --master-port int             Master port probed during Tailscale auto-discovery (default 8787, env ORCHESTRA_MASTER_PORT)
+  --tailscale-binary string     Optional explicit path to tailscale CLI binary (env ORCHESTRA_TAILSCALE_BINARY)
   --token string                Bearer token matching ORCHESTRA_TOKEN (env ORCHESTRA_TOKEN)
+  --connection-file string      Local discovery state file fallback (env ORCHESTRA_CONNECTION_FILE)
   --id string                   Stable node identifier (env ORCHESTRA_NODE_ID)
   --name string                 Display name for this slave node (env ORCHESTRA_NAME)
   --kind string                 Node kind: local, home-server, or cloud (default local, env ORCHESTRA_KIND)
@@ -295,6 +359,9 @@ Flags:
   --disable-self-update         Reject remote self-update directives on this slave (env ORCHESTRA_DISABLE_SELF_UPDATE)
   --tls-ca string               CA certificate PEM path for https:// and wss:// (env ORCHESTRA_TLS_CA)
   --tls-insecure                Skip TLS certificate verification (env ORCHESTRA_TLS_INSECURE)
+  --verbose                     Enable debug operational logs (env ORCHESTRA_VERBOSE)
+  --log-level string            Operational log level: debug, info, warn, error, quiet (default info, env ORCHESTRA_LOG_LEVEL)
+  --log-format string           Operational log format: text or json (default text, env ORCHESTRA_LOG_FORMAT)
 `)
 }
 
@@ -306,17 +373,35 @@ func runMCPBridge(
 	standardError io.Writer,
 	lookupEnvironment func(string) (string, bool),
 ) int {
+	if len(arguments) > 0 {
+		switch arguments[0] {
+		case "install":
+			return runMCPInstall(arguments[1:], standardOutput, standardError, lookupEnvironment)
+		case "uninstall":
+			return runMCPUninstall(arguments[1:], standardOutput, standardError, lookupEnvironment)
+		case "status":
+			return runMCPStatus(operationContext, arguments[1:], standardOutput, standardError, lookupEnvironment)
+		}
+	}
 	if hasHelpFlag(arguments) {
-		fmt.Fprintf(standardOutput, `Usage: orchestra mcp [flags]
+		fmt.Fprintf(standardOutput, `Usage:
+  orchestra mcp [flags]
+  orchestra mcp <install|uninstall|status> [flags]
 
-Flags:
-  --endpoint string    Orchestra master HTTP or WebSocket endpoint (default http://127.0.0.1:8787, env ORCHESTRA_ENDPOINT)
-  --token string       Bearer token matching ORCHESTRA_TOKEN (env ORCHESTRA_TOKEN)
-  --client-id string   Stable orchestrator client identifier (env ORCHESTRA_CLIENT_ID)
-  --name string        Optional agent mail handle, e.g. "auth-api" (env ORCHESTRA_MAIL_NAME)
-  --host string        Optional agent mail host override (defaults to local hostname, env ORCHESTRA_MAIL_HOST)
-  --tls-ca string      CA certificate PEM path for https:// and wss:// (env ORCHESTRA_TLS_CA)
-  --tls-insecure       Skip TLS certificate verification (env ORCHESTRA_TLS_INSECURE)
+Subcommands:
+  install     Register Orchestra MCP once across local harnesses (Antigravity, Claude Code, Codex, OpenCode)
+  uninstall   Remove Orchestra MCP entries from local harness config files
+  status      Inspect local master discovery state and per-harness MCP registration
+
+Bridge Flags (stdio MCP server):
+  --endpoint string         Explicit Orchestra master endpoint override (auto-discovered from connection.json if omitted)
+  --token string            Explicit bearer token override (auto-discovered from connection.json if omitted)
+  --connection-file string  Local connection discovery state file path (env ORCHESTRA_CONNECTION_FILE)
+  --client-id string        Stable orchestrator client identifier (env ORCHESTRA_CLIENT_ID)
+  --name string             Optional agent mail handle, e.g. "auth-api" (env ORCHESTRA_MAIL_NAME)
+  --host string             Optional agent mail host override (defaults to local hostname, env ORCHESTRA_MAIL_HOST)
+  --tls-ca string           CA certificate PEM path for https:// and wss:// (env ORCHESTRA_TLS_CA)
+  --tls-insecure            Skip TLS certificate verification (env ORCHESTRA_TLS_INSECURE)
 `)
 		return 0
 	}

@@ -15,6 +15,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/cafecito-games/Orchestra/internal/localstate"
 	"github.com/cafecito-games/Orchestra/internal/orchestrator"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/slave"
@@ -23,19 +24,27 @@ import (
 const operatorRequestTimeout = 30 * time.Second
 
 type operatorConnectionFlags struct {
-	endpoint    *string
-	token       *string
-	asJSON      *bool
-	tlsCACert   *string
-	tlsInsecure *bool
+	flagSet                 *flag.FlagSet
+	connectionFilePath      string
+	endpointFromEnvironment string
+	tokenFromEnvironment    string
+	tlsExplicitEnvironment  bool
+	endpoint                *string
+	token                   *string
+	asJSON                  *bool
+	tlsCACert               *string
+	tlsInsecure             *bool
 }
 
 func registerOperatorFlags(flagSet *flag.FlagSet, lookupEnvironment func(string) (string, bool)) operatorConnectionFlags {
-	defaultEndpoint := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_ENDPOINT", "CONTROL_ENDPOINT")
+	connectionFilePath := localstate.ResolveConnectionFilePath(lookupEnvironment)
+	endpointFromEnvironment := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_ENDPOINT", "CONTROL_ENDPOINT")
+	defaultEndpoint := endpointFromEnvironment
 	if defaultEndpoint == "" {
 		defaultEndpoint = slave.DefaultEndpoint
 	}
-	defaultToken := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TOKEN")
+	tokenFromEnvironment := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TOKEN")
+	defaultToken := tokenFromEnvironment
 	defaultTLSCACert := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_CA")
 	defaultTLSInsecure := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_INSECURE") == "1" ||
 		strings.EqualFold(firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_INSECURE"), "true")
@@ -48,12 +57,54 @@ func registerOperatorFlags(flagSet *flag.FlagSet, lookupEnvironment func(string)
 	tlsInsecure := flagSet.Bool("tls-insecure", defaultTLSInsecure, "Skip TLS certificate verification")
 
 	return operatorConnectionFlags{
-		endpoint:    endpoint,
-		token:       token,
-		asJSON:      asJSON,
-		tlsCACert:   tlsCACert,
-		tlsInsecure: tlsInsecure,
+		flagSet:                 flagSet,
+		connectionFilePath:      connectionFilePath,
+		endpointFromEnvironment: endpointFromEnvironment,
+		tokenFromEnvironment:    tokenFromEnvironment,
+		tlsExplicitEnvironment:  defaultTLSCACert != "" || defaultTLSInsecure,
+		endpoint:                endpoint,
+		token:                   token,
+		asJSON:                  asJSON,
+		tlsCACert:               tlsCACert,
+		tlsInsecure:             tlsInsecure,
 	}
+}
+
+func (connection operatorConnectionFlags) resolvedTarget() (string, string, string, bool) {
+	explicitFlags := map[string]bool{}
+	if connection.flagSet != nil {
+		connection.flagSet.Visit(func(visited *flag.Flag) {
+			explicitFlags[visited.Name] = true
+		})
+	}
+	endpoint := *connection.endpoint
+	token := *connection.token
+	tlsCACert := *connection.tlsCACert
+	tlsInsecure := *connection.tlsInsecure
+
+	endpointExplicit := explicitFlags["endpoint"] || explicitFlags["control-endpoint"] || connection.endpointFromEnvironment != ""
+	tokenExplicit := explicitFlags["token"] || connection.tokenFromEnvironment != ""
+	tlsExplicit := explicitFlags["tls-ca"] || explicitFlags["tls-insecure"] || connection.tlsExplicitEnvironment
+
+	if connection.connectionFilePath != "" && (!endpointExplicit || !tokenExplicit || !tlsExplicit) {
+		if discovered, found, readErr := localstate.ReadConnectionState(connection.connectionFilePath); readErr == nil && found {
+			if !endpointExplicit && strings.TrimSpace(discovered.Endpoint) != "" {
+				endpoint = strings.TrimSpace(discovered.Endpoint)
+			}
+			if !tokenExplicit && (strings.TrimSpace(discovered.Token) != "" || strings.EqualFold(discovered.AuthMode, "tailscale")) {
+				token = strings.TrimSpace(discovered.Token)
+			}
+			if !tlsExplicit {
+				if strings.TrimSpace(discovered.TLSCACert) != "" {
+					tlsCACert = strings.TrimSpace(discovered.TLSCACert)
+				}
+				if discovered.TLSInsecure {
+					tlsInsecure = true
+				}
+			}
+		}
+	}
+	return endpoint, token, tlsCACert, tlsInsecure
 }
 
 func normalizeFlagOrder(flagSet *flag.FlagSet, arguments []string) []string {
@@ -117,7 +168,8 @@ func (connection operatorConnectionFlags) requestJSONWithTimeout(
 	destination any,
 	timeout time.Duration,
 ) error {
-	baseURL, err := resolveHTTPBaseURL(*connection.endpoint)
+	resolvedEndpoint, resolvedToken, resolvedTLSCACert, resolvedTLSInsecure := connection.resolvedTarget()
+	baseURL, err := resolveHTTPBaseURL(resolvedEndpoint)
 	if err != nil {
 		return err
 	}
@@ -135,7 +187,7 @@ func (connection operatorConnectionFlags) requestJSONWithTimeout(
 		bodyReader = bytes.NewReader(encodedBytes)
 	}
 
-	httpClient, err := protocol.BuildHTTPClient(*connection.tlsCACert, *connection.tlsInsecure, timeout)
+	httpClient, err := protocol.BuildHTTPClient(resolvedTLSCACert, resolvedTLSInsecure, timeout)
 	if err != nil {
 		return err
 	}
@@ -147,8 +199,8 @@ func (connection operatorConnectionFlags) requestJSONWithTimeout(
 	if requestBody != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	if *connection.token != "" {
-		request.Header.Set("Authorization", "Bearer "+*connection.token)
+	if resolvedToken != "" {
+		request.Header.Set("Authorization", "Bearer "+resolvedToken)
 	}
 
 	response, err := httpClient.Do(request)

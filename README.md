@@ -51,11 +51,9 @@ CGO_ENABLED=0 go build -trimpath -o bin/orchestra ./cmd/orchestra
 
 ### 2. Start the Control Plane + Local Worker
 
-Generate a bearer token and launch `orchestra master` with an embedded worker pointed at your projects directory:
+Launch `orchestra master` with an embedded worker pointed at your projects directory (when `--token` is omitted, Orchestra automatically generates and persists a `0600` bearer token at `<data-dir>/token` and writes `~/.local/share/orchestra/connection.json` for local discovery):
 
 ```bash
-export ORCHESTRA_TOKEN="$(openssl rand -hex 32)"
-
 orchestra master \
   --with-local-worker \
   --workspace-root ~/Projects \
@@ -64,16 +62,28 @@ orchestra master \
 
 ### 3. Connect Your Coding Agent
 
-Point your primary coding agent at `orchestra mcp` so it can discover nodes, spawn tasks, read blackboard rooms, and exchange agent mail.
+Register `orchestra mcp` once across all harnesses installed on your machine (**Antigravity**, **Claude Code**, **Codex**, and **OpenCode**):
 
-#### Claude Code (`~/.claude.json` or `.mcp.json`)
+```bash
+orchestra mcp install
+orchestra mcp status
+```
+
+`orchestra mcp install` writes zero-secret `orchestra mcp` entries into each harness configuration (`~/.gemini/config/mcp_config.json`, `~/.claude.json`, `~/.codex/config.toml`, `~/.config/opencode/opencode.json`). At runtime, `orchestra mcp` reads `~/.local/share/orchestra/connection.json` on demand—starting immediately even if `orchestra master` is stopped and hot-reconnecting whenever the master restarts on a new port, IP, or token.
+
+<details>
+<summary><strong>Manual MCP Configs (Remote Machines & Streamable HTTP)</strong></summary>
+
+When connecting from a machine where `orchestra master` is not running locally, pass `--endpoint` (and `ORCHESTRA_TOKEN` when the master uses `--auth token`):
+
+#### Claude Code (`~/.claude.json`) & Antigravity (`~/.gemini/config/mcp_config.json`)
 
 ```json
 {
   "mcpServers": {
     "orchestra": {
       "command": "orchestra",
-      "args": ["mcp", "--endpoint", "http://127.0.0.1:8787"],
+      "args": ["mcp", "--endpoint", "http://100.x.y.z:8787"],
       "env": {
         "ORCHESTRA_TOKEN": "paste-your-token-here"
       }
@@ -82,29 +92,27 @@ Point your primary coding agent at `orchestra mcp` so it can discover nodes, spa
 }
 ```
 
-<details>
-<summary><strong>Configs for Codex, Antigravity, and Streamable HTTP</strong></summary>
-
 #### Codex (`~/.codex/config.toml`)
 
 ```toml
 [mcp_servers.orchestra]
 command = "orchestra"
-args = ["mcp", "--endpoint", "http://127.0.0.1:8787"]
+args = ["mcp", "--endpoint", "http://100.x.y.z:8787"]
 env = { "ORCHESTRA_TOKEN" = "paste-your-token-here" }
 ```
 
-#### Antigravity (`mcp_config.json`)
+#### OpenCode (`~/.config/opencode/opencode.json`)
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "orchestra": {
-      "command": "orchestra",
-      "args": ["mcp", "--endpoint", "http://127.0.0.1:8787"],
-      "env": {
+      "type": "local",
+      "command": ["orchestra", "mcp", "--endpoint", "http://100.x.y.z:8787"],
+      "environment": {
         "ORCHESTRA_TOKEN": "paste-your-token-here"
-      }
+      },
+      "enabled": true
     }
   }
 }
@@ -112,13 +120,13 @@ env = { "ORCHESTRA_TOKEN" = "paste-your-token-here" }
 
 #### Direct Streamable HTTP
 
-Agents that support remote MCP natively can connect directly to `POST http://127.0.0.1:8787/mcp` with header `Authorization: Bearer <ORCHESTRA_TOKEN>`. Using the `orchestra mcp` stdio bridge additionally subscribes to `/api/mcp/events` SSE notifications so idle sessions wake on thread and mail events.
+Agents that support remote MCP natively can connect directly to `POST http://127.0.0.1:8787/mcp` (with header `Authorization: Bearer <ORCHESTRA_TOKEN>` when `--auth token` is active). Using the `orchestra mcp` stdio bridge additionally subscribes to `/api/mcp/events` SSE notifications so idle sessions wake on thread and mail events.
 
 </details>
 
 ### 4. Verify Cluster Health
 
-In another terminal (with `ORCHESTRA_TOKEN` exported):
+In another terminal (auto-discovered via `~/.local/share/orchestra/connection.json`):
 
 ```bash
 orchestra status
@@ -172,16 +180,21 @@ task build:all
 
 Copy the matching binary to `/usr/local/bin/orchestra` or `~/.local/bin/orchestra` on each worker machine.
 
-### 2. Bind `orchestra master` to Tailscale
+### 2. Start `orchestra master` on Tailscale
+
+Pass `--auth tailscale` so neither `orchestra master`, remote `orchestra slave` machines, `orchestra mcp`, nor CLI commands need `ORCHESTRA_TOKEN`:
 
 ```bash
-TAILSCALE_IP="$(tailscale ip -4)"
-
+# Auto-binds <your-tailscale-ipv4>:8787, verifies peers via `tailscale whois`,
+# refuses wildcard/LAN binds, and rejects browser Origin / Sec-Fetch-* / Funnel requests:
 orchestra master \
-  --listen "${TAILSCALE_IP}:8787" \
-  --token "${ORCHESTRA_TOKEN}" \
+  --auth tailscale \
   --data-dir ~/.local/share/orchestra/master
 ```
+
+By default, `--auth tailscale` authorizes devices owned by the same Tailscale user as `orchestra master`, plus ACL-tagged devices (`tag:...`) belonging to the same tailnet. To authorize additional tailnet users or restrict to specific ACL tags, pass repeatable `--tailscale-allow-user <login>` and/or `--tailscale-allow-tag tag:<name>` flags.
+
+> Prefer explicit bearer tokens instead? Omit `--auth tailscale` (default `--auth token`) and bind `--listen "$(tailscale ip -4):8787"` with `ORCHESTRA_TOKEN`.
 
 <details>
 <summary><strong>Optional: Enable End-to-End TLS (`https://` & `wss://`)</strong></summary>
@@ -192,10 +205,9 @@ Provision a Tailscale MagicDNS certificate (or use your own internal CA) and pas
 tailscale cert my-main-mac.tailnet-name.ts.net
 
 orchestra master \
-  --listen 0.0.0.0:8787 \
+  --auth tailscale \
   --tls-cert ./my-main-mac.tailnet-name.ts.net.crt \
   --tls-key ./my-main-mac.tailnet-name.ts.net.key \
-  --token "${ORCHESTRA_TOKEN}" \
   --data-dir ~/.local/share/orchestra/master
 ```
 
@@ -205,19 +217,21 @@ If you use a private CA instead of MagicDNS public certificates, pass `--tls-ca 
 
 ### 3. Check Readiness & Start `orchestra slave`
 
-On each remote worker machine, run `orchestra doctor` first to verify installed harnesses, auth safety gates, and connectivity to the master:
+On any remote worker machine on your tailnet, start `orchestra slave` with **no `--endpoint` and no `--token`**—it automatically probes online Tailscale peers for active Orchestra masters on port `8787`, connects immediately if one is found, or prompts you interactively if multiple masters are online:
 
 ```bash
-export ORCHESTRA_TOKEN="same-shared-bearer-token"
-
-orchestra doctor \
-  --endpoint http://100.x.y.z:8787 \
+orchestra slave \
+  --workspace-root /srv/workspaces \
   --claude-acp-auth-mode local-subscription
 ```
 
-Then start the worker daemon with its workspace root(s) and capability labels:
+You can also run `orchestra doctor` first or pin explicit node metadata, capabilities, and endpoints:
 
 ```bash
+orchestra doctor \
+  --endpoint http://100.x.y.z:8787 \
+  --claude-acp-auth-mode local-subscription
+
 orchestra slave \
   --endpoint http://100.x.y.z:8787 \
   --id build-linux-01 \
@@ -232,6 +246,8 @@ orchestra slave \
   --approval-policy manual \
   --claude-acp-auth-mode local-subscription
 ```
+
+Both `orchestra master` and `orchestra slave` emit structured, secret-redacted operational logs to `stderr` (`info` by default; customize with `--verbose`, `--log-level debug|info|warn|error|quiet`, and `--log-format text|json`).
 
 ### Supported Harnesses at a Glance
 
@@ -316,9 +332,13 @@ Pass `--project-profiles profiles.json` to `orchestra master` so tasks referenci
 
 ## Operator CLI
 
-Every inspection and control command reads `ORCHESTRA_ENDPOINT` (default `http://127.0.0.1:8787`) and `ORCHESTRA_TOKEN`, and accepts `--json` for scripting.
+Every inspection and control command auto-discovers `~/.local/share/orchestra/connection.json` when omitted, supports `ORCHESTRA_ENDPOINT` and `ORCHESTRA_TOKEN` overrides, and accepts `--json` for scripting.
 
 ```bash
+# Register, inspect, or remove Orchestra MCP across local harnesses
+orchestra mcp install
+orchestra mcp status
+orchestra mcp uninstall
 # Cluster overview & worker inventory
 orchestra status
 orchestra nodes
@@ -357,12 +377,12 @@ orchestra cancel <run-id|task-id>
 <details>
 <summary><strong>Security Model & Invariants</strong></summary>
 
-- **Constant-time bearer authentication** (`ORCHESTRA_TOKEN`) guards all REST, MCP, SSE, and `/control-agent` WebSocket endpoints.
+- **Flexible authentication**: Constant-time bearer authentication (`--auth token`, default, with automatic `0600` `<data-dir>/token` generation) or zero-token Tailscale peer verification (`--auth tailscale`) using `tailscale whois`, strict Tailscale/loopback bind confinement, and browser `Origin` / `Sec-Fetch-*` / Tailscale Funnel request rejection.
 - **Vendor credentials remain on workers**: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, OAuth credentials, and CLI subscriptions never leave `orchestra slave` machines. `ORCHESTRA_TOKEN` is stripped from child harness environments; workers talk only to an ephemeral loopback `orchestra_hub` server scoped to their active run.
 - **No shell execution**: Harnesses and `git` are spawned directly via `exec.CommandContext` with process-group isolation and cancellation tombstones—never `sh -c`.
 - **Canonical workspace confinement**: Every workspace path on a slave is resolved symlink-free and verified to live beneath an operator-configured `--workspace-root`.
 - **Claude ACP billing gate**: `claude-cli` over `acp-v1` requires an explicit `--claude-acp-auth-mode` (`local-subscription` or `api`) so local Max/Pro subscription users never accidentally incur API key charges.
-- **Automatic secret redaction**: Harness events, transcripts, and error diagnostics are scrubbed before SQLite persistence or CLI/MCP output.
+- **Automatic secret redaction**: Harness events, transcripts, operational logs, and error diagnostics are scrubbed before SQLite persistence or CLI/MCP output.
 
 </details>
 
@@ -396,8 +416,13 @@ Each worker run receives an isolated `127.0.0.1` Streamable HTTP MCP server expo
 
 | Flag | Environment Variable | Description |
 | :--- | :--- | :--- |
-| `--listen` | `ORCHESTRA_LISTEN` | HTTP/WebSocket listen address (default `127.0.0.1:8787`) |
-| `--token` | `ORCHESTRA_TOKEN` | Shared bearer token for API, MCP, and `/control-agent` |
+| `--listen` | `ORCHESTRA_LISTEN` | HTTP/WebSocket listen address (default `127.0.0.1:8787`, or `<tailscale-ipv4>:8787` with `--auth tailscale`) |
+| `--auth` | `ORCHESTRA_AUTH_MODE` | Authentication mode: `token` (default) or `tailscale` |
+| `--token` | `ORCHESTRA_TOKEN` | Shared bearer token in `token` mode (auto-generated/persisted at `<data-dir>/token` if omitted) |
+| `--tailscale-allow-user` | `ORCHESTRA_TAILSCALE_ALLOW_USERS` | Authorized Tailscale login in `tailscale` mode (repeatable; defaults to master's Tailscale user) |
+| `--tailscale-allow-tag` | `ORCHESTRA_TAILSCALE_ALLOW_TAGS` | Authorized Tailscale ACL `tag:<name>` in `tailscale` mode (repeatable) |
+| `--tailscale-binary` | `ORCHESTRA_TAILSCALE_BINARY` | Explicit path to the `tailscale` CLI binary |
+| `--connection-file` | `ORCHESTRA_CONNECTION_FILE` | Local discovery file path (default `~/.local/share/orchestra/connection.json`; `none` to disable) |
 | `--data-dir` | `ORCHESTRA_DATA_DIR` | Directory for SQLite WAL database and SHA-256 artifact store |
 | `--tls-cert`, `--tls-key` | `ORCHESTRA_TLS_CERT`, `ORCHESTRA_TLS_KEY` | PEM certificate and private key for `https://` and `wss://` |
 | `--project-profiles` | `ORCHESTRA_PROJECT_PROFILES` | Optional JSON file defining project capability profiles |
@@ -406,13 +431,17 @@ Each worker run receives an isolated `127.0.0.1` Streamable HTTP MCP server expo
 | `--worker-id`, `--worker-name` | — | Stable ID and display name for the embedded worker |
 | `--worker-concurrency`, `--worker-instance-capacity` | — | Max concurrent runs (default `2`) and resident instances (default `4`) |
 | `--worker-label` | — | Capability label for the embedded worker (repeatable) |
+| `--verbose`, `--log-level`, `--log-format` | `ORCHESTRA_VERBOSE`, `ORCHESTRA_LOG_LEVEL`, `ORCHESTRA_LOG_FORMAT` | Operational logging (`debug\|info\|warn\|error\|quiet`, `text\|json`) |
 
 #### `orchestra slave`
 
 | Flag | Environment Variable | Description |
 | :--- | :--- | :--- |
-| `--endpoint` | `ORCHESTRA_ENDPOINT` | Master URL (default `http://127.0.0.1:8787`) |
-| `--token` | `ORCHESTRA_TOKEN` | Shared bearer token matching the master |
+| `--endpoint` | `ORCHESTRA_ENDPOINT` | Master URL (auto-discovered via `connection.json` or Tailscale peers if omitted) |
+| `--master-port` | `ORCHESTRA_MASTER_PORT` | Master port probed during Tailscale auto-discovery (default `8787`) |
+| `--tailscale-binary` | `ORCHESTRA_TAILSCALE_BINARY` | Explicit path to the `tailscale` CLI binary |
+| `--token` | `ORCHESTRA_TOKEN` | Shared bearer token when connecting to a `token`-mode master |
+| `--connection-file` | `ORCHESTRA_CONNECTION_FILE` | Local discovery file fallback path (`none` to disable) |
 | `--id`, `--name`, `--kind` | `ORCHESTRA_NODE_ID`, `ORCHESTRA_NAME`, `ORCHESTRA_KIND` | Node identity and kind (`local`, `home-server`, `cloud`) |
 | `--workspace-root` | `WORKSPACE_ROOTS` | Allowed parent directory for task workspaces (repeatable) |
 | `--concurrency`, `--instance-capacity` | `ORCHESTRA_CONCURRENCY`, `ORCHESTRA_INSTANCE_CAPACITY` | Max concurrent runs (`2`) and resident instances (`4`) |
@@ -423,13 +452,15 @@ Each worker run receives an isolated `127.0.0.1` Streamable HTTP MCP server expo
 | `--require-acp` | `ORCHESTRA_REQUIRE_ACP` | Withhold harnesses that only have `native-cli` transport |
 | `--disable-self-update` | `ORCHESTRA_DISABLE_SELF_UPDATE` | Reject remote self-update directives on this slave node |
 | `--tls-ca`, `--tls-insecure` | `ORCHESTRA_TLS_CA`, `ORCHESTRA_TLS_INSECURE` | Custom CA bundle path or TLS verification skip |
+| `--verbose`, `--log-level`, `--log-format` | `ORCHESTRA_VERBOSE`, `ORCHESTRA_LOG_LEVEL`, `ORCHESTRA_LOG_FORMAT` | Operational logging (`debug\|info\|warn\|error\|quiet`, `text\|json`) |
 
 #### `orchestra mcp`
 
 | Flag | Environment Variable | Description |
 | :--- | :--- | :--- |
-| `--endpoint` | `ORCHESTRA_ENDPOINT` | Master HTTP/HTTPS URL (default `http://127.0.0.1:8787`) |
-| `--token` | `ORCHESTRA_TOKEN` | Shared bearer token matching the master |
+| `--endpoint` | `ORCHESTRA_ENDPOINT` | Master HTTP/HTTPS URL (auto-discovered via `connection.json` if omitted) |
+| `--token` | `ORCHESTRA_TOKEN` | Shared bearer token override (auto-discovered via `connection.json` if omitted) |
+| `--connection-file` | `ORCHESTRA_CONNECTION_FILE` | Local discovery file path (`none` to disable) |
 | `--name`, `--host` | `ORCHESTRA_MAIL_NAME`, `ORCHESTRA_MAIL_HOST` | Optional Agent Mail handle and host override (`<name>@<host>`) |
 | `--client-id` | `ORCHESTRA_CLIENT_ID` | Stable client identifier across bridge restarts |
 

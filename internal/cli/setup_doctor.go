@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cafecito-games/Orchestra/internal/harness"
+	"github.com/cafecito-games/Orchestra/internal/localstate"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/setup"
 	"github.com/cafecito-games/Orchestra/internal/slave"
@@ -580,7 +581,9 @@ func runDoctor(
 	standardError io.Writer,
 	lookupEnvironment func(string) (string, bool),
 ) int {
-	defaultEndpoint := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_ENDPOINT", "CONTROL_ENDPOINT")
+	connectionFilePath := localstate.ResolveConnectionFilePath(lookupEnvironment)
+	endpointFromEnvironment := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_ENDPOINT", "CONTROL_ENDPOINT")
+	defaultEndpoint := endpointFromEnvironment
 	if defaultEndpoint == "" {
 		defaultEndpoint = slave.DefaultEndpoint
 	}
@@ -607,6 +610,16 @@ func runDoctor(
 	if flagSet.NArg() > 0 {
 		fmt.Fprintf(standardError, "orchestra doctor: unexpected arguments: %s\n", strings.Join(flagSet.Args(), " "))
 		return 2
+	}
+
+	explicitFlags := map[string]bool{}
+	flagSet.Visit(func(visited *flag.Flag) {
+		explicitFlags[visited.Name] = true
+	})
+	if !explicitFlags["endpoint"] && !explicitFlags["control-endpoint"] && endpointFromEnvironment == "" && connectionFilePath != "" {
+		if discovered, found, readErr := localstate.ReadConnectionState(connectionFilePath); readErr == nil && found && strings.TrimSpace(discovered.Endpoint) != "" {
+			*controlEndpoint = strings.TrimSpace(discovered.Endpoint)
+		}
 	}
 
 	rawPolicies := []string(approvalPolicyValues)

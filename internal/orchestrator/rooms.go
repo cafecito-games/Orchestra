@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
@@ -415,6 +416,17 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 	})
 	if err != nil {
 		return PostRoomMessageResult{}, err
+	}
+	if !result.Replayed {
+		service.logger.Info(
+			"room",
+			"posted",
+			activitylog.String("thread", result.ThreadID),
+			activitylog.Int64("seq", result.Message.Sequence),
+			activitylog.String("kind", result.Message.Kind),
+			activitylog.String("topic", result.Message.Topic),
+			activitylog.Int("nudged", len(result.NudgedTaskIDs)),
+		)
 	}
 	return result, nil
 }
