@@ -192,17 +192,36 @@ func (runner *Runner) Admit(harnessID, transport, fallbackTransport string) erro
 
 func (runner *Runner) nativeTransportAdmitted(harnessID string) error {
 	profile, available := runner.advertisedProfile(harnessID)
-	if available && len(profile.Transports) > 0 && !slices.Contains(profile.Transports, TransportNative) {
+	if !available {
+		return fmt.Errorf("%w: harness %s is not available on this slave node", ErrDriverUnavailable, harnessID)
+	}
+	if len(profile.Transports) > 0 && !slices.Contains(profile.Transports, TransportNative) {
 		return fmt.Errorf("%w: harness %s does not advertise the %s transport", ErrDriverUnavailable, harnessID, TransportNative)
 	}
 	return nil
 }
 
-func (runner *Runner) AdmitResume(harnessID string) error {
-	if err := runner.acpAvailable(harnessID); err != nil {
-		return err
+func (runner *Runner) AdmitResume(harnessID, transport string) error {
+	switch transport {
+	case "", TransportNative:
+		if err := runner.nativeTransportAdmitted(harnessID); err != nil {
+			return err
+		}
+		if _, available := runner.profile(harnessID); !available {
+			return fmt.Errorf("%w: native harness %s is unavailable", ErrDriverUnavailable, harnessID)
+		}
+		if !slices.Contains(protocol.HarnessIDs, harnessID) {
+			return fmt.Errorf("%w: harness %s does not support native session resume", ErrDriverUnavailable, harnessID)
+		}
+		return nil
+	case TransportACP:
+		if err := runner.acpAvailable(harnessID); err != nil {
+			return err
+		}
+		return runner.acp.SupportsResume(harnessID)
+	default:
+		return fmt.Errorf("%w: unknown harness transport", ErrDriverUnavailable)
 	}
-	return runner.acp.SupportsResume(harnessID)
 }
 
 func (runner *Runner) AdmitModel(harnessID, model string) error {
@@ -223,6 +242,9 @@ func (runner *Runner) Execute(operationContext context.Context, invocation Invoc
 	invocation.approvalPolicy = runner.approvalPolicies.For(invocation.Run.HarnessID)
 	switch invocation.Run.Transport {
 	case "", TransportNative:
+		if err := runner.nativeTransportAdmitted(invocation.Run.HarnessID); err != nil {
+			return "", err
+		}
 		return runner.native.Execute(operationContext, runner.beginning(invocation, protocol.RunTransportSelection{RequestedTransport: TransportNative, SelectedTransport: TransportNative}, nil))
 	case TransportACP:
 		return runner.executeACP(operationContext, invocation)
@@ -233,7 +255,7 @@ func (runner *Runner) Execute(operationContext context.Context, invocation Invoc
 
 func (runner *Runner) executeACP(operationContext context.Context, invocation Invocation) (string, error) {
 	harnessID := invocation.Run.HarnessID
-	permitted := runner.fallbackPermitted(harnessID, invocation.FallbackTransport)
+	permitted := invocation.Resume == nil && runner.fallbackPermitted(harnessID, invocation.FallbackTransport)
 	if err := runner.acpAvailable(harnessID); err != nil {
 		if permitted {
 			return runner.fallBack(operationContext, invocation, protocol.FallbackACPAdapterUnavailable)

@@ -287,3 +287,166 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"agy-conv-777","sta
 	require.Contains(t, recordedArgs, "--sandbox")
 	require.NotContains(t, recordedArgs, "ephemeral-mcp-secret")
 }
+
+func TestPrepareNativeArguments_SessionResumeAndValidation(t *testing.T) {
+	workspaceDirectory := t.TempDir()
+	mcpConfig := mcpserver.Configuration{
+		URL:         "http://127.0.0.1:9999/mcp",
+		Token:       "mcp-secret-token-value",
+		CanDelegate: false,
+	}
+
+	t.Run("claude-cli resume", func(t *testing.T) {
+		arguments, cleanup, err := prepareNativeArguments(Invocation{
+			Run: protocol.Run{
+				HarnessID: protocol.HarnessClaudeCLI,
+				Model:     "sonnet",
+				Prompt:    "initial prompt",
+			},
+			Workspace:      workspaceDirectory,
+			MCP:            mcpConfig,
+			Resume:         &SessionResume{ProviderSessionID: "sess-claude-42", Prompt: "follow-up prompt"},
+			approvalPolicy: protocol.ApprovalPolicyAuto,
+		})
+		defer cleanup()
+		require.NoError(t, err)
+		require.Equal(t, "--resume", arguments[0])
+		require.Equal(t, "sess-claude-42", arguments[1])
+		require.Equal(t, "-p", arguments[2])
+		require.Contains(t, arguments[3], "follow-up prompt")
+		require.NotContains(t, arguments[3], "initial prompt")
+		require.Contains(t, arguments, "--mcp-config")
+	})
+
+	t.Run("codex-cli resume places options before resume subcommand", func(t *testing.T) {
+		arguments, cleanup, err := prepareNativeArguments(Invocation{
+			Run: protocol.Run{
+				HarnessID: protocol.HarnessCodexCLI,
+				Model:     "gpt-5.5",
+				Prompt:    "initial prompt",
+			},
+			Workspace:      workspaceDirectory,
+			MCP:            mcpConfig,
+			Resume:         &SessionResume{ProviderSessionID: "thread-codex-99", Prompt: "codex follow-up"},
+			approvalPolicy: protocol.ApprovalPolicyManual,
+		})
+		defer cleanup()
+		require.NoError(t, err)
+		require.Equal(t, []string{"exec", "--json", "--sandbox", "workspace-write", "--model", "gpt-5.5"}, arguments[:6])
+		require.Equal(t, "resume", arguments[len(arguments)-3])
+		require.Equal(t, "thread-codex-99", arguments[len(arguments)-2])
+		require.Contains(t, arguments[len(arguments)-1], "codex follow-up")
+	})
+
+	t.Run("opencode-cli resume passes session flag", func(t *testing.T) {
+		arguments, cleanup, err := prepareNativeArguments(Invocation{
+			Run: protocol.Run{
+				HarnessID: protocol.HarnessOpenCodeCLI,
+				Model:     "zai-coding-plan/glm-5.2",
+				Prompt:    "initial prompt",
+			},
+			Workspace:      workspaceDirectory,
+			MCP:            mcpConfig,
+			Resume:         &SessionResume{ProviderSessionID: "ses_open_77", Prompt: "opencode follow-up"},
+			approvalPolicy: protocol.ApprovalPolicyAuto,
+		})
+		defer cleanup()
+		require.NoError(t, err)
+		require.Equal(t, []string{
+			"--standalone", "run", "--format", "json",
+			"--session", "ses_open_77",
+			"--auto",
+			"--model", "zai-coding-plan/glm-5.2",
+		}, arguments[:9])
+		require.Contains(t, arguments[9], "opencode follow-up")
+	})
+
+	t.Run("rejects malformed or secret-like resume session IDs", func(t *testing.T) {
+		invalidIDs := []string{
+			"--flag-injection",
+			"-r",
+			"bad space",
+			"sk-ant-api03-1234567890abcdef",
+		}
+		for _, harnessID := range protocol.HarnessIDs {
+			for _, badID := range invalidIDs {
+				_, cleanup, err := prepareNativeArguments(Invocation{
+					Run: protocol.Run{
+						HarnessID: harnessID,
+						Prompt:    "prompt",
+					},
+					Workspace: workspaceDirectory,
+					Resume:    &SessionResume{ProviderSessionID: badID},
+				})
+				if cleanup != nil {
+					cleanup()
+				}
+				require.Error(t, err, "expected error for harness=%s id=%q", harnessID, badID)
+			}
+		}
+	})
+}
+
+func TestAdmitResume_TransportIsolationAndNoCrossTransportFallback(t *testing.T) {
+	temporaryDirectory := t.TempDir()
+	fakeClaude := filepath.Join(temporaryDirectory, "claude")
+	require.NoError(t, os.WriteFile(fakeClaude, []byte("#!/bin/sh\necho '{\"type\":\"result\",\"result\":\"unexpected native fallback\"}'\n"), 0o755))
+
+	nativeProfiles := []protocol.HarnessProfile{
+		{
+			ID:          protocol.HarnessClaudeCLI,
+			Label:       "Claude Code",
+			Description: "2.1.231",
+			Binary:      fakeClaude,
+			Available:   true,
+			Models:      []string{"sonnet"},
+			Transports:  []string{TransportNative},
+		},
+		{
+			ID:         protocol.HarnessCodexCLI,
+			Label:      "Codex",
+			Available:  false,
+			Transports: []string{TransportNative},
+		},
+	}
+
+	runner := NewRunner(nativeProfiles).WithNativeFallback(protocol.HarnessClaudeCLI)
+	require.NoError(t, runner.AdmitResume(protocol.HarnessClaudeCLI, TransportNative))
+	require.NoError(t, runner.AdmitResume(protocol.HarnessClaudeCLI, ""))
+	require.Error(t, runner.AdmitResume(protocol.HarnessCodexCLI, TransportNative))
+	require.Error(t, runner.AdmitResume(protocol.HarnessClaudeCLI, TransportACP))
+	require.Error(t, runner.AdmitResume(protocol.HarnessClaudeCLI, "invalid-transport"))
+
+	acpOnlyRunner := NewRunner(nativeProfiles).WithAdvertisedProfiles([]protocol.HarnessProfile{{
+		ID:         protocol.HarnessClaudeCLI,
+		Label:      "Claude Code",
+		Available:  true,
+		Transports: []string{TransportACP},
+	}})
+	require.Error(t, acpOnlyRunner.AdmitResume(protocol.HarnessClaudeCLI, TransportNative))
+	_, acpOnlyNativeErr := acpOnlyRunner.Execute(context.Background(), Invocation{
+		Run: protocol.Run{
+			ID:        "run-native-disallowed",
+			HarnessID: protocol.HarnessClaudeCLI,
+			Workspace: temporaryDirectory,
+			Prompt:    "Disallowed native run",
+			Transport: TransportNative,
+		},
+		Workspace: temporaryDirectory,
+	})
+	require.Error(t, acpOnlyNativeErr)
+
+	_, err := runner.Execute(context.Background(), Invocation{
+		Run: protocol.Run{
+			ID:        "run-acp-resume",
+			HarnessID: protocol.HarnessClaudeCLI,
+			Workspace: temporaryDirectory,
+			Prompt:    "Resume ACP session",
+			Transport: TransportACP,
+		},
+		Workspace:         temporaryDirectory,
+		FallbackTransport: TransportNative,
+		Resume:            &SessionResume{ProviderSessionID: "acp-sess-1"},
+	})
+	require.Error(t, err, "ACP resume must fail closed instead of falling back to native CLI")
+}

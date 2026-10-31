@@ -74,6 +74,7 @@ func IsTerminalApprovalStatus(status string) bool {
 type DispatchSessionBinding struct {
 	ID                string `json:"id"`
 	ProviderSessionID string `json:"providerSessionId"`
+	Transport         string `json:"transport,omitempty"`
 	ResumePrompt      string `json:"resumePrompt,omitempty"`
 }
 
@@ -83,6 +84,9 @@ func (binding DispatchSessionBinding) Validate() error {
 	}
 	if LooksSecretLike(binding.ID) || LooksSecretLike(binding.ProviderSessionID) {
 		return fmt.Errorf("session binding identity looks like a credential")
+	}
+	if binding.Transport != "" && !slices.Contains(HarnessTransports, binding.Transport) {
+		return fmt.Errorf("session binding has an unknown transport")
 	}
 	if len(binding.ResumePrompt) > SessionResumePromptMaximumBytes || !utf8.ValidString(binding.ResumePrompt) {
 		return fmt.Errorf("session binding resume prompt exceeds its bound")

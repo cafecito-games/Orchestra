@@ -146,12 +146,21 @@ func nativeCodexSandboxArguments(approvalPolicy string) []string {
 	return []string{"--sandbox", "workspace-write"}
 }
 
+func isValidNativeSessionID(sessionID string) bool {
+	return providerSessionPattern.MatchString(sessionID) &&
+		protocol.IsIdentifier(sessionID) &&
+		!protocol.LooksSecretLike(sessionID)
+}
+
 func prepareNativeArguments(invocation Invocation) ([]string, func(), error) {
 	noopCleanup := func() {}
 	effectiveRun := invocation.Run
 	conversationID := ""
 	if invocation.Resume != nil {
 		conversationID = invocation.Resume.ProviderSessionID
+		if !isValidNativeSessionID(conversationID) {
+			return nil, noopCleanup, errors.New("native session resume identity is missing or invalid")
+		}
 		if invocation.Resume.Prompt != "" {
 			effectiveRun.Prompt = invocation.Resume.Prompt
 		}
@@ -187,15 +196,38 @@ func prepareNativeArguments(invocation Invocation) ([]string, func(), error) {
 		)
 		return arguments, preparedMCP.Cleanup, nil
 	}
-	arguments, err := harnessArguments(effectiveRun, invocation.SystemPrompt, invocation.MCP, invocation.approvalPolicy)
+	arguments, err := harnessArgumentsForSession(effectiveRun, invocation.SystemPrompt, invocation.MCP, invocation.approvalPolicy, conversationID)
 	return arguments, noopCleanup, err
 }
 
 func harnessArguments(run protocol.Run, systemPrompt string, mcpConfiguration mcpserver.Configuration, approvalPolicy string) ([]string, error) {
+	return harnessArgumentsForSession(run, systemPrompt, mcpConfiguration, approvalPolicy, "")
+}
+
+func harnessArgumentsForSession(
+	run protocol.Run,
+	systemPrompt string,
+	mcpConfiguration mcpserver.Configuration,
+	approvalPolicy string,
+	conversationID string,
+) ([]string, error) {
+	if conversationID != "" && !isValidNativeSessionID(conversationID) {
+		return nil, errors.New("native session resume identity is invalid")
+	}
 	prompt := composePrompt(run, systemPrompt)
 	switch run.HarnessID {
 	case protocol.HarnessClaudeCLI:
-		arguments := []string{"-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", nativeClaudePermissionMode(approvalPolicy), "--permission-prompts", "none"}
+		arguments := make([]string, 0, 14)
+		if conversationID != "" {
+			arguments = append(arguments, "--resume", conversationID)
+		}
+		arguments = append(arguments,
+			"-p", prompt,
+			"--output-format", "stream-json",
+			"--verbose",
+			"--permission-mode", nativeClaudePermissionMode(approvalPolicy),
+			"--permission-prompts", "none",
+		)
 		if run.Model != "" && run.Model != "default" {
 			arguments = append(arguments, "--model", run.Model)
 		}
@@ -232,12 +264,18 @@ func harnessArguments(run protocol.Run, systemPrompt string, mcpConfiguration mc
 				"-c", `mcp_servers.`+mcpServerName+`.default_tools_approval_mode="approve"`,
 			)
 		}
+		if conversationID != "" {
+			return append(arguments, "resume", conversationID, prompt), nil
+		}
 		return append(arguments, prompt), nil
 	case protocol.HarnessOpenCodeCLI:
 		// A private server makes each Orchestra run consume the model, MCP, and
 		// permission configuration supplied to this process instead of inheriting
 		// configuration from an already-running OpenCode background service.
 		arguments := []string{"--standalone", "run", "--format", "json"}
+		if conversationID != "" {
+			arguments = append(arguments, "--session", conversationID)
+		}
 		if approvalPolicy == protocol.ApprovalPolicyAuto || approvalPolicy == protocol.ApprovalPolicyBypass {
 			arguments = append(arguments, "--auto")
 		}

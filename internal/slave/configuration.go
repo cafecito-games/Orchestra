@@ -53,6 +53,7 @@ type Configuration struct {
 	AdapterManifest      string
 	ACPAdapters          []acpadapter.Override
 	ACPNativeFallback    []string
+	RequireACP           bool
 	ClaudeACPAuthMode    string
 	ApprovalPolicies     harness.ApprovalPolicies
 	BuiltInACPExecutable string
@@ -120,6 +121,14 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	defaultTLSCACert := firstEnvironment(lookupEnvironment, "ORCHESTRA_TLS_CA")
 	defaultTLSInsecure := firstEnvironment(lookupEnvironment, "ORCHESTRA_TLS_INSECURE") == "1" ||
 		strings.EqualFold(firstEnvironment(lookupEnvironment, "ORCHESTRA_TLS_INSECURE"), "true")
+	defaultRequireACP := false
+	if rawRequireACP := firstEnvironment(lookupEnvironment, "ORCHESTRA_REQUIRE_ACP"); rawRequireACP != "" {
+		parsedRequireACP, err := parseStrictBool(rawRequireACP)
+		if err != nil {
+			return Configuration{}, fmt.Errorf("invalid ORCHESTRA_REQUIRE_ACP %q: %w", rawRequireACP, err)
+		}
+		defaultRequireACP = parsedRequireACP
+	}
 
 	defaultConcurrency := DefaultConcurrency
 	if raw := firstEnvironment(lookupEnvironment, "ORCHESTRA_CONCURRENCY"); raw != "" {
@@ -182,6 +191,7 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	flagSet.Var(&toolchainFlag, "toolchain", "Configured toolchain id=version (repeatable)")
 	flagSet.Var(&acpAdapterFlag, "acp-adapter", "Pinned ACP adapter override harness=sha256:digest:/abs/path (repeatable)")
 	flagSet.Var(&acpFallbackFlag, "acp-native-fallback", "Harness ID allowed to fall back from acp-v1 to native-cli (repeatable)")
+	flagSet.BoolVar(&configuration.RequireACP, "require-acp", defaultRequireACP, "Require verified acp-v1 readiness and disable native-cli advertisement")
 	flagSet.Var(&approvalPolicyFlag, "approval-policy", "Harness approval policy manual|auto|bypass or harness=policy (repeatable)")
 
 	if err := flagSet.Parse(arguments); err != nil {
@@ -260,6 +270,9 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 		return Configuration{}, err
 	}
 	configuration.ACPNativeFallback = fallbacks
+	if configuration.RequireACP && len(configuration.ACPNativeFallback) > 0 {
+		return Configuration{}, errors.New("--require-acp cannot be combined with --acp-native-fallback")
+	}
 
 	rawPolicies := chooseList(approvalPolicyFlag, firstEnvironment(lookupEnvironment, "ORCHESTRA_APPROVAL_POLICY"))
 	policies, err := parseApprovalPolicies(rawPolicies)
@@ -285,6 +298,9 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 }
 
 func BuildRuntime(operationContext context.Context, configuration Configuration) (*Runtime, error) {
+	if configuration.RequireACP && len(configuration.ACPNativeFallback) > 0 {
+		return nil, errors.New("--require-acp cannot be combined with --acp-native-fallback")
+	}
 	if configuration.Version == "" {
 		configuration.Version = DefaultVersion
 	}
@@ -407,18 +423,24 @@ func BuildRuntime(operationContext context.Context, configuration Configuration)
 			ClientVersion:  configuration.Version,
 		})
 	}
-	advertisedProfiles, probeFailures := harness.AdvertiseACP(operationContext, nativeProfiles, acpDriver)
+	probedProfiles, probeFailures := harness.AdvertiseACP(operationContext, nativeProfiles, acpDriver)
 	for harnessID, probeErr := range probeFailures {
 		warnings = append(warnings, fmt.Sprintf("ACP probe failed for %s: %v", harnessID, probeErr))
 	}
 	if configuration.ClaudeACPAuthMode == harness.ClaudeACPAuthModeAPI {
-		for index := range advertisedProfiles {
-			if advertisedProfiles[index].ID == protocol.HarnessClaudeCLI {
-				advertisedProfiles[index].AuthMode = "api"
+		for index := range probedProfiles {
+			if probedProfiles[index].ID == protocol.HarnessClaudeCLI {
+				probedProfiles[index].AuthMode = "api"
 			}
 		}
 	}
-	advertisedProfiles = harness.AdvertiseApprovalPolicies(advertisedProfiles, configuration.ApprovalPolicies)
+	probedProfiles = harness.AdvertiseApprovalPolicies(probedProfiles, configuration.ApprovalPolicies)
+	advertisedProfiles := probedProfiles
+	if configuration.RequireACP {
+		var requireACPWarnings []string
+		advertisedProfiles, requireACPWarnings = enforceRequireACP(probedProfiles)
+		warnings = append(warnings, requireACPWarnings...)
+	}
 
 	runner := harness.NewRunner(nativeProfiles).
 		WithManagedHarnesses(verifiedManaged).
@@ -468,7 +490,7 @@ func BuildRuntime(operationContext context.Context, configuration Configuration)
 		configuration.DataRoot,
 		platform,
 		activation,
-		advertisedProfiles,
+		probedProfiles,
 		setup.ComponentAssessmentOptions{ACPStartupEvidenceKnown: true},
 	)
 	componentReport := setup.ComponentInventoryReport(configuration.NodeID, observedAt, assessments)
@@ -503,6 +525,37 @@ func firstEnvironment(lookupEnvironment func(string) (string, bool), names ...st
 		}
 	}
 	return ""
+}
+
+func parseStrictBool(raw string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true":
+		return true, nil
+	case "0", "false":
+		return false, nil
+	default:
+		return false, errors.New("expected true, false, 1, or 0")
+	}
+}
+
+func enforceRequireACP(profiles []protocol.HarnessProfile) ([]protocol.HarnessProfile, []string) {
+	filtered := make([]protocol.HarnessProfile, len(profiles))
+	var warnings []string
+	for index, profile := range profiles {
+		updated := profile
+		if profile.Available && slices.Contains(profile.Transports, protocol.TransportACP) {
+			updated.Transports = []string{protocol.TransportACP}
+		} else {
+			if profile.Available {
+				warnings = append(warnings, fmt.Sprintf("harness %s withheld because --require-acp is enabled and acp-v1 is not ready", profile.ID))
+			}
+			updated.Available = false
+			updated.Transports = []string{}
+			updated.ACP = nil
+		}
+		filtered[index] = updated
+	}
+	return filtered, warnings
 }
 
 func chooseList(flagValue repeatFlag, environmentValue string) []string {
