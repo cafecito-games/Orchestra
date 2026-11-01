@@ -398,6 +398,12 @@ orchestra reject <approval-id> --reason "Do not modify production config"
 orchestra cancel <run-id|task-id>
 ```
 
+### Operator Web Console
+
+`orchestra master` also serves a browser console at its root URL (e.g. `http://127.0.0.1:8787/`, or your master's endpoint). Open it, paste the master's bearer token on the login screen, and inspect the fleet visually: cluster metrics, worker nodes with their harnesses and capabilities, coordination threads and task DAGs, resident instances, and agent mail. You can also approve or reject pending permission requests and cancel active runs directly from the UI.
+
+The console is a React single-page application (Vite + TypeScript) compiled to static assets that are embedded into the binary via `go:embed`, so it adds no runtime dependencies. The frontend source lives in `web/`, and its committed build output is embedded under `internal/webui/static`. After editing the frontend, regenerate it with `task web:build` (the `ci` pipeline runs this step too). The console shell is unauthenticated markup with no cluster data; everything it shows is served through the existing bearer-authenticated REST API.
+
 ---
 
 ## Reference & Deep Dives
