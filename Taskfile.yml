@@ -41,6 +41,13 @@ tasks:
       - mkdir -p bin
       - CGO_ENABLED=0 go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/orchestra ./cmd/orchestra
 
+  web:build:
+    desc: Install frontend dependencies and compile the React console into internal/webui/static
+    dir: web
+    cmds:
+      - npm ci
+      - npm run build
+
   build:all:
     desc: Cross-compile CGo-free orchestra release binaries across darwin and linux (amd64/arm64)
     cmds:
@@ -146,6 +153,7 @@ tasks:
       - task: lint
       - task: unit:test
       - task: system:test
+      - task: web:build
       - task: build
       - task: build:all
 

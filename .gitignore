@@ -1,5 +1,7 @@
 bin/
 dist/
+node_modules/
+web/.vite/
 .orchestra/
 .task/
 *.sqlite

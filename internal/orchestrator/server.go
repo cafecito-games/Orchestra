@@ -30,6 +30,7 @@ import (
 	"github.com/cafecito-games/Orchestra/internal/slave"
 	"github.com/cafecito-games/Orchestra/internal/store"
 	"github.com/cafecito-games/Orchestra/internal/tailscaleauth"
+	"github.com/cafecito-games/Orchestra/internal/webui"
 )
 
 const (
@@ -354,6 +355,9 @@ func (service *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/mail/agents", service.requireBearer(service.handleAPIMailAgents))
 	mux.HandleFunc("/api/mail/messages", service.requireBearer(service.handleAPIMailMessages))
 	mux.HandleFunc("/api/mail/rename", service.requireBearer(service.handleAPIMailRename))
+	// The operator console is a static shell with no cluster data; it falls back
+	// to "/" so it only serves paths not claimed by the API or WebSocket routes.
+	mux.Handle("/", webui.Handler())
 	return mux
 }
 
