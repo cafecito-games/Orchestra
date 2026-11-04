@@ -23,6 +23,15 @@ import (
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
 
+func TestToolDefinitionsForRelayScopes(t *testing.T) {
+	definitions := toolDefinitionsForScopes(protocol.RelayToolNames)
+	names := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		names = append(names, definition.Name)
+	}
+	assert.Equal(t, protocol.RelayToolNames, names)
+}
+
 func TestStdioBridgeInitializeToolsCallArtifactUploadAndDoorbell(t *testing.T) {
 	openedStore, err := store.Open(t.TempDir())
 	require.NoError(t, err)

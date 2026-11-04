@@ -59,7 +59,7 @@ export async function api<T>(path: string, options: ApiOptions = {}): Promise<T>
   try {
     response = await fetch(path, init);
   } catch {
-    throw new Error("Network error — is the master reachable?");
+    throw new Error("Network error — is Orchestra reachable?");
   }
 
   if (response.status === 401) {

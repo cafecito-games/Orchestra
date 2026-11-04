@@ -85,15 +85,22 @@ export default function App() {
 
 function Shell({ route, health }: { route: ReturnType<typeof useRoute>; health: Health | null }) {
   const live = useLive();
+  const isRelay = health?.mode === "relay";
   const pending = usePolledFetch<{ approvals: ApprovalRequest[] }>(
-    () => api<{ approvals: ApprovalRequest[] }>("/api/approvals?status=pending"),
-    [live.refreshNonce],
+    () => isRelay
+      ? Promise.resolve({ approvals: [] })
+      : api<{ approvals: ApprovalRequest[] }>("/api/approvals?status=pending"),
+    [isRelay, live.refreshNonce],
     live.pollMs,
   ).data;
   const pendingCount = pending?.approvals.length ?? 0;
 
-  const [title, subtitle] = TITLES[route.name] ?? TITLES.overview!;
+  const effectiveRoute = isRelay && route.name !== "mailbox" ? { name: "mail" } : route;
+  const [title, subtitle] = isRelay
+    ? (effectiveRoute.name === "mailbox" ? ["Mail", "Agent mailbox"] : ["Mail", "Live traffic between connected agents"])
+    : (TITLES[effectiveRoute.name] ?? TITLES.overview!);
   const connected = health?.authMode === "token";
+  const navigation = isRelay ? NAV.filter((item) => item.name === "mail") : NAV;
 
   return (
     <div className="app">
@@ -104,15 +111,15 @@ function Shell({ route, health }: { route: ReturnType<typeof useRoute>; health: 
           </div>
           <div>
             <div className="brand-name">Orchestra</div>
-            <div className="brand-sub">Agent control plane</div>
+            <div className="brand-sub">{isRelay ? "Agent communication relay" : "Agent control plane"}</div>
           </div>
         </div>
         <nav className="nav">
-          <div className="nav-label">Fleet</div>
-          {NAV.map((item) => (
+          <div className="nav-label">{isRelay ? "Relay" : "Fleet"}</div>
+          {navigation.map((item) => (
             <button
               key={item.name}
-              className={`nav-item${activeFor(route.name, item.name) ? " active" : ""}`}
+              className={`nav-item${activeFor(effectiveRoute.name, item.name) ? " active" : ""}`}
               onClick={() => navigate(`/${item.name}`)}
             >
               <span className="nav-icon">{item.icon}</span>
@@ -162,7 +169,7 @@ function Shell({ route, health }: { route: ReturnType<typeof useRoute>; health: 
           </div>
         </div>
         <div className="content">
-          <View route={route} />
+          <View route={effectiveRoute} />
         </div>
       </div>
     </div>

@@ -37,7 +37,15 @@ const (
 	DefaultListenAddress = "127.0.0.1:8787"
 )
 
+type ServiceMode string
+
+const (
+	ServiceModeOrchestrator ServiceMode = "orchestrator"
+	ServiceModeRelay        ServiceMode = "relay"
+)
+
 type Configuration struct {
+	Mode                ServiceMode
 	ListenAddress       string
 	ListenExplicit      bool
 	AuthMode            string
@@ -60,6 +68,7 @@ type Configuration struct {
 }
 
 type ServiceOptions struct {
+	Mode                 ServiceMode
 	Store                *store.Store
 	Token                string
 	TailscaleVerifier    *tailscaleauth.Verifier
@@ -102,6 +111,7 @@ type replayWindow struct {
 
 type Service struct {
 	baseContext       context.Context
+	mode              ServiceMode
 	store             *store.Store
 	token             string
 	authMode          string
@@ -144,6 +154,13 @@ func NewService(options ServiceOptions) (*Service, error) {
 	if options.Store == nil {
 		return nil, errors.New("orchestrator store is required")
 	}
+	mode := options.Mode
+	if mode == "" {
+		mode = ServiceModeOrchestrator
+	}
+	if mode != ServiceModeOrchestrator && mode != ServiceModeRelay {
+		return nil, fmt.Errorf("unknown service mode %q", mode)
+	}
 	nowFunction := options.Now
 	if nowFunction == nil {
 		nowFunction = time.Now
@@ -168,21 +185,26 @@ func NewService(options ServiceOptions) (*Service, error) {
 	if nodeUpdateTimeout <= 0 {
 		nodeUpdateTimeout = defaultNodeUpdateTimeout
 	}
-	releaseClient := options.ReleaseClient
-	if releaseClient == nil {
-		createdClient, clientErr := selfupdate.NewReleaseClient(selfupdate.ReleaseClientOptions{})
-		if clientErr != nil {
-			return nil, clientErr
+	var releaseClient *selfupdate.ReleaseClient
+	var updateCache *selfupdate.BundleCache
+	if mode == ServiceModeOrchestrator {
+		releaseClient = options.ReleaseClient
+		if releaseClient == nil {
+			createdClient, clientErr := selfupdate.NewReleaseClient(selfupdate.ReleaseClientOptions{})
+			if clientErr != nil {
+				return nil, clientErr
+			}
+			releaseClient = createdClient
 		}
-		releaseClient = createdClient
-	}
-	cacheDirectory := strings.TrimSpace(options.UpdateCacheDirectory)
-	if cacheDirectory == "" {
-		cacheDirectory = filepath.Join(options.Store.DataDirectory(), "updates")
-	}
-	updateCache, cacheErr := selfupdate.NewBundleCache(cacheDirectory)
-	if cacheErr != nil {
-		return nil, cacheErr
+		cacheDirectory := strings.TrimSpace(options.UpdateCacheDirectory)
+		if cacheDirectory == "" {
+			cacheDirectory = filepath.Join(options.Store.DataDirectory(), "updates")
+		}
+		var cacheErr error
+		updateCache, cacheErr = selfupdate.NewBundleCache(cacheDirectory)
+		if cacheErr != nil {
+			return nil, cacheErr
+		}
 	}
 
 	authMode := tailscaleauth.AuthModeToken
@@ -196,6 +218,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 
 	service := &Service{
 		baseContext:       context.Background(),
+		mode:              mode,
 		store:             options.Store,
 		token:             options.Token,
 		authMode:          authMode,
@@ -220,7 +243,7 @@ func NewService(options ServiceOptions) (*Service, error) {
 	}
 	service.mcpHandler, service.closeMCP = service.newMCPHTTPHandler()
 
-	if len(options.ProjectProfiles) > 0 {
+	if mode == ServiceModeOrchestrator && len(options.ProjectProfiles) > 0 {
 		_, err := service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
 			for _, profile := range options.ProjectProfiles {
 				state.ProjectProfiles[profile.ID] = profile
@@ -234,11 +257,13 @@ func NewService(options ServiceOptions) (*Service, error) {
 
 	_, _ = service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
 		nowText := service.nowUTC()
-		for nodeID, node := range state.Nodes {
-			if node.Status != "offline" {
-				node.Status = "offline"
-				node.LastSeen = nowText
-				state.Nodes[nodeID] = node
+		if mode == ServiceModeOrchestrator {
+			for nodeID, node := range state.Nodes {
+				if node.Status != "offline" {
+					node.Status = "offline"
+					node.LastSeen = nowText
+					state.Nodes[nodeID] = node
+				}
 			}
 		}
 		for mailboxID, mailbox := range state.Mailboxes {
@@ -255,15 +280,17 @@ func NewService(options ServiceOptions) (*Service, error) {
 	service.baseContext = backgroundContext
 	service.backgroundCancel = cancelBackground
 
-	service.backgroundGroup.Go(func() {
-		service.runSchedulerLoop(backgroundContext)
-	})
-	service.backgroundGroup.Go(func() {
-		service.runDoorbellLoop(backgroundContext)
-	})
-	service.backgroundGroup.Go(func() {
-		service.runSweepLoop(backgroundContext)
-	})
+	if mode == ServiceModeOrchestrator {
+		service.backgroundGroup.Go(func() {
+			service.runSchedulerLoop(backgroundContext)
+		})
+		service.backgroundGroup.Go(func() {
+			service.runDoorbellLoop(backgroundContext)
+		})
+		service.backgroundGroup.Go(func() {
+			service.runSweepLoop(backgroundContext)
+		})
+	}
 
 	return service, nil
 }
@@ -333,28 +360,31 @@ func (service *Service) isReplayHarnessEvent(runID string, sequence int64, diges
 func (service *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", service.handleHealth)
-	mux.HandleFunc("/control-agent", service.handleControlAgentUpgrade)
 	mux.HandleFunc("/orchestrator-client", service.handleOrchestratorClientUpgrade)
 	mux.Handle("/mcp", service.requireBearerHandler(service.mcpHandler))
-	mux.HandleFunc("/api/status", service.requireBearer(service.handleAPIStatus))
-	mux.HandleFunc("/api/nodes", service.requireBearer(service.handleAPINodes))
-	mux.HandleFunc("/api/nodes/repositories/refresh", service.requireBearer(service.handleAPINodesRefresh))
-	mux.HandleFunc("/api/nodes/repositories/clone", service.requireBearer(service.handleAPINodesClone))
-	mux.HandleFunc("/api/nodes/update", service.requireBearer(service.handleAPINodesUpdate))
-	mux.HandleFunc("/api/updates/bundles/", service.requireBearer(service.handleAPIUpdateBundle))
-	mux.HandleFunc("/api/threads", service.requireBearer(service.handleAPIThreads))
-	mux.HandleFunc("/api/threads/", service.requireBearer(service.handleAPIThreadSubroutes))
-	mux.HandleFunc("/api/runs/", service.requireBearer(service.handleAPIRunSubroutes))
-	mux.HandleFunc("/api/tasks/", service.requireBearer(service.handleAPITaskSubroutes))
-	mux.HandleFunc("/api/cancel/", service.requireBearer(service.handleAPICancelTarget))
-	mux.HandleFunc("/api/approvals", service.requireBearer(service.handleAPIApprovals))
-	mux.HandleFunc("/api/approvals/", service.requireBearer(service.handleAPIApprovalSubroutes))
-	mux.HandleFunc("/api/artifacts/", service.handleAPIArtifactSubroutes)
-	mux.HandleFunc("/api/workspace-leases", service.requireBearer(service.handleAPIWorkspaceLeases))
-	mux.HandleFunc("/api/workspace-leases/", service.requireBearer(service.handleAPIWorkspaceLeaseSubroutes))
 	mux.HandleFunc("/api/mail/agents", service.requireBearer(service.handleAPIMailAgents))
 	mux.HandleFunc("/api/mail/messages", service.requireBearer(service.handleAPIMailMessages))
 	mux.HandleFunc("/api/mail/rename", service.requireBearer(service.handleAPIMailRename))
+	mux.HandleFunc("/api/mail/traffic", service.requireBearer(service.handleAPIMailTraffic))
+	if service.mode == ServiceModeOrchestrator {
+		mux.HandleFunc("/control-agent", service.handleControlAgentUpgrade)
+		mux.HandleFunc("/api/status", service.requireBearer(service.handleAPIStatus))
+		mux.HandleFunc("/api/nodes", service.requireBearer(service.handleAPINodes))
+		mux.HandleFunc("/api/nodes/repositories/refresh", service.requireBearer(service.handleAPINodesRefresh))
+		mux.HandleFunc("/api/nodes/repositories/clone", service.requireBearer(service.handleAPINodesClone))
+		mux.HandleFunc("/api/nodes/update", service.requireBearer(service.handleAPINodesUpdate))
+		mux.HandleFunc("/api/updates/bundles/", service.requireBearer(service.handleAPIUpdateBundle))
+		mux.HandleFunc("/api/threads", service.requireBearer(service.handleAPIThreads))
+		mux.HandleFunc("/api/threads/", service.requireBearer(service.handleAPIThreadSubroutes))
+		mux.HandleFunc("/api/runs/", service.requireBearer(service.handleAPIRunSubroutes))
+		mux.HandleFunc("/api/tasks/", service.requireBearer(service.handleAPITaskSubroutes))
+		mux.HandleFunc("/api/cancel/", service.requireBearer(service.handleAPICancelTarget))
+		mux.HandleFunc("/api/approvals", service.requireBearer(service.handleAPIApprovals))
+		mux.HandleFunc("/api/approvals/", service.requireBearer(service.handleAPIApprovalSubroutes))
+		mux.HandleFunc("/api/artifacts/", service.handleAPIArtifactSubroutes)
+		mux.HandleFunc("/api/workspace-leases", service.requireBearer(service.handleAPIWorkspaceLeases))
+		mux.HandleFunc("/api/workspace-leases/", service.requireBearer(service.handleAPIWorkspaceLeaseSubroutes))
+	}
 	// The operator console is a static shell with no cluster data; it falls back
 	// to "/" so it only serves paths not claimed by the API or WebSocket routes.
 	mux.Handle("/", webui.Handler())
@@ -446,9 +476,14 @@ func (service *Service) handleHealth(writer http.ResponseWriter, request *http.R
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	serviceName := "orchestra-master"
+	if service.mode == ServiceModeRelay {
+		serviceName = "orchestra-relay"
+	}
 	writeJSONResponse(writer, http.StatusOK, map[string]any{
 		"ok":              true,
-		"service":         "orchestra-master",
+		"service":         serviceName,
+		"mode":            service.mode,
 		"version":         protocol.EffectiveBuildVersion(),
 		"protocolVersion": protocol.ProtocolVersion,
 		"hostName":        service.hostName,
@@ -564,7 +599,7 @@ func (service *Service) serveOrchestratorClientConnection(requestContext context
 		ClientID:        clientID,
 		SessionID:       sessionID,
 		Mailbox:         mailboxPointer,
-		Scopes:          slices.Clone(protocol.OrchestratorToolNames),
+		Scopes:          service.toolNames(),
 		At:              service.nowUTC(),
 	}); err != nil {
 		return
@@ -1081,6 +1116,31 @@ func (service *Service) handleAPIMailAgents(writer http.ResponseWriter, request 
 	writeJSONResponse(writer, http.StatusOK, result)
 }
 
+func (service *Service) handleAPIMailTraffic(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	limit := 0
+	if rawLimit := strings.TrimSpace(request.URL.Query().Get("limit")); rawLimit != "" {
+		parsedLimit, err := strconv.Atoi(rawLimit)
+		if err != nil {
+			writeOperationError(writer, invalidRequest("limit must be an integer"))
+			return
+		}
+		limit = parsedLimit
+	}
+	result, err := service.ListMailTraffic(ListMailTrafficInput{
+		Address: request.URL.Query().Get("address"),
+		Limit:   limit,
+	})
+	if err != nil {
+		writeOperationError(writer, err)
+		return
+	}
+	writeJSONResponse(writer, http.StatusOK, result)
+}
+
 func (service *Service) handleAPIMailMessages(writer http.ResponseWriter, request *http.Request) {
 	operatorCaller := CallerIdentity{Kind: "operator", OperatorID: "cli"}
 	switch request.Method {
@@ -1270,6 +1330,7 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	flagSet.SetOutput(io.Discard)
 
 	var configuration Configuration
+	configuration.Mode = ServiceModeOrchestrator
 	var authModeRaw string
 	var workerName string
 	var workerID string
@@ -1402,6 +1463,60 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	return configuration, nil
 }
 
+func ParseRelayConfiguration(arguments []string, lookupEnvironment func(string) (string, bool)) (Configuration, error) {
+	configuration, err := ParseConfiguration(arguments, lookupEnvironment)
+	if err != nil {
+		return Configuration{}, err
+	}
+	for _, disallowed := range []string{
+		"project-profiles",
+		"with-local-worker",
+		"worker-name",
+		"worker-id",
+		"worker-concurrency",
+		"worker-instance-capacity",
+		"workspace-root",
+		"worker-label",
+		"approval-policy",
+		"acp-adapter",
+		"claude-acp-auth-mode",
+	} {
+		if commandLineHasFlag(arguments, disallowed) {
+			return Configuration{}, fmt.Errorf("--%s is unavailable in relay mode", disallowed)
+		}
+	}
+	if configuration.WithLocalWorker {
+		return Configuration{}, errors.New("embedded workers are unavailable in relay mode")
+	}
+	if strings.TrimSpace(configuration.ProjectProfilePath) != "" {
+		return Configuration{}, errors.New("project profiles are unavailable in relay mode")
+	}
+	dataDirectoryExplicit := commandLineHasFlag(arguments, "data-dir")
+	if lookupEnvironment == nil {
+		lookupEnvironment = os.LookupEnv
+	}
+	if firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_DATA_DIR", "ORCHESTRA_DATA_ROOT") != "" {
+		dataDirectoryExplicit = true
+	}
+	if !dataDirectoryExplicit {
+		configuration.DataDirectory = filepath.Join(setup.DefaultDataRoot(), "relay")
+	}
+	configuration.Mode = ServiceModeRelay
+	configuration.WithLocalWorker = false
+	configuration.LocalWorker = slave.Configuration{}
+	return configuration, nil
+}
+
+func commandLineHasFlag(arguments []string, name string) bool {
+	prefix := "--" + name
+	for _, argument := range arguments {
+		if argument == prefix || strings.HasPrefix(argument, prefix+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 type RunningMaster struct {
 	Service            *Service
 	Store              *store.Store
@@ -1418,6 +1533,22 @@ type RunningMaster struct {
 }
 
 func StartMaster(operationContext context.Context, configuration Configuration) (*RunningMaster, error) {
+	configuration.Mode = ServiceModeOrchestrator
+	return startRuntime(operationContext, configuration)
+}
+
+func StartRelay(operationContext context.Context, configuration Configuration) (*RunningMaster, error) {
+	if configuration.WithLocalWorker {
+		return nil, errors.New("embedded workers are unavailable in relay mode")
+	}
+	if strings.TrimSpace(configuration.ProjectProfilePath) != "" {
+		return nil, errors.New("project profiles are unavailable in relay mode")
+	}
+	configuration.Mode = ServiceModeRelay
+	return startRuntime(operationContext, configuration)
+}
+
+func startRuntime(operationContext context.Context, configuration Configuration) (*RunningMaster, error) {
 	authMode, authErr := tailscaleauth.ParseAuthMode(configuration.AuthMode)
 	if authErr != nil {
 		return nil, authErr
@@ -1492,6 +1623,7 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 	}
 
 	service, err := NewService(ServiceOptions{
+		Mode:              configuration.Mode,
 		Store:             openedStore,
 		Token:             configuration.Token,
 		TailscaleVerifier: verifier,
@@ -1570,7 +1702,7 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 
 	workerContext, cancelWorker := context.WithCancel(operationContext)
 	workerDone := make(chan struct{})
-	if configuration.WithLocalWorker {
+	if configuration.Mode == ServiceModeOrchestrator && configuration.WithLocalWorker {
 		localConfig := configuration.LocalWorker
 		localConfig.ControlEndpoint = localDialURL
 		localConfig.Token = configuration.Token
@@ -1616,7 +1748,11 @@ func StartMaster(operationContext context.Context, configuration Configuration) 
 	var shutdownErr error
 	shutdownFunction := func(shutdownContext context.Context) error {
 		shutdownOnce.Do(func() {
-			service.logger.Info("master", "shutting down")
+			component := "master"
+			if configuration.Mode == ServiceModeRelay {
+				component = "relay"
+			}
+			service.logger.Info(component, "shutting down")
 			cancelWorker()
 			<-workerDone
 			cancelServerBase()

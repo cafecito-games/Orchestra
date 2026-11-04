@@ -100,6 +100,7 @@ export interface StatusResponse {
 export interface Health {
   ok: boolean;
   service: string;
+  mode: "orchestrator" | "relay";
   version: string;
   protocolVersion: string;
   hostName: string;
@@ -285,6 +286,11 @@ export interface ListMailboxesResult {
 
 export interface ReadMailResult {
   mailbox: AgentMailbox;
+  messages: MailMessage[];
+  hasMore: boolean;
+}
+
+export interface ListMailTrafficResult {
   messages: MailMessage[];
   hasMore: boolean;
 }

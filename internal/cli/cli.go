@@ -53,6 +53,8 @@ func Run(
 		return runVersion(remaining, standardOutput, standardError)
 	case "master":
 		return runMaster(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
+	case "relay":
+		return runRelay(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "slave":
 		return runSlave(operationContext, remaining, standardInput, standardOutput, standardError, lookupEnvironment)
 	case "mcp":
@@ -97,6 +99,7 @@ func printTopLevelUsage(output io.Writer) {
 
 Runtime Modes:
   master      Start the Orchestra control-plane server (HTTP, WebSocket, SQLite, Streamable HTTP MCP)
+  relay       Start a communication-only server for durable Agent Mail between independently run agents
   slave       Start an Orchestra remote worker daemon connecting to a master
   mcp         Run the stdio MCP bridge or configure local harnesses (install, uninstall, status)
   acp-bridge  Run a built-in stdio Agent Client Protocol bridge (antigravity)
@@ -219,6 +222,94 @@ func runMaster(
 		return 1
 	}
 	return 0
+}
+
+func runRelay(
+	operationContext context.Context,
+	arguments []string,
+	standardOutput io.Writer,
+	standardError io.Writer,
+	lookupEnvironment func(string) (string, bool),
+) int {
+	if hasHelpFlag(arguments) {
+		printRelayUsage(standardOutput)
+		return 0
+	}
+	configuration, err := orchestrator.ParseRelayConfiguration(arguments, lookupEnvironment)
+	if err != nil {
+		fmt.Fprintf(standardError, "orchestra relay: %v\n", err)
+		return 2
+	}
+	logger := activitylog.New(activitylog.Options{
+		Writer:            standardError,
+		Level:             configuration.LogLevel,
+		Format:            configuration.LogFormat,
+		Redactor:          protocol.NewRedactor(configuration.Token),
+		LookupEnvironment: lookupEnvironment,
+	})
+	configuration.Logger = logger
+
+	running, err := orchestrator.StartRelay(operationContext, configuration)
+	if err != nil {
+		fmt.Fprintf(standardError, "orchestra relay: %v\n", err)
+		return 1
+	}
+	logger = logger.WithSecrets(running.Token)
+	logger.Info(
+		"relay",
+		fmt.Sprintf("orchestra relay %s listening", protocol.EffectiveBuildVersion()),
+		activitylog.String("listen", running.Address),
+		activitylog.String("endpoint", running.BaseURL),
+		activitylog.String("auth", running.AuthMode),
+	)
+	if running.AuthMode == tailscaleauth.AuthModeTailscale {
+		nodeLabel := running.TailscaleSelf.DNSName
+		if nodeLabel == "" {
+			nodeLabel = running.TailscaleSelf.HostName
+		}
+		logger.Info(
+			"auth",
+			"tailscale peer identity verification enabled",
+			activitylog.String("node", nodeLabel),
+			activitylog.String("owner", running.TailscaleSelf.LoginName),
+			activitylog.String("tailnet", running.TailscaleSelf.MagicDNSSuffix),
+		)
+	}
+	if running.TokenGenerated {
+		logger.Info("auth", "generated persistent bearer token", activitylog.String("file", running.TokenPath))
+	}
+	if running.ConnectionFilePath != "" {
+		logger.Info("config", "wrote local discovery state", activitylog.String("file", running.ConnectionFilePath))
+	}
+	if waitErr := running.Wait(); waitErr != nil && !errors.Is(waitErr, context.Canceled) {
+		logger.Error("relay", "stopped with error", activitylog.String("error", waitErr.Error()))
+		return 1
+	}
+	return 0
+}
+
+func printRelayUsage(output io.Writer) {
+	fmt.Fprintf(output, `Usage: orchestra relay [flags]
+
+Starts a durable, communication-only Agent Mail relay. Independently run agents
+connect through orchestra mcp; no workers, tasks, scheduler, or process lifecycle
+management are enabled.
+
+Flags:
+  --listen string                HTTP/WebSocket listen address (default 127.0.0.1:8787, or <tailscale-ip>:8787 with --auth tailscale)
+  --auth string                  Authentication mode: token or tailscale (default token)
+  --token string                 Bearer token (auto-generated in <data-dir>/token in token mode)
+  --tailscale-allow-user value   Allowed Tailscale user login (repeatable)
+  --tailscale-allow-tag value    Allowed Tailscale ACL tag (repeatable)
+  --tailscale-binary string      Explicit path to tailscale CLI binary
+  --data-dir string              SQLite mail storage directory (default Orchestra data root/relay)
+  --connection-file string       Local discovery state file written on startup
+  --tls-cert string              TLS certificate PEM path
+  --tls-key string               TLS private key PEM path
+  --verbose                      Enable debug operational logs
+  --log-level string             Operational log level: debug, info, warn, error, quiet
+  --log-format string            Operational log format: text or json
+`)
 }
 
 func printMasterUsage(output io.Writer) {

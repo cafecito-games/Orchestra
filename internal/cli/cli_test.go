@@ -67,6 +67,13 @@ func TestCLIVersionAndHelp(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
+	exitCode = cli.Run(t.Context(), []string{"relay", "--help"}, nil, &stdout, &stderr, nil)
+	assert.Equal(t, 0, exitCode)
+	assert.Contains(t, stdout.String(), "communication-only Agent Mail relay")
+	assert.NotContains(t, stdout.String(), "--workspace-root")
+
+	stdout.Reset()
+	stderr.Reset()
 	exitCode = cli.Run(t.Context(), []string{"slave", "--workspace-root", t.TempDir(), "--require-acp", "--acp-native-fallback", "claude-cli"}, nil, &stdout, &stderr, nil)
 	assert.Equal(t, 2, exitCode)
 	assert.Contains(t, stderr.String(), "--require-acp cannot be combined with --acp-native-fallback")

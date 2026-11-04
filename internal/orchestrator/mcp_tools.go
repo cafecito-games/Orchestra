@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -317,6 +318,41 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 	}
 }
 
+func RelayToolDefinitions() []MCPToolDefinition {
+	definitions := OrchestratorToolDefinitions()
+	filtered := make([]MCPToolDefinition, 0, len(protocol.RelayToolNames))
+	for _, definition := range definitions {
+		if !protocol.IsRelayToolName(definition.Name) {
+			continue
+		}
+		if definition.Name == "list_mailboxes" {
+			definition.Description = "List peer agent mailboxes connected to this communication relay."
+		}
+		if definition.Name == "send_mail" {
+			definition.Description = "Send durable mail to another agent by <handle>@<host>, notifying it immediately when connected."
+			if properties, ok := definition.InputSchema["properties"].(map[string]any); ok {
+				delete(properties, "artifactIds")
+			}
+		}
+		filtered = append(filtered, definition)
+	}
+	return filtered
+}
+
+func (service *Service) toolDefinitions() []MCPToolDefinition {
+	if service.mode == ServiceModeRelay {
+		return RelayToolDefinitions()
+	}
+	return OrchestratorToolDefinitions()
+}
+
+func (service *Service) toolNames() []string {
+	if service.mode == ServiceModeRelay {
+		return slices.Clone(protocol.RelayToolNames)
+	}
+	return slices.Clone(protocol.OrchestratorToolNames)
+}
+
 func (service *Service) newMCPHTTPHandler() (http.Handler, func()) {
 	protocolServer := mcp.NewServer(
 		&mcp.Implementation{Name: "orchestra", Version: protocol.EffectiveBuildVersion()},
@@ -355,7 +391,7 @@ func (service *Service) newMCPHTTPHandler() (http.Handler, func()) {
 			return result, err
 		}
 	})
-	for _, definition := range OrchestratorToolDefinitions() {
+	for _, definition := range service.toolDefinitions() {
 		protocolServer.AddTool(&mcp.Tool{
 			Name:        definition.Name,
 			Description: definition.Description,
@@ -457,6 +493,9 @@ func (service *Service) ExecuteOrchestratorTool(
 ) (json.RawMessage, error) {
 	if caller.Kind == "" {
 		caller.Kind = "orchestrator-client"
+	}
+	if service.mode == ServiceModeRelay && !protocol.IsRelayToolName(toolName) {
+		return nil, forbiddenError(fmt.Sprintf("tool %q is unavailable in relay mode", toolName))
 	}
 
 	var responseValue any

@@ -75,6 +75,17 @@ var OrchestratorToolNames = []string{
 	"wait_for_mail",
 }
 
+// RelayToolNames are the communication-only tools exposed by an Orchestra relay.
+// Relays do not schedule work or manage agent process lifecycles.
+var RelayToolNames = []string{
+	"get_mail_identity",
+	"set_mail_identity",
+	"list_mailboxes",
+	"send_mail",
+	"read_mail",
+	"wait_for_mail",
+}
+
 func IsHubToolName(name string) bool {
 	return slices.Contains(HubToolNames, name)
 }
@@ -85,6 +96,10 @@ func IsDelegationHubToolName(name string) bool {
 
 func IsOrchestratorToolName(name string) bool {
 	return slices.Contains(OrchestratorToolNames, name)
+}
+
+func IsRelayToolName(name string) bool {
+	return slices.Contains(RelayToolNames, name)
 }
 
 // Control-plane messages sent from a slave node to the master `/control-agent` endpoint.

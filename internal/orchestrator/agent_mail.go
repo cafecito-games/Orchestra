@@ -66,6 +66,16 @@ type ReadMailResult struct {
 	HasMore  bool                   `json:"hasMore"`
 }
 
+type ListMailTrafficInput struct {
+	Address string
+	Limit   int
+}
+
+type ListMailTrafficResult struct {
+	Messages []protocol.MailMessage `json:"messages"`
+	HasMore  bool                   `json:"hasMore"`
+}
+
 type WaitForMailInput struct {
 	TimeoutMilliseconds int   `json:"timeoutMilliseconds,omitempty"`
 	WaitMilliseconds    int   `json:"waitMs,omitempty"`
@@ -607,6 +617,52 @@ func (service *Service) ReadMail(
 		return nil
 	})
 	return result, err
+}
+
+func (service *Service) ListMailTraffic(input ListMailTrafficInput) (ListMailTrafficResult, error) {
+	limit := input.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > protocol.MaximumMailReadLimit {
+		limit = protocol.MaximumMailReadLimit
+	}
+
+	address := strings.TrimSpace(input.Address)
+	var messages []protocol.MailMessage
+	err := service.store.Read(func(state *store.State) error {
+		if address != "" {
+			resolved, found := resolveMailboxInState(state, address)
+			if !found {
+				return notFound(fmt.Sprintf("mailbox %q does not exist", address))
+			}
+			address = resolved.Address
+		}
+		for _, message := range state.MailMessages {
+			if address != "" && message.FromAddress != address && message.ToAddress != address {
+				continue
+			}
+			messages = append(messages, message)
+		}
+		return nil
+	})
+	if err != nil {
+		return ListMailTrafficResult{}, err
+	}
+	slices.SortFunc(messages, func(left, right protocol.MailMessage) int {
+		if left.CreatedAt != right.CreatedAt {
+			return strings.Compare(right.CreatedAt, left.CreatedAt)
+		}
+		return strings.Compare(right.ID, left.ID)
+	})
+	hasMore := len(messages) > limit
+	if hasMore {
+		messages = messages[:limit]
+	}
+	if messages == nil {
+		messages = []protocol.MailMessage{}
+	}
+	return ListMailTrafficResult{Messages: messages, HasMore: hasMore}, nil
 }
 
 func (service *Service) WaitForMail(

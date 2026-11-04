@@ -89,7 +89,7 @@ export function CapacityBar({ used, total, tone }: { used: number; total: number
   const pct = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
   return (
     <div className={`bar ${tone ?? ""}`} style={{ width: 72 }}>
-      <span style={{ width: `${pct}%` }} />
+      <span style={{ transform: `scaleX(${pct / 100})` }} />
     </div>
   );
 }

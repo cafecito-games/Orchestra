@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,6 +165,10 @@ type Bridge struct {
 
 	mcpConnectionMutex sync.RWMutex
 	mcpConnection      mcp.Connection
+	toolMutex          sync.Mutex
+	protocolServer     *mcp.Server
+	toolScopes         []string
+	toolScopesKnown    bool
 
 	connectionMutex  sync.Mutex
 	connection       *websocket.Conn
@@ -393,35 +398,92 @@ func (bridge *Bridge) newProtocolServer() *mcp.Server {
 			return next(operationContext, method, request)
 		}
 	})
-	for _, definition := range orchestrator.OrchestratorToolDefinitions() {
-		protocolServer.AddTool(&mcp.Tool{
-			Name:        definition.Name,
-			Description: definition.Description,
-			InputSchema: definition.InputSchema,
-		}, func(operationContext context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			resultBytes, rpcErr := bridge.invokeTool(operationContext, definition.Name, request.Params.Arguments)
-			if rpcErr != nil {
-				errorText, _ := json.Marshal(rpcErr)
-				return &mcp.CallToolResult{
-					Content: []mcp.Content{&mcp.TextContent{Text: string(errorText)}},
-					IsError: true,
-				}, nil
-			}
-			var structured any
-			if err := json.Unmarshal(resultBytes, &structured); err != nil {
-				errorText, _ := json.Marshal(&protocol.HubRPCError{Code: "internal_error", Message: "malformed tool result"})
-				return &mcp.CallToolResult{
-					Content: []mcp.Content{&mcp.TextContent{Text: string(errorText)}},
-					IsError: true,
-				}, nil
-			}
-			return &mcp.CallToolResult{
-				Content:           []mcp.Content{&mcp.TextContent{Text: string(resultBytes)}},
-				StructuredContent: structured,
-			}, nil
-		})
+	bridge.toolMutex.Lock()
+	bridge.protocolServer = protocolServer
+	definitions := orchestrator.OrchestratorToolDefinitions()
+	if bridge.toolScopesKnown {
+		definitions = toolDefinitionsForScopes(bridge.toolScopes)
 	}
+	for _, definition := range definitions {
+		bridge.addTool(protocolServer, definition)
+	}
+	bridge.toolMutex.Unlock()
 	return protocolServer
+}
+
+func (bridge *Bridge) addTool(protocolServer *mcp.Server, definition orchestrator.MCPToolDefinition) {
+	protocolServer.AddTool(&mcp.Tool{
+		Name:        definition.Name,
+		Description: definition.Description,
+		InputSchema: definition.InputSchema,
+	}, func(operationContext context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		resultBytes, rpcErr := bridge.invokeTool(operationContext, definition.Name, request.Params.Arguments)
+		if rpcErr != nil {
+			errorText, _ := json.Marshal(rpcErr)
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: string(errorText)}},
+				IsError: true,
+			}, nil
+		}
+		var structured any
+		if err := json.Unmarshal(resultBytes, &structured); err != nil {
+			errorText, _ := json.Marshal(&protocol.HubRPCError{Code: "internal_error", Message: "malformed tool result"})
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{&mcp.TextContent{Text: string(errorText)}},
+				IsError: true,
+			}, nil
+		}
+		return &mcp.CallToolResult{
+			Content:           []mcp.Content{&mcp.TextContent{Text: string(resultBytes)}},
+			StructuredContent: structured,
+		}, nil
+	})
+}
+
+func toolDefinitionsForScopes(scopes []string) []orchestrator.MCPToolDefinition {
+	if len(scopes) == len(protocol.RelayToolNames) {
+		relayOnly := true
+		for _, scope := range scopes {
+			if !protocol.IsRelayToolName(scope) {
+				relayOnly = false
+				break
+			}
+		}
+		if relayOnly {
+			return orchestrator.RelayToolDefinitions()
+		}
+	}
+	allowed := make(map[string]bool, len(scopes))
+	for _, scope := range scopes {
+		allowed[scope] = true
+	}
+	all := orchestrator.OrchestratorToolDefinitions()
+	filtered := make([]orchestrator.MCPToolDefinition, 0, len(scopes))
+	for _, definition := range all {
+		if allowed[definition.Name] {
+			filtered = append(filtered, definition)
+		}
+	}
+	return filtered
+}
+
+func (bridge *Bridge) applyToolScopes(scopes []string) {
+	// Older masters did not populate welcome scopes; retain the historical full
+	// catalog when connecting across that compatibility boundary.
+	if len(scopes) == 0 {
+		return
+	}
+	bridge.toolMutex.Lock()
+	defer bridge.toolMutex.Unlock()
+	bridge.toolScopes = slices.Clone(scopes)
+	bridge.toolScopesKnown = true
+	if bridge.protocolServer == nil {
+		return
+	}
+	bridge.protocolServer.RemoveTools(protocol.OrchestratorToolNames...)
+	for _, definition := range toolDefinitionsForScopes(scopes) {
+		bridge.addTool(bridge.protocolServer, definition)
+	}
 }
 
 func (bridge *Bridge) invokeTool(
@@ -749,6 +811,7 @@ func (bridge *Bridge) runSingleWebSocketSession(operationContext context.Context
 	if welcome.Mailbox != nil {
 		bridge.storeMailbox(*welcome.Mailbox)
 	}
+	bridge.applyToolScopes(welcome.Scopes)
 
 	bridge.connectionMutex.Lock()
 	bridge.connection = connection
