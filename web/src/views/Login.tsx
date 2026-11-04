@@ -9,6 +9,7 @@ export function Login({ health }: { health: Health | null }) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const tailscale = health?.authMode === "tailscale";
+  const relay = health?.mode === "relay";
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -17,10 +18,10 @@ export function Login({ health }: { health: Health | null }) {
     setBusy(true);
     setError(null);
     try {
-      const response = await fetch("/api/status", {
+      const response = await fetch(relay ? "/api/mail/agents" : "/api/status", {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (response.status === 401) throw new Error("That token was rejected by the master.");
+      if (response.status === 401) throw new Error(`That token was rejected by the ${relay ? "relay" : "master"}.`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setToken(token);
     } catch (err) {
@@ -44,7 +45,7 @@ export function Login({ health }: { health: Health | null }) {
 
         {tailscale ? (
           <div className="login-error">
-            This master runs in Tailscale auth mode. The browser console requires token auth — restart
+            This {relay ? "relay" : "master"} runs in Tailscale auth mode. The browser console requires token auth — restart
             with <code>--auth token</code> to use it.
           </div>
         ) : (
@@ -67,7 +68,7 @@ export function Login({ health }: { health: Health | null }) {
             </button>
             <div className="login-hint">
               Find your token at <code>&lt;data-dir&gt;/token</code>, or pass <code>--token</code> when
-              starting <code>orchestra master</code>. The token is held in this tab only.
+              starting <code>orchestra {relay ? "relay" : "master"}</code>. The token is held in this tab only.
             </div>
           </form>
         )}

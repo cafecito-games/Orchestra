@@ -76,6 +76,11 @@ tasks:
     cmds:
       - CGO_ENABLED=0 go run ./cmd/orchestra master {{.CLI_ARGS}}
 
+  run:relay:
+    desc: Run the communication-only Agent Mail relay from source; append flags after --
+    cmds:
+      - CGO_ENABLED=0 go run ./cmd/orchestra relay {{.CLI_ARGS}}
+
   run:slave:
     desc: Run orchestra slave from source; append flags after --
     cmds:

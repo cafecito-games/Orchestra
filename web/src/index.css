@@ -705,10 +705,12 @@ a {
 
 .bar > span {
   display: block;
+  width: 100%;
   height: 100%;
   border-radius: 3px;
   background: var(--accent);
-  transition: width 250ms ease;
+  transform-origin: left center;
+  transition: transform 250ms ease;
 }
 
 .bar.warn > span {
@@ -937,16 +939,26 @@ a {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 10px 12px;
-  border-left: 2px solid var(--border-strong);
+  padding: 12px 4px;
+}
+
+.msg + .msg {
+  border-top: 1px solid var(--border);
 }
 
 .msg-head {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   font-size: 11px;
   color: var(--text-3);
+}
+
+.msg-subject {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
 }
 
 .msg-unread {
@@ -959,7 +971,9 @@ a {
 
 .msg-body {
   font-size: 13px;
+  line-height: 1.5;
   color: var(--text);
+  max-width: 75ch;
   white-space: pre-wrap;
   word-break: break-word;
 }

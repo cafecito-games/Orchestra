@@ -165,6 +165,23 @@ Orchestra gives agents four ways to collaborate, ranging from structured batch e
 | **Resident Instances** | Stateful, multi-turn specialist sessions | Spawn a warm ACP session on a worker, delegate follow-up tasks to the same live context, and release it when finished. |
 | **Agent Mail (`handle@host`)** | Direct peer-to-peer messaging across machines and interactive sessions | Every MCP session and resident worker gets a `<handle>@<host>` mailbox (`auth-api@macbook`, `gpu-bench@linux-01`). Sending mail wakes idle agents immediately. |
 
+### Communication-Only Relay Mode
+
+Run `orchestra relay` when agents are launched independently and only need durable communication across machines. Relay mode provides Agent Mail identity, discovery, offline inboxes, live delivery, and the mail Web UI without starting a scheduler or exposing workers, tasks, approvals, workspaces, or process-lifecycle controls.
+
+```bash
+# On an always-reachable machine in the tailnet:
+orchestra relay --listen "$(tailscale ip -4):8787"
+
+# In each independently run agent's MCP configuration:
+ORCHESTRA_TOKEN=<relay-token> orchestra mcp \
+  --endpoint http://relay-host:8787 \
+  --name backend \
+  --host laptop-a
+```
+
+The relay Web UI is served at the relay root URL. Paste the generated `<data-dir>/token` into its login screen; browser access intentionally requires token auth rather than `--auth tailscale`. Its Mail view shows the latest traffic across every registered mailbox in one chronological feed, and inspecting the feed does not mark recipient messages as read. A connected MCP session can be notified immediately, while a stopped agent process remains outside Orchestra's control and receives durable mail when it reconnects.
+
 ---
 
 ## Scaling to Multiple Machines
@@ -400,7 +417,7 @@ orchestra cancel <run-id|task-id>
 
 ### Operator Web Console
 
-`orchestra master` also serves a browser console at its root URL (e.g. `http://127.0.0.1:8787/`, or your master's endpoint). Open it, paste the master's bearer token on the login screen, and inspect the fleet visually: cluster metrics, worker nodes with their harnesses and capabilities, coordination threads and task DAGs, resident instances, and agent mail. You can also approve or reject pending permission requests and cancel active runs directly from the UI.
+`orchestra master` also serves a browser console at its root URL (e.g. `http://127.0.0.1:8787/`, or your master's endpoint). Open it, paste the master's bearer token on the login screen, and inspect the fleet visually: cluster metrics, worker nodes with their harnesses and capabilities, coordination threads and task DAGs, resident instances, and agent mail. You can also approve or reject pending permission requests and cancel active runs directly from the UI. `orchestra relay` serves the same console in a mail-focused mode with a global agent-traffic feed and mailbox directory.
 
 The console is a React single-page application (Vite + TypeScript) compiled to static assets that are embedded into the binary via `go:embed`, so it adds no runtime dependencies. The frontend source lives in `web/`, and its committed build output is embedded under `internal/webui/static`. After editing the frontend, regenerate it with `task web:build` (the `ci` pipeline runs this step too). The console shell is unauthenticated markup with no cluster data; everything it shows is served through the existing bearer-authenticated REST API.
 
