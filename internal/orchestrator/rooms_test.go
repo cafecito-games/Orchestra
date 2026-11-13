@@ -1167,3 +1167,221 @@ func TestRoomSubChannelsSubscriptionFilteringAndMainMentionRefusal(t *testing.T)
 	require.NoError(t, err)
 	require.Len(t, wildcardRead.Messages, 3)
 }
+
+func TestRoomSubChannelNonRunReadsAndCursorPreservation(t *testing.T) {
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	service, err := NewService(ServiceOptions{
+		Store: openedStore,
+		Token: "master-secret-token",
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	coordinatorCaller := CallerIdentity{Kind: "orchestrator-client", ClientID: "coord-1", SessionID: "sess-1"}
+	thread, _, err := service.CreateThread(coordinatorCaller, CreateThreadInput{
+		Title:  "Subchannel non-run and cursor preservation",
+		Attach: true,
+	})
+	require.NoError(t, err)
+
+	submitted, err := service.SubmitTasks(coordinatorCaller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "cursor-subchannels",
+		Tasks: []SubmittedTaskSpec{
+			{ClientTaskID: "qa-worker", Title: "QA Worker", Instructions: "Verify"},
+			{ClientTaskID: "author-worker", Title: "Author Worker", Instructions: "Author"},
+		},
+	})
+	require.NoError(t, err)
+	qaTaskID := submitted.ClientTaskMap["qa-worker"]
+	authorTaskID := submitted.ClientTaskMap["author-worker"]
+
+	nowText := service.nowUTC()
+	_, err = openedStore.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		state.Instances["inst-qa"] = protocol.AgentInstance{
+			ID:           "inst-qa",
+			ThreadID:     thread.ID,
+			RoomChannels: []string{"verification"},
+			Status:       "busy",
+			CreatedAt:    nowText,
+			UpdatedAt:    nowText,
+			Lease:        protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+		}
+		state.Instances["inst-author"] = protocol.AgentInstance{
+			ID:        "inst-author",
+			ThreadID:  thread.ID,
+			Status:    "busy",
+			CreatedAt: nowText,
+			UpdatedAt: nowText,
+			Lease:     protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+		}
+		state.Runs["run-qa"] = protocol.Run{
+			ID: "run-qa", ThreadID: thread.ID, InstanceID: "inst-qa", NodeID: "node-1",
+			Status: "running", CreatedAt: nowText, TaskID: &qaTaskID,
+		}
+		state.Runs["run-author"] = protocol.Run{
+			ID: "run-author", ThreadID: thread.ID, InstanceID: "inst-author", NodeID: "node-1",
+			Status: "running", CreatedAt: nowText, TaskID: &authorTaskID,
+		}
+		qaTask := state.Tasks[qaTaskID]
+		qaTask.Status = "running"
+		state.Tasks[qaTaskID] = qaTask
+
+		authorTask := state.Tasks[authorTaskID]
+		authorTask.Status = "running"
+		state.Tasks[authorTaskID] = authorTask
+		return nil
+	})
+	require.NoError(t, err)
+
+	qaCaller := CallerIdentity{Kind: "run", RunID: "run-qa", TaskID: qaTaskID, ThreadID: thread.ID, InstanceID: "inst-qa"}
+	authorCaller := CallerIdentity{Kind: "run", RunID: "run-author", TaskID: authorTaskID, ThreadID: thread.ID, InstanceID: "inst-author"}
+
+	// Post #1 on "verification", #2 on "main" (nudging qaTaskID), and #3 on "telemetry" (from worker, unread by coordinator).
+	wakeDisabled := false
+	_, err = service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "post-verif-1",
+		Channel:        "verification",
+		Kind:           "finding",
+		Body:           "Regression suite output ready",
+		Wake:           &wakeDisabled,
+	})
+	require.NoError(t, err)
+
+	_, err = service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "post-main-2",
+		Channel:        "main",
+		Kind:           "contract",
+		Body:           "Updated API contract on main",
+		NudgeTaskIDs:   []string{qaTaskID},
+		Wake:           &wakeDisabled,
+	})
+	require.NoError(t, err)
+
+	_, err = service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "post-telemetry-3",
+		Channel:        "telemetry",
+		Kind:           "finding",
+		Body:           "Benchmark p95 = 2.1ms",
+		Wake:           &wakeDisabled,
+	})
+	require.NoError(t, err)
+
+	// 1. Operator GET /api/threads/{id}/room (default Channel: "") returns all messages across all sub-channels.
+	httpServer := httptest.NewServer(service.Handler())
+	defer httpServer.Close()
+
+	getRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+"/api/threads/"+thread.ID+"/room", nil)
+	require.NoError(t, err)
+	getRequest.Header.Set("Authorization", "Bearer master-secret-token")
+	getResponse, err := http.DefaultClient.Do(getRequest)
+	require.NoError(t, err)
+	defer getResponse.Body.Close()
+	require.Equal(t, http.StatusOK, getResponse.StatusCode)
+
+	var roomHTTPPayload ReadRoomResult
+	require.NoError(t, json.NewDecoder(getResponse.Body).Decode(&roomHTTPPayload))
+	require.Len(t, roomHTTPPayload.Messages, 3)
+	assert.Equal(t, "verification", roomHTTPPayload.Messages[0].Channel)
+	assert.Equal(t, "main", roomHTTPPayload.Messages[1].Channel)
+	assert.Equal(t, "telemetry", roomHTTPPayload.Messages[2].Channel)
+
+	// 2. Subscribed instance ("inst-qa" with RoomChannels: ["verification"]) reading explicit Channel: "main" or Kinds-filtered
+	// preserves instance.LastReadRoomSequence == 0 so unread #1 on "verification" is not skipped, while clearing task nudge.
+	qaMainOnlyRead, err := service.ReadRoom(qaCaller, ReadRoomInput{Channel: "main"})
+	require.NoError(t, err)
+	require.Len(t, qaMainOnlyRead.Messages, 1)
+	assert.Equal(t, int64(2), qaMainOnlyRead.Messages[0].Sequence)
+	assert.False(t, qaMainOnlyRead.UnreadNudge)
+	assert.Equal(t, int64(3), qaMainOnlyRead.LastReadSequence)
+
+	require.NoError(t, openedStore.Read(func(state *store.State) error {
+		assert.Equal(t, int64(0), state.Instances["inst-qa"].LastReadRoomSequence)
+		assert.Equal(t, int64(3), state.Tasks[qaTaskID].LastReadRoomSequence)
+		return nil
+	}))
+
+	qaKindsFilteredRead, err := service.ReadRoom(qaCaller, ReadRoomInput{Kinds: []string{"contract"}})
+	require.NoError(t, err)
+	require.Len(t, qaKindsFilteredRead.Messages, 1)
+	assert.Equal(t, int64(2), qaKindsFilteredRead.Messages[0].Sequence)
+	require.NoError(t, openedStore.Read(func(state *store.State) error {
+		assert.Equal(t, int64(0), state.Instances["inst-qa"].LastReadRoomSequence)
+		return nil
+	}))
+
+	// Default ReadRoom (Channel: "", no Kinds filter) on qaCaller reads "verification" (#1) + "main" (#2) and advances instance cursor.
+	qaSubscribedRead, err := service.ReadRoom(qaCaller, ReadRoomInput{})
+	require.NoError(t, err)
+	require.Len(t, qaSubscribedRead.Messages, 2)
+	assert.Equal(t, int64(1), qaSubscribedRead.Messages[0].Sequence)
+	assert.Equal(t, int64(2), qaSubscribedRead.Messages[1].Sequence)
+	require.NoError(t, openedStore.Read(func(state *store.State) error {
+		assert.Equal(t, int64(3), state.Instances["inst-qa"].LastReadRoomSequence)
+		return nil
+	}))
+
+	// 3. Coordinator explicit single-channel read (Channel: "main") does not advance attachment cursor past unread sub-channels,
+	// whereas default ReadRoom (Channel: "") returns all sub-channels and advances attachment cursor cleanly.
+	coordMainOnlyRead, err := service.ReadRoom(coordinatorCaller, ReadRoomInput{
+		ThreadID: thread.ID,
+		Channel:  "main",
+	})
+	require.NoError(t, err)
+	require.Len(t, coordMainOnlyRead.Messages, 1)
+	assert.Equal(t, int64(2), coordMainOnlyRead.Messages[0].Sequence)
+	assert.Equal(t, int64(0), coordMainOnlyRead.LastReadSequence)
+
+	// Settle runs/tasks to verify unread_by_coordinator is still detected before coordinator reads all channels, and cleared after.
+	_, err = openedStore.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		for _, instanceID := range []string{"inst-qa", "inst-author"} {
+			instance := state.Instances[instanceID]
+			instance.Status = "idle"
+			state.Instances[instanceID] = instance
+		}
+		for _, runID := range []string{"run-qa", "run-author"} {
+			run := state.Runs[runID]
+			run.Status = "completed"
+			state.Runs[runID] = run
+		}
+		for _, taskID := range []string{qaTaskID, authorTaskID} {
+			task := state.Tasks[taskID]
+			task.Status = "completed"
+			state.Tasks[taskID] = task
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	_, err = openedStore.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		attachment, attached := state.ActiveAttachmentForThread(thread.ID)
+		require.True(t, attached)
+		if events := state.ThreadEvents[thread.ID]; len(events) > 0 {
+			attachment.AcknowledgedSeq = events[len(events)-1].Sequence
+		}
+		state.Attachments[attachment.ID] = attachment
+		return nil
+	})
+	require.NoError(t, err)
+
+	detailBeforeDefaultRead, err := service.GetThreadDetail(thread.ID)
+	require.NoError(t, err)
+	require.NotNil(t, detailBeforeDefaultRead.Stall)
+	assert.True(t, detailBeforeDefaultRead.Stall.Stalled)
+	assert.Contains(t, detailBeforeDefaultRead.Stall.Reasons, "unread_by_coordinator")
+
+	coordDefaultRead, err := service.ReadRoom(coordinatorCaller, ReadRoomInput{ThreadID: thread.ID})
+	require.NoError(t, err)
+	require.Len(t, coordDefaultRead.Messages, 3)
+	assert.Equal(t, "verification", coordDefaultRead.Messages[0].Channel)
+	assert.Equal(t, "main", coordDefaultRead.Messages[1].Channel)
+	assert.Equal(t, "telemetry", coordDefaultRead.Messages[2].Channel)
+	assert.Equal(t, int64(3), coordDefaultRead.LastReadSequence)
+
+	detailAfterDefaultRead, err := service.GetThreadDetail(thread.ID)
+	require.NoError(t, err)
+	assert.Nil(t, detailAfterDefaultRead.Stall)
+}

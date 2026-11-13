@@ -151,7 +151,7 @@ func (service *Service) ReadRoom(caller CallerIdentity, input ReadRoomInput) (Re
 			if entry.Sequence <= input.AfterSequence {
 				continue
 			}
-			if !roomEntryMatchesReadChannel(entry, readChannel, callerSubscriptions) {
+			if !roomEntryMatchesReadChannel(entry, readChannel, caller.Kind, callerSubscriptions) {
 				throughSequence = entry.Sequence
 				continue
 			}
@@ -198,8 +198,17 @@ func (service *Service) ReadRoom(caller CallerIdentity, input ReadRoomInput) (Re
 			}
 			instanceID := resolveCallerInstanceID(state, caller)
 			if instance, instanceExists := state.Instances[instanceID]; instanceExists && instance.ThreadID == threadID {
-				skippedMain := !includesMain && hasMainRoomMessageBetween(allMessages, instance.LastReadRoomSequence, throughSequence)
-				if !skippedMain && input.AfterSequence <= instance.LastReadRoomSequence && throughSequence > instance.LastReadRoomSequence {
+				skippedSubscribed := readChannel != "" && readChannel != protocol.AllRoomChannels &&
+					hasOtherSubscribedChannelRoomMessageBetween(
+						allMessages,
+						readChannel,
+						instance.RoomChannels,
+						instance.LastReadRoomSequence,
+						throughSequence,
+					)
+				if !skippedSubscribed && len(input.Kinds) == 0 &&
+					input.AfterSequence <= instance.LastReadRoomSequence &&
+					throughSequence > instance.LastReadRoomSequence {
 					targetInstanceSequence = throughSequence
 					shouldAdvanceInstance = true
 				}
@@ -811,9 +820,13 @@ func resolveCallerInstanceID(state *store.State, caller CallerIdentity) string {
 func roomEntryMatchesReadChannel(
 	entry protocol.RoomMessage,
 	readChannel string,
+	callerKind string,
 	callerSubscriptions []string,
 ) bool {
 	if readChannel == protocol.AllRoomChannels {
+		return true
+	}
+	if readChannel == "" && callerKind != "run" {
 		return true
 	}
 	entryChannel := protocol.EffectiveRoomChannel(entry.Channel)
@@ -832,6 +845,28 @@ func hasMainRoomMessageBetween(messages []protocol.RoomMessage, afterSequence in
 			break
 		}
 		if protocol.EffectiveRoomChannel(entry.Channel) == protocol.DefaultRoomChannel {
+			return true
+		}
+	}
+	return false
+}
+
+func hasOtherSubscribedChannelRoomMessageBetween(
+	messages []protocol.RoomMessage,
+	selectedChannel string,
+	subscribedChannels []string,
+	afterSequence int64,
+	throughSequence int64,
+) bool {
+	for _, entry := range messages {
+		if entry.Sequence <= afterSequence {
+			continue
+		}
+		if entry.Sequence > throughSequence {
+			break
+		}
+		entryChannel := protocol.EffectiveRoomChannel(entry.Channel)
+		if entryChannel != selectedChannel && protocol.InstanceSubscribesToRoomChannel(subscribedChannels, entryChannel) {
 			return true
 		}
 	}
