@@ -476,6 +476,13 @@ func (client *Client) dispatchMasterMessage(message protocol.MasterControlMessag
 				client.leases.handleCleanupCommand(grantCopy, mode)
 			})
 		}
+	case "workspace.land":
+		if message.Land != nil {
+			requestCopy := *message.Land
+			client.waitGroup.Go(func() {
+				client.leases.handleLandCommand(requestCopy)
+			})
+		}
 	case "hub.rpc.response":
 		client.handleHubRPCResponse(message)
 	case "node.update":

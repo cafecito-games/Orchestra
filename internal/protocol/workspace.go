@@ -149,6 +149,8 @@ type WorkspaceLease struct {
 	RunID                string `json:"runId"`
 	NodeID               string `json:"nodeId"`
 	ProjectProfileID     string `json:"projectProfileId,omitempty"`
+	SourceLeaseID        string `json:"sourceLeaseId,omitempty"`
+	ReadOnly             bool   `json:"readOnly,omitempty"`
 	Policy               string `json:"policy"`
 	Cleanup              string `json:"cleanup"`
 	Repository           string `json:"repository,omitempty"`
@@ -161,6 +163,9 @@ type WorkspaceLease struct {
 	Status               string `json:"status"`
 	RetentionReason      string `json:"retentionReason,omitempty"`
 	Detail               string `json:"detail,omitempty"`
+	LandedBranch         string `json:"landedBranch,omitempty"`
+	LandedRevision       string `json:"landedRevision,omitempty"`
+	LandedAt             string `json:"landedAt,omitempty"`
 	CleanupRequestedAt   string `json:"cleanupRequestedAt,omitempty"`
 	CreatedAt            string `json:"createdAt"`
 	UpdatedAt            string `json:"updatedAt"`
@@ -169,6 +174,8 @@ type WorkspaceLease struct {
 func (lease WorkspaceLease) Grant() WorkspaceLeaseGrant {
 	return WorkspaceLeaseGrant{
 		ID:                   lease.ID,
+		SourceLeaseID:        lease.SourceLeaseID,
+		ReadOnly:             lease.ReadOnly,
 		Status:               lease.Status,
 		Policy:               lease.Policy,
 		Cleanup:              lease.Cleanup,
@@ -184,6 +191,8 @@ func (lease WorkspaceLease) Grant() WorkspaceLeaseGrant {
 
 type WorkspaceLeaseGrant struct {
 	ID                   string `json:"id"`
+	SourceLeaseID        string `json:"sourceLeaseId,omitempty"`
+	ReadOnly             bool   `json:"readOnly,omitempty"`
 	Status               string `json:"status"`
 	Policy               string `json:"policy"`
 	Cleanup              string `json:"cleanup"`
@@ -199,6 +208,12 @@ type WorkspaceLeaseGrant struct {
 func (grant WorkspaceLeaseGrant) Validate() error {
 	if !IsWorkspaceLeaseIdentity(grant.ID) {
 		return errors.New("workspace lease id is malformed")
+	}
+	if (grant.SourceLeaseID != "") != grant.ReadOnly {
+		return errors.New("workspace lease readOnly flag must match sourceLeaseId presence")
+	}
+	if grant.SourceLeaseID != "" && (!IsWorkspaceLeaseIdentity(grant.SourceLeaseID) || grant.SourceLeaseID == grant.ID) {
+		return errors.New("workspace lease sourceLeaseId is malformed")
 	}
 	if !slices.Contains(WorkspaceLeaseStatuses, grant.Status) {
 		return errors.New("workspace lease status is missing or unknown")
