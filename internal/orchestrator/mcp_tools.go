@@ -204,10 +204,15 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 		},
 		{
 			Name:        "spawn_instance",
-			Description: "Provision a resident agent instance on a capability-matched slave node.",
+			Description: "Provision one or more resident agent instances on capability-matched slave nodes, with optional mail handle, public room brief, sharded count, and warm fork context.",
 			InputSchema: objectSchema(map[string]any{
 				"threadId":           map[string]any{"type": "string"},
 				"idempotencyKey":     map[string]any{"type": "string"},
+				"handle":             map[string]any{"type": "string"},
+				"publicBrief":        map[string]any{"type": "boolean"},
+				"brief":              map[string]any{"type": "string"},
+				"count":              map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumSpawnInstanceCount},
+				"forkFromInstanceId": map[string]any{"type": "string"},
 				"purpose":            map[string]any{"type": "object"},
 				"delegation":         map[string]any{"type": "object"},
 				"requirements":       map[string]any{"type": "object"},
@@ -221,6 +226,15 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 			InputSchema: objectSchema(map[string]any{
 				"instanceId": map[string]any{"type": "string"},
 			}, []string{"instanceId"}),
+		},
+		{
+			Name:        "reconfigure_instance",
+			Description: "Switch an idle or ready resident agent instance's model in place while preserving its warm session, workspace, and Agent Mail identity.",
+			InputSchema: objectSchema(map[string]any{
+				"instanceId":     map[string]any{"type": "string"},
+				"idempotencyKey": map[string]any{"type": "string"},
+				"model":          map[string]any{"type": "string"},
+			}, []string{"instanceId", "idempotencyKey", "model"}),
 		},
 		{
 			Name:        "renew_instance",
@@ -313,6 +327,22 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 				"afterSequence":       map[string]any{"type": "integer", "minimum": 0},
 				"limit":               map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumMailReadLimit},
 				"markRead":            map[string]any{"type": "boolean"},
+			}, nil),
+		},
+		{
+			Name:        "wait_for_activity",
+			Description: "Block up to timeoutMilliseconds waiting for either new thread/room events or incoming Agent Mail, returning whichever arrives first.",
+			InputSchema: objectSchema(map[string]any{
+				"threadId":            map[string]any{"type": "string"},
+				"eventCursor":         map[string]any{"type": "string"},
+				"cursor":              map[string]any{"type": "string"},
+				"eventTypes":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"afterRoomSequence":   map[string]any{"type": "integer", "minimum": 0},
+				"afterMailSequence":   map[string]any{"type": "integer", "minimum": 0},
+				"unreadMailOnly":      map[string]any{"type": "boolean"},
+				"markMailRead":        map[string]any{"type": "boolean"},
+				"timeoutMilliseconds": map[string]any{"type": "integer", "minimum": 0, "maximum": protocol.MaximumWaitMilliseconds},
+				"limit":               map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumEventsPerWait},
 			}, nil),
 		},
 	}
@@ -651,6 +681,12 @@ func (service *Service) ExecuteOrchestratorTool(
 			return nil, decodeErr
 		}
 		responseValue, err = service.GetInstance(caller, input)
+	case "reconfigure_instance":
+		input, decodeErr := decodeToolArguments[ReconfigureInstanceInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.ReconfigureInstance(caller, input)
 	case "renew_instance":
 		input, decodeErr := decodeToolArguments[RenewInstanceInput](rawArguments)
 		if decodeErr != nil {
@@ -723,6 +759,12 @@ func (service *Service) ExecuteOrchestratorTool(
 			return nil, decodeErr
 		}
 		responseValue, err = service.WaitForMail(operationContext, caller, input)
+	case "wait_for_activity":
+		input, decodeErr := decodeToolArguments[WaitForActivityInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.WaitForActivity(operationContext, caller, input)
 	default:
 		return nil, invalidRequest(fmt.Sprintf("unknown orchestrator tool %q", toolName))
 	}

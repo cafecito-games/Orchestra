@@ -21,11 +21,13 @@ var HubToolNames = []string{
 	"send_mail",
 	"read_mail",
 	"wait_for_mail",
+	"wait_for_activity",
 	"get_execution_inventory",
 	"submit_tasks",
 	"delegate_task",
 	"spawn_instance",
 	"get_instance",
+	"reconfigure_instance",
 	"renew_instance",
 	"release_instance",
 }
@@ -37,6 +39,7 @@ var DelegationHubToolNames = []string{
 	"delegate_task",
 	"spawn_instance",
 	"get_instance",
+	"reconfigure_instance",
 	"renew_instance",
 	"release_instance",
 }
@@ -63,6 +66,7 @@ var OrchestratorToolNames = []string{
 	"post_artifact",
 	"spawn_instance",
 	"get_instance",
+	"reconfigure_instance",
 	"renew_instance",
 	"release_instance",
 	"list_approvals",
@@ -73,6 +77,7 @@ var OrchestratorToolNames = []string{
 	"send_mail",
 	"read_mail",
 	"wait_for_mail",
+	"wait_for_activity",
 }
 
 // RelayToolNames are the communication-only tools exposed by an Orchestra relay.
@@ -119,6 +124,7 @@ type SlaveControlMessage struct {
 	Chunk             *string                   `json:"chunk,omitempty"`
 	Output            *string                   `json:"output,omitempty"`
 	Error             *string                   `json:"error,omitempty"`
+	ErrorKind         string                    `json:"errorKind,omitempty"`
 	Reason            string                    `json:"reason,omitempty"`
 	ProviderSessionID string                    `json:"providerSessionId,omitempty"`
 	Transport         *RunTransportSelection    `json:"transport,omitempty"`
@@ -144,6 +150,7 @@ type MasterControlMessage struct {
 	LeaseID        string                    `json:"leaseId,omitempty"`
 	Status         string                    `json:"status,omitempty"`
 	Mode           string                    `json:"mode,omitempty"`
+	Model          string                    `json:"model,omitempty"`
 	InstanceID     string                    `json:"instanceId,omitempty"`
 	AllocationID   string                    `json:"allocationId,omitempty"`
 	Instance       *AgentInstance            `json:"instance,omitempty"`
@@ -247,6 +254,7 @@ type NodeDetail struct {
 	RepositoryReport  *NodeRepositoryReport     `json:"repositoryReport,omitempty"`
 	UpdateStatus      *NodeUpdateState          `json:"updateStatus,omitempty"`
 	ResidentInstances []string                  `json:"residentInstances,omitempty"`
+	OfferingCooldowns []OfferingCooldown        `json:"offeringCooldowns,omitempty"`
 }
 
 type ThreadDetailResponse struct {

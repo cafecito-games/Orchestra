@@ -9,11 +9,222 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
+
+const (
+	RateLimitedOfferingCooldownDuration    = 60 * time.Second
+	QuotaExhaustedOfferingCooldownDuration = 15 * time.Minute
+)
+
+type offeringCooldownKey struct {
+	nodeID    string
+	harnessID string
+	model     string
+}
+
+type offeringCooldownBook struct {
+	mutex   sync.Mutex
+	entries map[offeringCooldownKey]protocol.OfferingCooldown
+}
+
+var serviceOfferingCooldowns sync.Map
+
+func (service *Service) cooldownBook() *offeringCooldownBook {
+	if existing, found := serviceOfferingCooldowns.Load(service); found {
+		return existing.(*offeringCooldownBook)
+	}
+	created := &offeringCooldownBook{
+		entries: map[offeringCooldownKey]protocol.OfferingCooldown{},
+	}
+	actual, _ := serviceOfferingCooldowns.LoadOrStore(service, created)
+	return actual.(*offeringCooldownBook)
+}
+
+func cooldownDurationForErrorKind(errorKind string) time.Duration {
+	switch strings.TrimSpace(errorKind) {
+	case protocol.RunErrorKindQuotaExhausted:
+		return QuotaExhaustedOfferingCooldownDuration
+	case protocol.RunErrorKindRateLimited:
+		return RateLimitedOfferingCooldownDuration
+	default:
+		return 0
+	}
+}
+
+func normalizeOfferingModel(model string) string {
+	trimmed := strings.TrimSpace(model)
+	if trimmed == "" {
+		return "default"
+	}
+	return trimmed
+}
+
+func (service *Service) recordOfferingCooldown(cooldown protocol.OfferingCooldown) {
+	if cooldown.NodeID == "" || cooldown.HarnessID == "" || !protocol.IsQuotaOrRateLimitErrorKind(cooldown.ErrorKind) {
+		return
+	}
+	cooldown.Model = normalizeOfferingModel(cooldown.Model)
+	book := service.cooldownBook()
+	book.mutex.Lock()
+	book.entries[offeringCooldownKey{
+		nodeID:    cooldown.NodeID,
+		harnessID: cooldown.HarnessID,
+		model:     cooldown.Model,
+	}] = cooldown
+	book.mutex.Unlock()
+}
+
+func (service *Service) clearOfferingCooldown(nodeID, harnessID, model string) {
+	if nodeID == "" || harnessID == "" {
+		return
+	}
+	book := service.cooldownBook()
+	book.mutex.Lock()
+	delete(book.entries, offeringCooldownKey{
+		nodeID:    nodeID,
+		harnessID: harnessID,
+		model:     normalizeOfferingModel(model),
+	})
+	book.mutex.Unlock()
+}
+
+func (service *Service) activeOfferingCooldownsInState(
+	state *store.State,
+	filterNodeID string,
+	referenceTime time.Time,
+) []protocol.OfferingCooldown {
+	merged := map[offeringCooldownKey]protocol.OfferingCooldown{}
+
+	book := service.cooldownBook()
+	book.mutex.Lock()
+	for key, entry := range book.entries {
+		if !entry.IsActiveAt(referenceTime) {
+			delete(book.entries, key)
+			continue
+		}
+		if filterNodeID != "" && entry.NodeID != filterNodeID {
+			continue
+		}
+		merged[key] = entry
+	}
+	book.mutex.Unlock()
+
+	if state != nil {
+		latestCompletedAt := map[offeringCooldownKey]time.Time{}
+		for _, runRecord := range state.Runs {
+			if runRecord.Status != "completed" || runRecord.FinishedAt == nil {
+				continue
+			}
+			if filterNodeID != "" && runRecord.NodeID != filterNodeID {
+				continue
+			}
+			finishedTime, valid := protocol.ParseTimestamp(*runRecord.FinishedAt)
+			if !valid {
+				continue
+			}
+			key := offeringCooldownKey{
+				nodeID:    runRecord.NodeID,
+				harnessID: runRecord.HarnessID,
+				model:     normalizeOfferingModel(runRecord.Model),
+			}
+			if previous, exists := latestCompletedAt[key]; !exists || finishedTime.After(previous) {
+				latestCompletedAt[key] = finishedTime
+			}
+		}
+
+		for _, runRecord := range state.Runs {
+			if runRecord.Status != "failed" || !protocol.IsQuotaOrRateLimitErrorKind(runRecord.ErrorKind) || runRecord.FinishedAt == nil {
+				continue
+			}
+			if filterNodeID != "" && runRecord.NodeID != filterNodeID {
+				continue
+			}
+			occurredTime, valid := protocol.ParseTimestamp(*runRecord.FinishedAt)
+			if !valid {
+				continue
+			}
+			duration := cooldownDurationForErrorKind(runRecord.ErrorKind)
+			if duration <= 0 {
+				continue
+			}
+			expiresTime := occurredTime.Add(duration)
+			if !referenceTime.Before(expiresTime) {
+				continue
+			}
+			key := offeringCooldownKey{
+				nodeID:    runRecord.NodeID,
+				harnessID: runRecord.HarnessID,
+				model:     normalizeOfferingModel(runRecord.Model),
+			}
+			if completedTime, hasCompleted := latestCompletedAt[key]; hasCompleted && !completedTime.Before(occurredTime) {
+				continue
+			}
+			detail := ""
+			if runRecord.Error != nil {
+				detail = *runRecord.Error
+			}
+			candidate := protocol.OfferingCooldown{
+				NodeID:     runRecord.NodeID,
+				HarnessID:  runRecord.HarnessID,
+				Model:      key.model,
+				ErrorKind:  runRecord.ErrorKind,
+				Detail:     detail,
+				RunID:      runRecord.ID,
+				OccurredAt: *runRecord.FinishedAt,
+				ExpiresAt:  expiresTime.UTC().Format(time.RFC3339Nano),
+			}
+			existing, alreadyPresent := merged[key]
+			if !alreadyPresent {
+				merged[key] = candidate
+				continue
+			}
+			existingExpires, existingValid := protocol.ParseTimestamp(existing.ExpiresAt)
+			if !existingValid || expiresTime.After(existingExpires) {
+				merged[key] = candidate
+			}
+		}
+	}
+
+	cooldowns := make([]protocol.OfferingCooldown, 0, len(merged))
+	for _, entry := range merged {
+		cooldowns = append(cooldowns, entry)
+	}
+	slices.SortFunc(cooldowns, func(left, right protocol.OfferingCooldown) int {
+		if compared := cmp.Compare(left.NodeID, right.NodeID); compared != 0 {
+			return compared
+		}
+		if compared := cmp.Compare(left.HarnessID, right.HarnessID); compared != 0 {
+			return compared
+		}
+		return cmp.Compare(left.Model, right.Model)
+	})
+	return cooldowns
+}
+
+func isOfferingCooledDown(cooldowns []protocol.OfferingCooldown, nodeID, harnessID, model string) bool {
+	normalizedModel := normalizeOfferingModel(model)
+	for _, entry := range cooldowns {
+		if entry.NodeID == nodeID && entry.HarnessID == harnessID && entry.Model == normalizedModel {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyHarnessCooldown(cooldowns []protocol.OfferingCooldown, nodeID, harnessID string) bool {
+	for _, entry := range cooldowns {
+		if entry.NodeID == nodeID && entry.HarnessID == harnessID {
+			return true
+		}
+	}
+	return false
+}
 
 type matchedOffering struct {
 	node          protocol.ComputeNode
@@ -22,6 +233,7 @@ type matchedOffering struct {
 	transport     string
 	workspaceRoot string
 	workspacePath string
+	cooledDown    bool
 	preferenceHit int
 	activeRuns    int
 }
@@ -182,7 +394,9 @@ func (service *Service) scheduleReadyTasks() {
 			}
 			state.Instances[instanceID] = instance
 			state.Allocations[allocationID] = allocation
-			service.ensureInstanceMailboxInState(state, instance, allocation, nowText)
+			mailbox := service.ensureInstanceMailboxInState(state, instance, allocation, nowText)
+			instance.Handle = mailbox.Handle
+			state.Instances[instanceID] = instance
 			delivery := store.InstanceDelivery{
 				ID:           protocol.NewIdentifier("idlv"),
 				NodeID:       selection.node.ID,
@@ -268,11 +482,13 @@ func (service *Service) findReusableResident(
 		instance          protocol.AgentInstance
 		allocation        protocol.InstanceAllocation
 		preferredInstance bool
+		cooledDown        bool
 		hasBinding        bool
 		preferenceHit     int
 		activeRuns        int
 	}
 
+	activeCooldowns := service.activeOfferingCooldownsInState(state, "", service.now())
 	var candidates []candidate
 
 	for _, instance := range state.Instances {
@@ -345,10 +561,16 @@ func (service *Service) findReusableResident(
 			)
 		}
 
+		cooledDown := isOfferingCooledDown(activeCooldowns, allocation.NodeID, allocation.HarnessID, allocation.Model)
+		if cooledDown && instance.AutoManaged && task.PlacementInstanceID == "" {
+			continue
+		}
+
 		candidates = append(candidates, candidate{
 			instance:          instance,
 			allocation:        allocation,
 			preferredInstance: task.PreferredInstanceID != "" && instance.ID == task.PreferredInstanceID,
+			cooledDown:        cooledDown,
 			hasBinding:        hasBinding,
 			preferenceHit:     scorePreferences(node, report, allocation.HarnessID, allocation.Model, requirements.Preferences),
 			activeRuns:        activeRuns,
@@ -360,6 +582,12 @@ func (service *Service) findReusableResident(
 	}
 
 	slices.SortFunc(candidates, func(left, right candidate) int {
+		if task.PlacementInstanceID == "" && left.cooledDown != right.cooledDown {
+			if !left.cooledDown {
+				return -1
+			}
+			return 1
+		}
 		if left.preferredInstance != right.preferredInstance {
 			if left.preferredInstance {
 				return -1
@@ -573,7 +801,9 @@ func (service *Service) selectOfferingForRequirements(
 	requireInstanceSlot bool,
 ) (*matchedOffering, protocol.PlacementDiagnostic) {
 	effectiveRequirements := mergeProjectProfileRequirements(state, requirements)
-	nowText := service.nowUTC()
+	referenceTime := service.now()
+	nowText := referenceTime.UTC().Format(time.RFC3339Nano)
+	activeCooldowns := service.activeOfferingCooldownsInState(state, "", referenceTime)
 	diagnostic := protocol.PlacementDiagnostic{
 		EvaluatedAt:     nowText,
 		EligibleNodeIDs: []string{},
@@ -670,7 +900,7 @@ func (service *Service) selectOfferingForRequirements(
 				continue
 			}
 
-			selectedModel := chooseModel(harnessProfile, effectiveRequirements)
+			selectedModel, modelCooledDown := chooseModelForOffering(harnessProfile, effectiveRequirements, nodeID, activeCooldowns)
 			if selectedModel == "" && len(effectiveRequirements.Models) > 0 {
 				continue
 			}
@@ -688,6 +918,7 @@ func (service *Service) selectOfferingForRequirements(
 				transport:     selectedTransport,
 				workspaceRoot: workspaceRoot,
 				workspacePath: workspacePath,
+				cooledDown:    modelCooledDown,
 				preferenceHit: scorePreferences(node, report, harnessProfile.ID, selectedModel, effectiveRequirements.Preferences),
 				activeRuns:    activeRuns,
 			})
@@ -710,6 +941,12 @@ func (service *Service) selectOfferingForRequirements(
 	}
 
 	slices.SortFunc(offerings, func(left, right matchedOffering) int {
+		if left.cooledDown != right.cooledDown {
+			if !left.cooledDown {
+				return -1
+			}
+			return 1
+		}
 		if compared := cmp.Compare(right.preferenceHit, left.preferenceHit); compared != 0 {
 			return compared
 		}
@@ -1028,23 +1265,66 @@ func resolveWorkspaceOnNode(
 	)
 }
 
-func chooseModel(profile protocol.HarnessProfile, requirements protocol.ExecutionRequirements) string {
+func isHarnessModelSupported(profile protocol.HarnessProfile, requestedModel string) bool {
+	return len(profile.Models) == 0 || slices.Contains(profile.Models, requestedModel) || requestedModel == "default"
+}
+
+func chooseModelForOffering(
+	profile protocol.HarnessProfile,
+	requirements protocol.ExecutionRequirements,
+	nodeID string,
+	activeCooldowns []protocol.OfferingCooldown,
+) (string, bool) {
 	if len(requirements.Models) > 0 {
+		var firstCooledFallback string
 		for _, requestedModel := range requirements.Models {
-			if len(profile.Models) == 0 || slices.Contains(profile.Models, requestedModel) || requestedModel == "default" {
-				return requestedModel
+			if !isHarnessModelSupported(profile, requestedModel) {
+				continue
+			}
+			if !isOfferingCooledDown(activeCooldowns, nodeID, profile.ID, requestedModel) {
+				return requestedModel, false
+			}
+			if firstCooledFallback == "" {
+				firstCooledFallback = requestedModel
 			}
 		}
-		return ""
+		if firstCooledFallback != "" {
+			return firstCooledFallback, true
+		}
+		return "", false
 	}
+
 	if requirements.Preferences != nil {
 		for _, preferred := range requirements.Preferences.Models {
-			if slices.Contains(profile.Models, preferred) {
-				return preferred
+			if slices.Contains(profile.Models, preferred) && !isOfferingCooledDown(activeCooldowns, nodeID, profile.ID, preferred) {
+				return preferred, false
 			}
 		}
 	}
-	return "default"
+
+	if isOfferingCooledDown(activeCooldowns, nodeID, profile.ID, "default") || hasAnyHarnessCooldown(activeCooldowns, nodeID, profile.ID) {
+		for _, advertisedModel := range profile.Models {
+			if !isOfferingCooledDown(activeCooldowns, nodeID, profile.ID, advertisedModel) {
+				return advertisedModel, false
+			}
+		}
+		if len(profile.Models) == 0 && !isOfferingCooledDown(activeCooldowns, nodeID, profile.ID, "default") {
+			return "default", false
+		}
+		if requirements.Preferences != nil {
+			for _, preferred := range requirements.Preferences.Models {
+				if slices.Contains(profile.Models, preferred) {
+					return preferred, true
+				}
+			}
+		}
+		if len(profile.Models) > 0 {
+			return profile.Models[0], true
+		}
+		return "default", true
+	}
+
+	return "default", false
 }
 
 func chooseTransport(profile protocol.HarnessProfile, requirements protocol.ExecutionRequirements) string {

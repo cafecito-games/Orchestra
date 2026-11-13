@@ -454,6 +454,10 @@ func (client *Client) dispatchMasterMessage(message protocol.MasterControlMessag
 		client.waitGroup.Go(func() {
 			client.handleInstanceProvision(message.Instance, message.Allocation)
 		})
+	case protocol.InstanceReconfigureControlType:
+		client.waitGroup.Go(func() {
+			client.handleInstanceReconfigure(message)
+		})
 	case "instance.release":
 		client.waitGroup.Go(func() {
 			client.handleInstanceRelease(message.InstanceID, message.AllocationID, message.Mode)

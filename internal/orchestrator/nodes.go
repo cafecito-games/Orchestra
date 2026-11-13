@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/cafecito-games/Orchestra/internal/activitylog"
+	"github.com/cafecito-games/Orchestra/internal/harness"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/store"
 )
@@ -116,10 +117,11 @@ func (session *slaveSession) closePendingRequests() {
 }
 
 type ExecutionInventoryResponse struct {
-	ProtocolVersion string                    `json:"protocolVersion"`
-	GeneratedAt     string                    `json:"generatedAt"`
-	Nodes           []protocol.NodeDetail     `json:"nodes"`
-	ProjectProfiles []protocol.ProjectProfile `json:"projectProfiles"`
+	ProtocolVersion   string                      `json:"protocolVersion"`
+	GeneratedAt       string                      `json:"generatedAt"`
+	Nodes             []protocol.NodeDetail       `json:"nodes"`
+	ProjectProfiles   []protocol.ProjectProfile   `json:"projectProfiles"`
+	OfferingCooldowns []protocol.OfferingCooldown `json:"offeringCooldowns"`
 }
 
 func (service *Service) GetExecutionInventory() (ExecutionInventoryResponse, error) {
@@ -128,10 +130,13 @@ func (service *Service) GetExecutionInventory() (ExecutionInventoryResponse, err
 		return ExecutionInventoryResponse{}, err
 	}
 	var profiles []protocol.ProjectProfile
+	var offeringCooldowns []protocol.OfferingCooldown
+	referenceTime := service.now()
 	if readErr := service.store.Read(func(state *store.State) error {
 		for _, profile := range state.ProjectProfiles {
 			profiles = append(profiles, profile)
 		}
+		offeringCooldowns = service.activeOfferingCooldownsInState(state, "", referenceTime)
 		return nil
 	}); readErr != nil {
 		return ExecutionInventoryResponse{}, readErr
@@ -142,16 +147,21 @@ func (service *Service) GetExecutionInventory() (ExecutionInventoryResponse, err
 	if profiles == nil {
 		profiles = []protocol.ProjectProfile{}
 	}
+	if offeringCooldowns == nil {
+		offeringCooldowns = []protocol.OfferingCooldown{}
+	}
 	return ExecutionInventoryResponse{
-		ProtocolVersion: protocol.ProtocolVersion,
-		GeneratedAt:     service.nowUTC(),
-		Nodes:           nodes,
-		ProjectProfiles: profiles,
+		ProtocolVersion:   protocol.ProtocolVersion,
+		GeneratedAt:       referenceTime.UTC().Format(time.RFC3339Nano),
+		Nodes:             nodes,
+		ProjectProfiles:   profiles,
+		OfferingCooldowns: offeringCooldowns,
 	}, nil
 }
 
 func (service *Service) ListNodeDetails() ([]protocol.NodeDetail, error) {
 	var details []protocol.NodeDetail
+	referenceTime := service.now()
 	err := service.store.Read(func(state *store.State) error {
 		for _, nodeID := range sortedNodeIDs(state) {
 			node := state.Nodes[nodeID]
@@ -204,6 +214,8 @@ func (service *Service) ListNodeDetails() ([]protocol.NodeDetail, error) {
 			}
 			slices.Sort(residentIDs)
 
+			nodeCooldowns := service.activeOfferingCooldownsInState(state, nodeID, referenceTime)
+
 			details = append(details, protocol.NodeDetail{
 				Node:              node,
 				Connected:         connected,
@@ -212,6 +224,7 @@ func (service *Service) ListNodeDetails() ([]protocol.NodeDetail, error) {
 				ComponentReport:   componentReport,
 				RepositoryReport:  repositoryReport,
 				ResidentInstances: residentIDs,
+				OfferingCooldowns: nodeCooldowns,
 				UpdateStatus:      updateStatus,
 			})
 		}
@@ -520,14 +533,114 @@ func (service *Service) dispatchSlaveMessage(
 	case "approval.undeliverable":
 		service.handleApprovalUndeliverable(nodeID, message)
 	case "run.completed":
+		service.clearOfferingCooldownForRun(nodeID, message.RunID)
 		service.handleRunCompleted(nodeID, message)
 	case "run.failed":
+		service.recordRunFailureClassificationAndCooldown(nodeID, message)
 		service.handleRunFailed(nodeID, message, false)
 	case "run.cancelled":
 		service.handleRunCancelled(nodeID, message)
 	case "hub.rpc.request":
 		go service.handleHubRPCRequest(sessionContext, session, message)
 	}
+}
+
+func (service *Service) clearOfferingCooldownForRun(nodeID, runID string) {
+	if !protocol.IsIdentifier(runID) {
+		return
+	}
+	_ = service.store.Read(func(state *store.State) error {
+		runRecord, exists := state.Runs[runID]
+		if !exists || runRecord.NodeID != nodeID {
+			return nil
+		}
+		service.clearOfferingCooldown(nodeID, runRecord.HarnessID, runRecord.Model)
+		return nil
+	})
+}
+
+func (service *Service) recordRunFailureClassificationAndCooldown(nodeID string, message protocol.SlaveControlMessage) {
+	if !protocol.IsIdentifier(message.RunID) {
+		return
+	}
+	errorKind := strings.TrimSpace(message.ErrorKind)
+	if !protocol.IsQuotaOrRateLimitErrorKind(errorKind) && message.Error != nil && *message.Error != "" {
+		errorKind = harness.ClassifyDiagnostic(*message.Error)
+	}
+	if !protocol.IsQuotaOrRateLimitErrorKind(errorKind) {
+		return
+	}
+
+	cooldownDuration := cooldownDurationForErrorKind(errorKind)
+	if cooldownDuration <= 0 {
+		return
+	}
+
+	_, _ = service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		runRecord, exists := state.Runs[message.RunID]
+		if !exists || runRecord.NodeID != nodeID || protocol.IsTerminalRunStatus(runRecord.Status) {
+			return nil
+		}
+		referenceTime := service.now().UTC()
+		nowText := referenceTime.Format(time.RFC3339Nano)
+		expiresAtText := referenceTime.Add(cooldownDuration).Format(time.RFC3339Nano)
+
+		detail := ""
+		if message.Error != nil && *message.Error != "" {
+			detail = protocol.BoundedDiagnostic(service.redactor.Redact(*message.Error))
+		}
+
+		runRecord.ErrorKind = errorKind
+		state.Runs[runRecord.ID] = runRecord
+
+		normalizedModel := normalizeOfferingModel(runRecord.Model)
+		cooldown := protocol.OfferingCooldown{
+			NodeID:     nodeID,
+			HarnessID:  runRecord.HarnessID,
+			Model:      normalizedModel,
+			ErrorKind:  errorKind,
+			Detail:     detail,
+			RunID:      runRecord.ID,
+			OccurredAt: nowText,
+			ExpiresAt:  expiresAtText,
+		}
+		service.recordOfferingCooldown(cooldown)
+
+		taskID := ""
+		if runRecord.TaskID != nil {
+			taskID = *runRecord.TaskID
+		}
+		mutation.EmitEvent(protocol.TaskEventEntry{
+			ThreadID:   runRecord.ThreadID,
+			Type:       "run.offering_cooldown",
+			TaskID:     taskID,
+			RunID:      runRecord.ID,
+			InstanceID: runRecord.InstanceID,
+			Status:     errorKind,
+			Summary:    "offering " + runRecord.HarnessID + "/" + normalizedModel + " entered " + errorKind + " cooldown on node " + nodeID,
+			Detail: map[string]any{
+				"nodeId":    nodeID,
+				"harnessId": runRecord.HarnessID,
+				"model":     normalizedModel,
+				"errorKind": errorKind,
+				"expiresAt": expiresAtText,
+			},
+			OccurredAt: nowText,
+		})
+
+		mutation.OnCommit(func() {
+			service.logger.Warn(
+				"schedule",
+				"offering cooldown recorded",
+				activitylog.String("node", nodeID),
+				activitylog.String("harness", runRecord.HarnessID),
+				activitylog.String("model", normalizedModel),
+				activitylog.String("errorKind", errorKind),
+				activitylog.String("expiresAt", expiresAtText),
+			)
+		})
+		return nil
+	})
 }
 
 func (service *Service) handleNodeHeartbeat(nodeID string, message protocol.SlaveControlMessage) {

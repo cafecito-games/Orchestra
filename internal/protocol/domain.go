@@ -48,7 +48,7 @@ var (
 	OccupyingAllocationStatuses = []string{"reserved", "provisioning", "active"}
 	InstanceReleaseModes        = []string{"drain", "cancel"}
 	InstanceCreatorKinds        = []string{"operator", "run", "orchestrator-client"}
-	InstanceLifecycleOperations = []string{"create", "release", "renew"}
+	InstanceLifecycleOperations = []string{"create", "release", "renew", "reconfigure"}
 	TaskMessageKinds            = []string{"progress", "question", "guidance", "blocker", "result"}
 	RoomMessageKinds            = []string{"finding", "contract", "decision", "gotcha", "guidance", "question", "answer"}
 	RoomAuthorKinds             = []string{"task", "orchestrator", "operator"}
@@ -350,17 +350,19 @@ type InstanceExecutionRequirements struct {
 }
 
 type AgentInstance struct {
-	ID           string                        `json:"id"`
-	ThreadID     string                        `json:"threadId"`
-	Creator      InstanceCreator               `json:"creator"`
-	Purpose      *InstancePurpose              `json:"purpose,omitempty"`
-	Delegation   InstanceDelegationPolicy      `json:"delegation"`
-	Requirements InstanceExecutionRequirements `json:"requirements"`
-	Lease        InstanceLease                 `json:"lease"`
-	Status       string                        `json:"status"`
-	AutoManaged  bool                          `json:"autoManaged,omitempty"`
-	CreatedAt    string                        `json:"createdAt"`
-	UpdatedAt    string                        `json:"updatedAt"`
+	ID                 string                        `json:"id"`
+	ThreadID           string                        `json:"threadId"`
+	Handle             string                        `json:"handle,omitempty"`
+	ForkFromInstanceID string                        `json:"forkFromInstanceId,omitempty"`
+	Creator            InstanceCreator               `json:"creator"`
+	Purpose            *InstancePurpose              `json:"purpose,omitempty"`
+	Delegation         InstanceDelegationPolicy      `json:"delegation"`
+	Requirements       InstanceExecutionRequirements `json:"requirements"`
+	Lease              InstanceLease                 `json:"lease"`
+	Status             string                        `json:"status"`
+	AutoManaged        bool                          `json:"autoManaged,omitempty"`
+	CreatedAt          string                        `json:"createdAt"`
+	UpdatedAt          string                        `json:"updatedAt"`
 }
 
 type InstanceAllocation struct {
@@ -401,22 +403,29 @@ type InstanceLifecycleRequest struct {
 }
 
 type InstanceLifecycleResult struct {
-	Instance      AgentInstance       `json:"instance"`
-	Allocation    *InstanceAllocation `json:"allocation,omitempty"`
-	InitialTaskID *string             `json:"initialTaskId,omitempty"`
-	Replayed      bool                `json:"replayed"`
+	Instance          AgentInstance        `json:"instance"`
+	Allocation        *InstanceAllocation  `json:"allocation,omitempty"`
+	InitialTaskID     *string              `json:"initialTaskId,omitempty"`
+	Instances         []AgentInstance      `json:"instances,omitempty"`
+	Allocations       []InstanceAllocation `json:"allocations,omitempty"`
+	InitialTaskIDs    []string             `json:"initialTaskIds,omitempty"`
+	BriefRoomSequence *int64               `json:"briefRoomSequence,omitempty"`
+	Replayed          bool                 `json:"replayed"`
 }
 
 type InstanceLifecycleReceipt struct {
-	ID             string  `json:"id"`
-	ThreadID       string  `json:"threadId"`
-	SourceKey      string  `json:"sourceKey"`
-	IdempotencyKey string  `json:"idempotencyKey"`
-	Operation      string  `json:"operation"`
-	Digest         string  `json:"digest"`
-	InstanceID     string  `json:"instanceId"`
-	InitialTaskID  *string `json:"initialTaskId,omitempty"`
-	CreatedAt      string  `json:"createdAt"`
+	ID                string   `json:"id"`
+	ThreadID          string   `json:"threadId"`
+	SourceKey         string   `json:"sourceKey"`
+	IdempotencyKey    string   `json:"idempotencyKey"`
+	Operation         string   `json:"operation"`
+	Digest            string   `json:"digest"`
+	InstanceID        string   `json:"instanceId"`
+	InitialTaskID     *string  `json:"initialTaskId,omitempty"`
+	InstanceIDs       []string `json:"instanceIds,omitempty"`
+	InitialTaskIDs    []string `json:"initialTaskIds,omitempty"`
+	BriefRoomSequence *int64   `json:"briefRoomSequence,omitempty"`
+	CreatedAt         string   `json:"createdAt"`
 }
 
 type InstanceReleaseIntent struct {
@@ -440,6 +449,7 @@ type Run struct {
 	Status             string                 `json:"status"`
 	Output             string                 `json:"output"`
 	Error              *string                `json:"error,omitempty"`
+	ErrorKind          string                 `json:"errorKind,omitempty"`
 	Depth              int                    `json:"depth"`
 	ParentRunID        *string                `json:"parentRunId,omitempty"`
 	DispatchedAt       *string                `json:"dispatchedAt,omitempty"`

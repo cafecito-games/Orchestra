@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cafecito-games/Orchestra/internal/harness"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
 	"github.com/cafecito-games/Orchestra/internal/workspace"
 )
@@ -366,4 +367,204 @@ func TestLeaseCoordinator_CleanupHonorsDirtyRetainAndCleanDeletePolicies(t *test
 	require.NotNil(t, lastRetainMessage.Lease)
 	assert.Equal(t, "retained", lastRetainMessage.Lease.Status)
 	assert.Equal(t, "policy", lastRetainMessage.Lease.RetentionReason)
+}
+
+func TestClient_InstanceReconfigureInPlaceAndErrorKindReporting(t *testing.T) {
+	rawWorkspace := t.TempDir()
+	workspacePath, err := filepath.EvalSymlinks(rawWorkspace)
+	require.NoError(t, err)
+
+	binaryDirectory := t.TempDir()
+	fakeClaude := filepath.Join(binaryDirectory, "claude")
+	script := `#!/bin/sh
+model=""
+resume_id=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)
+      model="$2"
+      shift 2
+      ;;
+    --resume)
+      resume_id="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [ "$model" = "sonnet" ]; then
+  printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"result":"You have hit your usage limit"}'
+  exit 1
+fi
+printf '{"type":"assistant","session_id":"sess-warm-42","message":{"content":[{"type":"text","text":"model=%s resume=%s"}]}}\n' "$model" "$resume_id"
+printf '{"type":"result","session_id":"sess-warm-42","result":"model=%s resume=%s"}\n' "$model" "$resume_id"
+`
+	require.NoError(t, os.WriteFile(fakeClaude, []byte(script), 0o755))
+
+	runner := harness.NewRunner([]protocol.HarnessProfile{{
+		ID:          protocol.HarnessClaudeCLI,
+		Label:       "Claude Code",
+		Description: "2.1.231",
+		Binary:      fakeClaude,
+		Available:   true,
+		Models:      []string{"sonnet", "opus", "haiku"},
+		Transports:  []string{protocol.TransportNativeCLI},
+	}})
+
+	client := NewClient(ClientOptions{
+		Node: protocol.ComputeNode{
+			ID:             "worker-reconfig",
+			Concurrency:    2,
+			WorkspaceRoots: []string{workspacePath},
+		},
+		Runner: runner,
+	})
+	client.rootContext = t.Context()
+
+	instance := protocol.AgentInstance{
+		ID:       "instance-reconfig-1",
+		ThreadID: "thread-1",
+		Status:   "provisioning",
+	}
+	allocation := protocol.InstanceAllocation{
+		ID:         "alloc-reconfig-1",
+		InstanceID: instance.ID,
+		NodeID:     "worker-reconfig",
+		HarnessID:  protocol.HarnessClaudeCLI,
+		Model:      "sonnet",
+		Transport:  protocol.TransportNativeCLI,
+		Workspace:  workspacePath,
+		Status:     "provisioning",
+	}
+
+	client.handleInstanceProvision(&instance, &allocation)
+	client.mutex.Lock()
+	require.Contains(t, client.instances, instance.ID)
+	assert.Equal(t, "sonnet", client.instances[instance.ID].allocation.Model)
+	client.outbox = nil
+	client.mutex.Unlock()
+
+	// Unsupported model reconfigure is rejected without mutating the resident allocation.
+	client.handleInstanceReconfigure(protocol.MasterControlMessage{
+		Type:         protocol.InstanceReconfigureControlType,
+		InstanceID:   instance.ID,
+		AllocationID: allocation.ID,
+		Model:        "unsupported-model",
+	})
+	client.mutex.Lock()
+	assert.Equal(t, "sonnet", client.instances[instance.ID].allocation.Model)
+	client.mutex.Unlock()
+
+	// Run on sonnet fails with quota_exhausted ErrorKind on run.failed.
+	client.handleDispatch(protocol.MasterControlMessage{
+		Type: "dispatch",
+		Run: &protocol.Run{
+			ID:           "run-quota-fail",
+			ThreadID:     "thread-1",
+			InstanceID:   instance.ID,
+			AllocationID: allocation.ID,
+			NodeID:       "worker-reconfig",
+			HarnessID:    protocol.HarnessClaudeCLI,
+			Model:        "sonnet",
+			Transport:    protocol.TransportNativeCLI,
+			Workspace:    workspacePath,
+			Prompt:       "Trigger quota limit",
+		},
+	})
+	client.waitGroup.Wait()
+
+	client.mutex.Lock()
+	failedOutbox := append([]protocol.SlaveControlMessage(nil), client.outbox...)
+	client.outbox = nil
+	client.mutex.Unlock()
+
+	var quotaFailure *protocol.SlaveControlMessage
+	for index := range failedOutbox {
+		if failedOutbox[index].Type == "run.failed" && failedOutbox[index].RunID == "run-quota-fail" {
+			quotaFailure = &failedOutbox[index]
+			break
+		}
+	}
+	require.NotNil(t, quotaFailure)
+	assert.Equal(t, protocol.RunErrorKindQuotaExhausted, quotaFailure.ErrorKind)
+
+	// Reconfigure resident instance in place to opus while idle.
+	client.dispatchMasterMessage(protocol.MasterControlMessage{
+		Type:         protocol.InstanceReconfigureControlType,
+		InstanceID:   instance.ID,
+		AllocationID: allocation.ID,
+		Model:        "opus",
+	})
+	client.waitGroup.Wait()
+
+	client.mutex.Lock()
+	assert.Equal(t, "opus", client.instances[instance.ID].allocation.Model)
+	client.mutex.Unlock()
+
+	// Run on opus establishes warm session, then reconfigure to haiku preserves session resume!
+	client.handleDispatch(protocol.MasterControlMessage{
+		Type: "dispatch",
+		Run: &protocol.Run{
+			ID:           "run-opus-1",
+			ThreadID:     "thread-1",
+			InstanceID:   instance.ID,
+			AllocationID: allocation.ID,
+			NodeID:       "worker-reconfig",
+			HarnessID:    protocol.HarnessClaudeCLI,
+			Transport:    protocol.TransportNativeCLI,
+			Workspace:    workspacePath,
+			Prompt:       "Establish warm session",
+		},
+	})
+	client.waitGroup.Wait()
+
+	client.handleInstanceReconfigure(protocol.MasterControlMessage{
+		Type:         protocol.InstanceReconfigureControlType,
+		InstanceID:   instance.ID,
+		AllocationID: allocation.ID,
+		Model:        "haiku",
+	})
+
+	client.mutex.Lock()
+	client.outbox = nil
+	client.mutex.Unlock()
+
+	client.handleDispatch(protocol.MasterControlMessage{
+		Type: "dispatch",
+		Run: &protocol.Run{
+			ID:           "run-haiku-resume",
+			ThreadID:     "thread-1",
+			InstanceID:   instance.ID,
+			AllocationID: allocation.ID,
+			NodeID:       "worker-reconfig",
+			HarnessID:    protocol.HarnessClaudeCLI,
+			Transport:    protocol.TransportNativeCLI,
+			Workspace:    workspacePath,
+			Prompt:       "Continue warm session",
+		},
+		SessionBinding: &protocol.DispatchSessionBinding{
+			ID:                "binding-warm-42",
+			ProviderSessionID: "sess-warm-42",
+			Transport:         protocol.TransportNativeCLI,
+		},
+	})
+	client.waitGroup.Wait()
+
+	client.mutex.Lock()
+	resumedOutbox := append([]protocol.SlaveControlMessage(nil), client.outbox...)
+	client.mutex.Unlock()
+
+	var completedMessage *protocol.SlaveControlMessage
+	for index := range resumedOutbox {
+		if resumedOutbox[index].Type == "run.completed" && resumedOutbox[index].RunID == "run-haiku-resume" {
+			completedMessage = &resumedOutbox[index]
+			break
+		}
+	}
+	require.NotNil(t, completedMessage)
+	require.NotNil(t, completedMessage.Output)
+	assert.Equal(t, "model=haiku resume=sess-warm-42", *completedMessage.Output)
+	assert.Equal(t, "sess-warm-42", completedMessage.ProviderSessionID)
 }

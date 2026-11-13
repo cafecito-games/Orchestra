@@ -5,9 +5,9 @@ import "github.com/cafecito-games/Orchestra/internal/protocol"
 const instructions = "Use get_task_context for the durable thread, your task, its lineage, your mailbox cursor, and your room summary. " +
 	"Share thread-scoped findings, contracts, decisions, gotchas, questions, and answers on the blackboard with post_room_message and inspect sibling entries with read_room. " +
 	"When get_task_context or wait_for_task_events indicates an unread room nudge (or update_task returns unread_room_nudge), call read_room, reconcile your work if needed, and then finalize. " +
-	"Workers report with update_task, ask or answer through send_task_message, and wait for replies, nudges, or task changes with wait_for_task_events, passing back the cursor it returns. " +
+	"Workers report with update_task, ask or answer through send_task_message, and wait for replies, nudges, task changes, or incoming mail with wait_for_activity (or wait_for_task_events / wait_for_mail). " +
 	"Delegating instances inspect get_execution_inventory and submit parallel work with submit_tasks, describing capabilities rather than machines, " +
-	"and may spawn_instance, inspect it with get_instance, renew_instance while it is needed, and release_instance when it is done. " +
+	"and may spawn_instance (with optional handle, publicBrief/brief, count, and forkFromInstanceId), inspect it with get_instance, switch models in place with reconfigure_instance, renew_instance while it is needed, and release_instance when it is done. " +
 	"Refine or complete the thread with update_thread and post durable files with post_artifact. " +
 	"Peer agents across machines also participate in Orchestra Agent Mail (<handle>@<host>): inspect your address with get_mail_identity, rename your handle with set_mail_identity, discover peers with list_mailboxes, send or reply with send_mail, and inspect or await messages with read_mail and wait_for_mail. " +
 	"Every mutation takes a stable idempotency key: retry with the same key and arguments after a retryable error."
@@ -86,27 +86,30 @@ func leaseSchema() schema {
 }
 
 func safeInstanceSchema() schema {
-	return object(schema{
-		"id":           text(),
-		"threadId":     text(),
-		"purpose":      purposeSchema(false),
-		"delegation":   object(schema{"canDelegate": boolean()}, "canDelegate"),
-		"requirements": requirementsSchema(),
-		"lease":        leaseSchema(),
-		"status":       text(),
-		"createdAt":    text(),
-		"updatedAt":    text(),
+	return resultSchema(schema{
+		"id":                 text(),
+		"threadId":           text(),
+		"handle":             text(),
+		"forkFromInstanceId": text(),
+		"purpose":            purposeSchema(true),
+		"delegation":         resultSchema(schema{"canDelegate": boolean()}, "canDelegate"),
+		"requirements":       anyObject(),
+		"lease":              leaseSchema(),
+		"status":             text(),
+		"createdAt":          text(),
+		"updatedAt":          text(),
 	}, "id", "threadId", "delegation", "requirements", "lease", "status", "createdAt", "updatedAt")
 }
 
 func safeAllocationSchema() schema {
-	return object(schema{
+	return resultSchema(schema{
 		"id":         text(),
 		"instanceId": text(),
 		"nodeId":     text(),
 		"harnessId":  enum(protocol.HarnessIDs...),
 		"model":      text(),
 		"transport":  enum(protocol.HarnessTransports...),
+		"workspace":  text(),
 		"lease":      leaseSchema(),
 		"status":     text(),
 		"createdAt":  text(),
@@ -120,10 +123,14 @@ func instanceToolResultSchema(mutation bool) schema {
 		required = append(required, "replayed")
 	}
 	return resultSchema(schema{
-		"instance":      safeInstanceSchema(),
-		"allocation":    safeAllocationSchema(),
-		"initialTaskId": text(),
-		"replayed":      boolean(),
+		"instance":          safeInstanceSchema(),
+		"allocation":        safeAllocationSchema(),
+		"initialTaskId":     text(),
+		"instances":         list(safeInstanceSchema()),
+		"allocations":       list(safeAllocationSchema()),
+		"initialTaskIds":    list(text()),
+		"briefRoomSequence": integer(),
+		"replayed":          boolean(),
 	}, required...)
 }
 
@@ -211,23 +218,29 @@ var definitions = map[string]toolDefinition{
 	},
 	"get_execution_inventory": {
 		title:       "Get execution inventory",
-		description: "List compute nodes with harnesses, capacity, and worker-reported capabilities and their freshness, plus active instances, to write task requirements.",
+		description: "List compute nodes with harnesses, active offering cooldowns, capacity, and worker-reported capabilities and their freshness, plus active instances, to write task requirements.",
 		input:       object(schema{}),
 		output: resultSchema(schema{
-			"generatedAt": text(), "nodes": objects(), "instances": objects(), "truncated": anyObject(),
+			"generatedAt": text(), "nodes": objects(), "instances": objects(), "offeringCooldowns": objects(), "truncated": anyObject(),
 		}, "generatedAt", "nodes"),
 		readOnly: true,
 	},
 	"spawn_instance": {
 		title:       "Spawn instance",
-		description: "Request a non-delegating resident instance for this thread. Placement may remain pending; use one stable idempotency key for retries.",
+		description: "Request one or more non-delegating resident instances for this thread, optionally assigning mail handles, posting a public contract brief to the room, sharding count instances, or seeding warm context from forkFromInstanceId.",
 		input: object(schema{
+			"threadId":           text(),
 			"idempotencyKey":     text(),
+			"handle":             text(),
+			"publicBrief":        boolean(),
+			"brief":              text(),
+			"count":              schema{"type": "integer", "minimum": 1, "maximum": protocol.MaximumSpawnInstanceCount},
+			"forkFromInstanceId": text(),
 			"requirements":       requirementsSchema(),
 			"purpose":            purposeSchema(true),
 			"idleTimeoutSeconds": schema{"type": "integer", "minimum": protocol.MinimumInstanceIdleTimeoutSeconds, "maximum": protocol.MaximumInstanceIdleTimeoutSeconds},
 			"initialTask":        object(schema{"title": text(), "instructions": text()}, "title", "instructions"),
-		}, "idempotencyKey", "requirements"),
+		}, "idempotencyKey"),
 		output: instanceToolResultSchema(true),
 	},
 	"get_instance": {
@@ -236,6 +249,16 @@ var definitions = map[string]toolDefinition{
 		input:       object(schema{"instanceId": text()}, "instanceId"),
 		output:      instanceToolResultSchema(false),
 		readOnly:    true,
+	},
+	"reconfigure_instance": {
+		title:       "Reconfigure instance",
+		description: "Switch an idle or ready same-thread resident instance's model in place while preserving its warm session, workspace, and Agent Mail identity.",
+		input: object(schema{
+			"instanceId":     text(),
+			"idempotencyKey": text(),
+			"model":          text(),
+		}, "instanceId", "idempotencyKey", "model"),
+		output: instanceToolResultSchema(true),
 	},
 	"renew_instance": {
 		title:       "Renew instance",
@@ -377,6 +400,29 @@ var definitions = map[string]toolDefinition{
 			"markRead":            boolean(),
 		}),
 		output: resultSchema(schema{"mailbox": anyObject(), "messages": objects(), "timedOut": boolean()}, "mailbox", "messages", "timedOut"),
+	},
+	"wait_for_activity": {
+		title:       "Wait for activity",
+		description: "Wait up to timeoutMilliseconds for either new thread/room events or incoming Agent Mail, returning whichever arrives first.",
+		input: object(schema{
+			"threadId":            text(),
+			"eventCursor":         text(),
+			"cursor":              text(),
+			"eventTypes":          list(text()),
+			"afterRoomSequence":   schema{"type": "integer", "minimum": 0},
+			"afterMailSequence":   schema{"type": "integer", "minimum": 0},
+			"unreadMailOnly":      boolean(),
+			"markMailRead":        boolean(),
+			"timeoutMilliseconds": schema{"type": "integer", "minimum": 0, "maximum": protocol.MaximumWaitMilliseconds},
+			"limit":               schema{"type": "integer", "minimum": 1, "maximum": protocol.MaximumEventsPerWait},
+		}),
+		output: resultSchema(schema{
+			"threadId": text(), "wakeSources": list(text()),
+			"events": objects(), "eventCursor": text(), "cursorExpired": boolean(),
+			"roomMessages": objects(), "roomHeadSequence": integer(),
+			"mailbox": anyObject(), "mailMessages": objects(),
+			"timedOut": boolean(),
+		}, "wakeSources", "events", "roomMessages", "mailMessages", "timedOut"),
 	},
 }
 
