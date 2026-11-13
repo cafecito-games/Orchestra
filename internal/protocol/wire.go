@@ -262,6 +262,7 @@ type ThreadDetailResponse struct {
 	SessionBindings []HarnessSessionBinding `json:"sessionBindings"`
 	Messages        []TaskMessage           `json:"messages"`
 	Room            ThreadRoomHead          `json:"room"`
+	Stall           *ThreadStallReport      `json:"stall,omitempty"`
 	Activities      []RunActivity           `json:"activities"`
 	Transcripts     []RunTranscript         `json:"transcripts"`
 	EventStream     ThreadEventStream       `json:"eventStream"`
