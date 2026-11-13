@@ -146,17 +146,18 @@ type Thread struct {
 }
 
 type ThreadAttachment struct {
-	ID              string `json:"id"`
-	ThreadID        string `json:"threadId"`
-	ClientID        string `json:"clientId"`
-	SessionID       string `json:"sessionId"`
-	Status          string `json:"status"`
-	LastHeartbeatAt string `json:"lastHeartbeatAt"`
-	AcknowledgedSeq int64  `json:"acknowledgedSequence"`
-	LastDoorbellSeq int64  `json:"lastDoorbellSequence"`
-	CreatedAt       string `json:"createdAt"`
-	UpdatedAt       string `json:"updatedAt"`
-	DetachedReason  string `json:"detachedReason,omitempty"`
+	ID                   string `json:"id"`
+	ThreadID             string `json:"threadId"`
+	ClientID             string `json:"clientId"`
+	SessionID            string `json:"sessionId"`
+	Status               string `json:"status"`
+	LastHeartbeatAt      string `json:"lastHeartbeatAt"`
+	AcknowledgedSeq      int64  `json:"acknowledgedSequence"`
+	LastDoorbellSeq      int64  `json:"lastDoorbellSequence"`
+	LastReadRoomSequence int64  `json:"lastReadRoomSequence"`
+	CreatedAt            string `json:"createdAt"`
+	UpdatedAt            string `json:"updatedAt"`
+	DetachedReason       string `json:"detachedReason,omitempty"`
 }
 
 type TaskDependency struct {
@@ -172,12 +173,13 @@ type ExecutionPreferences struct {
 }
 
 type WorkspaceRequirements struct {
-	Repository string `json:"repository,omitempty"`
-	Path       string `json:"path,omitempty"`
-	Writable   bool   `json:"writable,omitempty"`
-	Isolation  string `json:"isolation,omitempty"`
-	Cleanup    string `json:"cleanup,omitempty"`
-	BaseBranch string `json:"baseBranch,omitempty"`
+	Repository    string `json:"repository,omitempty"`
+	Path          string `json:"path,omitempty"`
+	Writable      bool   `json:"writable,omitempty"`
+	Isolation     string `json:"isolation,omitempty"`
+	Cleanup       string `json:"cleanup,omitempty"`
+	BaseBranch    string `json:"baseBranch,omitempty"`
+	SourceLeaseID string `json:"sourceLeaseId,omitempty"`
 }
 
 type ExecutionRequirements struct {
@@ -350,19 +352,22 @@ type InstanceExecutionRequirements struct {
 }
 
 type AgentInstance struct {
-	ID                 string                        `json:"id"`
-	ThreadID           string                        `json:"threadId"`
-	Handle             string                        `json:"handle,omitempty"`
-	ForkFromInstanceID string                        `json:"forkFromInstanceId,omitempty"`
-	Creator            InstanceCreator               `json:"creator"`
-	Purpose            *InstancePurpose              `json:"purpose,omitempty"`
-	Delegation         InstanceDelegationPolicy      `json:"delegation"`
-	Requirements       InstanceExecutionRequirements `json:"requirements"`
-	Lease              InstanceLease                 `json:"lease"`
-	Status             string                        `json:"status"`
-	AutoManaged        bool                          `json:"autoManaged,omitempty"`
-	CreatedAt          string                        `json:"createdAt"`
-	UpdatedAt          string                        `json:"updatedAt"`
+	ID                   string                        `json:"id"`
+	ThreadID             string                        `json:"threadId"`
+	Handle               string                        `json:"handle,omitempty"`
+	ForkFromInstanceID   string                        `json:"forkFromInstanceId,omitempty"`
+	Creator              InstanceCreator               `json:"creator"`
+	Purpose              *InstancePurpose              `json:"purpose,omitempty"`
+	Delegation           InstanceDelegationPolicy      `json:"delegation"`
+	Requirements         InstanceExecutionRequirements `json:"requirements"`
+	RoomChannels         []string                      `json:"roomChannels,omitempty"`
+	LastReadRoomSequence int64                         `json:"lastReadRoomSequence"`
+	LastPostRoomSequence int64                         `json:"lastPostRoomSequence"`
+	Lease                InstanceLease                 `json:"lease"`
+	Status               string                        `json:"status"`
+	AutoManaged          bool                          `json:"autoManaged,omitempty"`
+	CreatedAt            string                        `json:"createdAt"`
+	UpdatedAt            string                        `json:"updatedAt"`
 }
 
 type InstanceAllocation struct {
@@ -533,6 +538,8 @@ type RoomAuthor struct {
 	Kind       string `json:"kind"`
 	TaskID     string `json:"taskId,omitempty"`
 	RunID      string `json:"runId,omitempty"`
+	InstanceID string `json:"instanceId,omitempty"`
+	Handle     string `json:"handle,omitempty"`
 	Title      string `json:"title,omitempty"`
 	ClientID   string `json:"clientId,omitempty"`
 	OperatorID string `json:"operatorId,omitempty"`
@@ -545,8 +552,10 @@ type RoomMessage struct {
 	CreatedAt          string     `json:"createdAt"`
 	Author             RoomAuthor `json:"author"`
 	Kind               string     `json:"kind"`
+	Channel            string     `json:"channel,omitempty"`
 	Topic              string     `json:"topic,omitempty"`
 	Body               string     `json:"body"`
+	Mentions           []string   `json:"mentions,omitempty"`
 	ReplyToSequence    *int64     `json:"replyToSequence,omitempty"`
 	SupersedesSequence *int64     `json:"supersedesSequence,omitempty"`
 	ArtifactIDs        []string   `json:"artifactIds,omitempty"`
@@ -568,14 +577,16 @@ type TaskRoomSummary struct {
 }
 
 type RoomMessageReceipt struct {
-	ID             string   `json:"id"`
-	ThreadID       string   `json:"threadId"`
-	SourceKey      string   `json:"sourceKey"`
-	IdempotencyKey string   `json:"idempotencyKey"`
-	Digest         string   `json:"digest"`
-	Sequence       int64    `json:"sequence"`
-	NudgedTaskIDs  []string `json:"nudgedTaskIds,omitempty"`
-	CreatedAt      string   `json:"createdAt"`
+	ID               string   `json:"id"`
+	ThreadID         string   `json:"threadId"`
+	SourceKey        string   `json:"sourceKey"`
+	IdempotencyKey   string   `json:"idempotencyKey"`
+	Digest           string   `json:"digest"`
+	Sequence         int64    `json:"sequence"`
+	NudgedTaskIDs    []string `json:"nudgedTaskIds,omitempty"`
+	WokenInstanceIDs []string `json:"wokenInstanceIds,omitempty"`
+	WakeTaskIDs      []string `json:"wakeTaskIds,omitempty"`
+	CreatedAt        string   `json:"createdAt"`
 }
 
 type RoomNudgeReceipt struct {

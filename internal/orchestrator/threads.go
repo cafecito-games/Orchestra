@@ -44,16 +44,17 @@ type GetThreadContextInput struct {
 }
 
 type ThreadContextResponse struct {
-	Thread           protocol.Thread            `json:"thread"`
-	Attachment       *protocol.ThreadAttachment `json:"attachment,omitempty"`
-	Tasks            []protocol.Task            `json:"tasks"`
-	Instances        []protocol.AgentInstance   `json:"instances"`
-	Runs             []protocol.Run             `json:"runs"`
-	PendingApprovals []protocol.ApprovalRequest `json:"pendingApprovals"`
-	Artifacts        []protocol.Artifact        `json:"artifacts"`
-	RecentMessages   []protocol.TaskMessage     `json:"recentMessages"`
-	Room             protocol.ThreadRoomHead    `json:"room"`
-	EventStream      protocol.ThreadEventStream `json:"eventStream"`
+	Thread           protocol.Thread             `json:"thread"`
+	Attachment       *protocol.ThreadAttachment  `json:"attachment,omitempty"`
+	Tasks            []protocol.Task             `json:"tasks"`
+	Instances        []protocol.AgentInstance    `json:"instances"`
+	Runs             []protocol.Run              `json:"runs"`
+	PendingApprovals []protocol.ApprovalRequest  `json:"pendingApprovals"`
+	Artifacts        []protocol.Artifact         `json:"artifacts"`
+	RecentMessages   []protocol.TaskMessage      `json:"recentMessages"`
+	Room             protocol.ThreadRoomHead     `json:"room"`
+	Stall            *protocol.ThreadStallReport `json:"stall,omitempty"`
+	EventStream      protocol.ThreadEventStream  `json:"eventStream"`
 }
 
 func (service *Service) CreateThread(
@@ -389,6 +390,7 @@ func (service *Service) GetThreadContext(threadID string) (ThreadContextResponse
 			stream = protocol.ThreadEventStream{ThreadID: threadID}
 		}
 		response.EventStream = stream
+		response.Stall = service.redactStallReport(EvaluateThreadStall(state, threadID, service.now()))
 		return nil
 	})
 	if err != nil {
@@ -487,6 +489,7 @@ func (service *Service) GetThreadDetail(threadID string) (protocol.ThreadDetailR
 			stream = protocol.ThreadEventStream{ThreadID: threadID}
 		}
 		detail.EventStream = stream
+		detail.Stall = service.redactStallReport(EvaluateThreadStall(state, threadID, service.now()))
 		return nil
 	})
 	if err != nil {
@@ -606,7 +609,13 @@ func (service *Service) runDoorbellLoop(operationContext context.Context) {
 				if event.ThreadID == "" {
 					continue
 				}
-				if event.Type == "approval.requested" {
+				urgentEvent := event.Type == "approval.requested" || event.Type == "thread.stalled"
+				if !urgentEvent && event.Detail != nil {
+					if urgentFlag, ok := event.Detail["urgentDoorbell"].(bool); ok && urgentFlag {
+						urgentEvent = true
+					}
+				}
+				if urgentEvent {
 					urgentByThread[event.ThreadID] = true
 				} else if _, seen := urgentByThread[event.ThreadID]; !seen {
 					urgentByThread[event.ThreadID] = false
@@ -633,12 +642,23 @@ func (service *Service) runDoorbellLoop(operationContext context.Context) {
 			}
 		case threadID := <-fireThread:
 			delete(timers, threadID)
-			service.emitDoorbellIfAttached(threadID)
+			_, emitted, _ := service.CheckThreadStall(threadID)
+			if !emitted {
+				service.emitDoorbellIfAttached(threadID)
+			}
 		}
 	}
 }
 
 func (service *Service) emitDoorbellIfAttached(threadID string) {
+	_ = service.emitDoorbellWithOverride(threadID, "", false)
+}
+
+func (service *Service) emitDoorbellWithOverride(
+	threadID string,
+	overrideSummary string,
+	forceUrgent bool,
+) string {
 	var sessionID string
 	var notification *protocol.DoorbellNotification
 
@@ -664,14 +684,19 @@ func (service *Service) emitDoorbellIfAttached(threadID string) {
 		}
 		slices.Sort(approvalIDs)
 
-		var latestSummary string
+		latestSummary := strings.TrimSpace(overrideSummary)
+		latestType := ""
 		events := state.ThreadEvents[threadID]
 		if len(events) > 0 {
-			latestSummary = events[len(events)-1].Summary
+			latestType = events[len(events)-1].Type
+			if latestSummary == "" {
+				latestSummary = events[len(events)-1].Summary
+			}
 		}
 		if latestSummary == "" {
 			latestSummary = fmt.Sprintf("Thread %q has new activity", thread.Title)
 		}
+		latestSummary = service.redactor.Redact(latestSummary)
 
 		attachment.LastDoorbellSeq = stream.Head
 		attachment.UpdatedAt = service.nowUTC()
@@ -683,7 +708,7 @@ func (service *Service) emitDoorbellIfAttached(threadID string) {
 			ThreadTitle:     thread.Title,
 			ThroughSequence: stream.Head,
 			Summary:         latestSummary,
-			Urgent:          len(approvalIDs) > 0,
+			Urgent:          forceUrgent || len(approvalIDs) > 0 || latestType == "thread.stalled",
 			ApprovalIDs:     approvalIDs,
 			OccurredAt:      service.nowUTC(),
 		}
@@ -696,5 +721,7 @@ func (service *Service) emitDoorbellIfAttached(threadID string) {
 			Doorbell: notification,
 			At:       notification.OccurredAt,
 		})
+		return sessionID
 	}
+	return ""
 }

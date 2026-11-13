@@ -113,6 +113,24 @@ func (git *Git) Run(operationContext context.Context, directory string, argument
 	return git.RunWithTimeout(operationContext, git.Timeout, directory, arguments...)
 }
 
+func (git *Git) CommitterArguments(operationContext context.Context, directory string) []string {
+	nameOutput, nameErr := git.Run(operationContext, directory, "config", "--get", "user.name")
+	emailOutput, emailErr := git.Run(operationContext, directory, "config", "--get", "user.email")
+	hasName := nameErr == nil && strings.TrimSpace(string(nameOutput)) != ""
+	hasEmail := emailErr == nil && strings.TrimSpace(string(emailOutput)) != ""
+	if hasName && hasEmail {
+		return nil
+	}
+	var arguments []string
+	if !hasName {
+		arguments = append(arguments, "-c", "user.name=Orchestra")
+	}
+	if !hasEmail {
+		arguments = append(arguments, "-c", "user.email=orchestra@localhost")
+	}
+	return arguments
+}
+
 func (git *Git) RunWithTimeout(operationContext context.Context, timeout time.Duration, directory string, arguments ...string) ([]byte, error) {
 	if timeout <= 0 {
 		timeout = DefaultGitTimeout

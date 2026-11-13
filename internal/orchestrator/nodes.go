@@ -522,6 +522,8 @@ func (service *Service) dispatchSlaveMessage(
 		service.handleInstanceReleased(nodeID, message)
 	case "workspace.lease":
 		service.handleWorkspaceLeaseUpdate(nodeID, message)
+	case "workspace.land.result":
+		service.handleWorkspaceLandResult(session, message)
 	case "run.started":
 		service.handleRunStarted(nodeID, message)
 	case "run.output":

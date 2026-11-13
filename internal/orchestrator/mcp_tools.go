@@ -47,6 +47,26 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 			}, []string{"nodeId", "repositoryUrl"}),
 		},
 		{
+			Name:        "list_workspace_leases",
+			Description: "List provisioned or retained git-worktree and exclusive workspace leases, optionally filtered by threadId, taskId, nodeId, or status.",
+			InputSchema: objectSchema(map[string]any{
+				"threadId": map[string]any{"type": "string"},
+				"taskId":   map[string]any{"type": "string"},
+				"nodeId":   map[string]any{"type": "string"},
+				"status":   map[string]any{"type": "string", "enum": protocol.WorkspaceLeaseStatuses},
+			}, nil),
+		},
+		{
+			Name:        "land_workspace_lease",
+			Description: "Safely land a retained git-worktree lease branch onto its target branch via fast-forward, merge-ff-only, or cherry-pick, preserving the worktree on dirty/conflict diagnostics and optionally cleaning up after landing.",
+			InputSchema: objectSchema(map[string]any{
+				"leaseId":          map[string]any{"type": "string"},
+				"mode":             map[string]any{"type": "string", "enum": protocol.WorkspaceLandingModes},
+				"targetBranch":     map[string]any{"type": "string"},
+				"cleanupAfterLand": map[string]any{"type": "boolean"},
+			}, []string{"leaseId"}),
+		},
+		{
 			Name:        "update_nodes",
 			Description: "Instruct connected slave nodes (or specified nodeIds) to download, verify, drain active runs, and self-update in place to a GitHub release version (defaults to latest).",
 			InputSchema: objectSchema(map[string]any{
@@ -105,23 +125,27 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 		},
 		{
 			Name:        "read_room",
-			Description: "Read ordered entries from a thread's shared blackboard room, optionally filtered after a sequence or by message kinds.",
+			Description: "Read ordered entries from a thread's shared blackboard room, optionally filtered after a sequence, by channel, or by message kinds.",
 			InputSchema: objectSchema(map[string]any{
 				"threadId":      map[string]any{"type": "string"},
 				"afterSequence": map[string]any{"type": "integer", "minimum": 0},
+				"channel":       map[string]any{"type": "string"},
 				"kinds":         map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": protocol.RoomMessageKinds}},
 				"limit":         map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumRoomReadLimit},
 			}, []string{"threadId"}),
 		},
 		{
 			Name:        "post_room_message",
-			Description: "Post an append-only blackboard entry to a thread's room, optionally nudging active tasks in that thread to read before finalizing.",
+			Description: "Post an append-only blackboard entry to a thread's room, optionally targeting a channel, mentioning @handles/@#channels/@all to wake idle instances, or nudging active tasks.",
 			InputSchema: objectSchema(map[string]any{
 				"threadId":           map[string]any{"type": "string"},
 				"idempotencyKey":     map[string]any{"type": "string"},
 				"kind":               map[string]any{"type": "string", "enum": protocol.RoomMessageKinds},
+				"channel":            map[string]any{"type": "string"},
 				"topic":              map[string]any{"type": "string"},
 				"body":               map[string]any{"type": "string"},
+				"mentions":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"wake":               map[string]any{"type": "boolean"},
 				"replyToSequence":    map[string]any{"type": "integer", "minimum": 1},
 				"supersedesSequence": map[string]any{"type": "integer", "minimum": 1},
 				"artifactIds":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
@@ -204,7 +228,7 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 		},
 		{
 			Name:        "spawn_instance",
-			Description: "Provision one or more resident agent instances on capability-matched slave nodes, with optional mail handle, public room brief, sharded count, and warm fork context.",
+			Description: "Provision one or more resident agent instances on capability-matched slave nodes, with optional mail handle, public room brief, sharded count, warm fork context, and roomChannels subscriptions.",
 			InputSchema: objectSchema(map[string]any{
 				"threadId":           map[string]any{"type": "string"},
 				"idempotencyKey":     map[string]any{"type": "string"},
@@ -213,6 +237,7 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 				"brief":              map[string]any{"type": "string"},
 				"count":              map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumSpawnInstanceCount},
 				"forkFromInstanceId": map[string]any{"type": "string"},
+				"roomChannels":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 				"purpose":            map[string]any{"type": "object"},
 				"delegation":         map[string]any{"type": "object"},
 				"requirements":       map[string]any{"type": "object"},
@@ -546,6 +571,18 @@ func (service *Service) ExecuteOrchestratorTool(
 			return nil, decodeErr
 		}
 		responseValue, err = service.CloneRepository(operationContext, caller, input)
+	case "list_workspace_leases":
+		input, decodeErr := decodeToolArguments[ListWorkspaceLeasesInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.ListWorkspaceLeases(caller, input)
+	case "land_workspace_lease":
+		input, decodeErr := decodeToolArguments[LandWorkspaceLeaseInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.LandWorkspaceLease(operationContext, caller, input)
 	case "update_nodes":
 		input, decodeErr := decodeToolArguments[UpdateNodesInput](rawArguments)
 		if decodeErr != nil {

@@ -1,10 +1,12 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -997,4 +999,324 @@ func TestSpawnInstance_HandleBriefShardedCountAndWarmFork(t *testing.T) {
 			assertOperationErrorCodeValue(t, validationErr, testCase.expectedCode)
 		})
 	}
+}
+
+func TestMergedSwarmEndpoints_WorkspaceLandingRoomChannelsAndSiblingHandoffs(t *testing.T) {
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	service, err := NewService(ServiceOptions{
+		Store: openedStore,
+		Token: "master-secret-token",
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	httpServer := httptest.NewServer(service.Handler())
+	defer httpServer.Close()
+
+	instanceCapacity := 8
+	activeInstances := 0
+	canonicalRoots, err := slave.CanonicalizeWorkspaceRoots([]string{t.TempDir()})
+	require.NoError(t, err)
+	workspaceRoot := canonicalRoots[0]
+	slaveConnection, masterMessages := connectMockSlaveNode(t, httpServer, service, protocol.ComputeNode{
+		ID:               "node-unified",
+		Name:             "node-unified",
+		Kind:             "local",
+		Platform:         "darwin-arm64",
+		Status:           "online",
+		LastSeen:         service.nowUTC(),
+		Concurrency:      4,
+		InstanceCapacity: &instanceCapacity,
+		ActiveInstances:  &activeInstances,
+		WorkspaceRoots:   canonicalRoots,
+		Version:          "1.0.0",
+		Harnesses: []protocol.HarnessProfile{{
+			ID:         "claude-cli",
+			Label:      "Claude Code",
+			Available:  true,
+			AuthMode:   "local-subscription",
+			Models:     []string{"sonnet", "opus"},
+			Transports: []string{protocol.TransportNativeCLI},
+		}},
+	})
+
+	coordinatorCaller := CallerIdentity{
+		Kind:      "orchestrator-client",
+		ClientID:  "coord-unified",
+		SessionID: "sess-unified",
+	}
+	thread, _, err := service.CreateThread(coordinatorCaller, CreateThreadInput{Title: "Unified Integration Thread"})
+	require.NoError(t, err)
+
+	_, invalidChannelErr := service.SpawnInstance(coordinatorCaller, SpawnInstanceInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "spawn-bad-channel",
+		RoomChannels:   []string{"INVALID CHANNEL!"},
+	})
+	assertOperationErrorCodeValue(t, invalidChannelErr, "invalid_request")
+
+	rawSpawnVerifier, err := json.Marshal(SpawnInstanceInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "spawn-verifier-channels",
+		Handle:         "verifier",
+		RoomChannels:   []string{"Verification", "main", "verification"},
+	})
+	require.NoError(t, err)
+	rawVerifierResp, err := service.ExecuteOrchestratorTool(t.Context(), coordinatorCaller, "spawn_instance", rawSpawnVerifier)
+	require.NoError(t, err)
+
+	var verifierSpawn protocol.InstanceLifecycleResult
+	require.NoError(t, json.Unmarshal(rawVerifierResp, &verifierSpawn))
+	assert.Equal(t, "verifier", verifierSpawn.Instance.Handle)
+	assert.Equal(t, []string{"verification"}, verifierSpawn.Instance.RoomChannels)
+
+	forkedVerifier, err := service.SpawnInstance(coordinatorCaller, SpawnInstanceInput{
+		ThreadID:           thread.ID,
+		IdempotencyKey:     "spawn-verifier-fork",
+		Handle:             "verifier-helper",
+		ForkFromInstanceID: verifierSpawn.Instance.ID,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"verification"}, forkedVerifier.Instance.RoomChannels)
+
+	authorSpawn, err := service.SpawnInstance(coordinatorCaller, SpawnInstanceInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "spawn-author-main-only",
+		Handle:         "author",
+	})
+	require.NoError(t, err)
+	assert.Empty(t, authorSpawn.Instance.RoomChannels)
+
+	submitted, err := service.SubmitTasks(coordinatorCaller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "submit-author-and-verifier",
+		Tasks: []SubmittedTaskSpec{
+			{ClientTaskID: "author-task", Title: "Author work", Instructions: "Implement slice"},
+			{ClientTaskID: "verifier-task", Title: "Verifier work", Instructions: "Review slice"},
+		},
+	})
+	require.NoError(t, err)
+	authorTaskID := submitted.ClientTaskMap["author-task"]
+	verifierTaskID := submitted.ClientTaskMap["verifier-task"]
+
+	nowText := service.nowUTC()
+	leaseMainID := "wlease-unified-mcp"
+	leaseHTTPID := "wlease-unified-http"
+	baseRevision := "0123456789abcdef0123456789abcdef01234567"
+	landedRevisionMCP := "abcdef0123456789abcdef0123456789abcdef01"
+	landedRevisionHTTP := "fedcba9876543210fedcba9876543210fedcba98"
+
+	mutateStore(t, openedStore, func(state *store.State, mutation *store.Mutation) error {
+		state.Runs["run-author-active"] = protocol.Run{
+			ID:         "run-author-active",
+			ThreadID:   thread.ID,
+			TaskID:     &authorTaskID,
+			NodeID:     "node-unified",
+			InstanceID: authorSpawn.Instance.ID,
+			Status:     "running",
+			CreatedAt:  nowText,
+		}
+		state.Runs["run-verifier-active"] = protocol.Run{
+			ID:         "run-verifier-active",
+			ThreadID:   thread.ID,
+			TaskID:     &verifierTaskID,
+			NodeID:     "node-unified",
+			InstanceID: verifierSpawn.Instance.ID,
+			Status:     "running",
+			CreatedAt:  nowText,
+		}
+		state.WorkspaceLeases[leaseMainID] = protocol.WorkspaceLease{
+			ID:                   leaseMainID,
+			ThreadID:             thread.ID,
+			TaskID:               authorTaskID,
+			RunID:                "run-completed-author-1",
+			NodeID:               "node-unified",
+			Policy:               protocol.WorkspaceIsolationGitWorktree,
+			Cleanup:              protocol.WorkspaceCleanupRetain,
+			Root:                 workspaceRoot,
+			SourcePath:           workspaceRoot,
+			BaseRevision:         "refs/heads/main",
+			ResolvedBaseRevision: baseRevision,
+			Branch:               "orchestra/wlease-unified-mcp",
+			WorktreePath:         filepath.Join(workspaceRoot, ".orchestra-worktrees", leaseMainID),
+			Status:               "retained",
+			RetentionReason:      "policy",
+			CreatedAt:            nowText,
+			UpdatedAt:            nowText,
+		}
+		state.WorkspaceLeases[leaseHTTPID] = protocol.WorkspaceLease{
+			ID:                   leaseHTTPID,
+			ThreadID:             thread.ID,
+			TaskID:               authorTaskID,
+			RunID:                "run-completed-author-2",
+			NodeID:               "node-unified",
+			Policy:               protocol.WorkspaceIsolationGitWorktree,
+			Cleanup:              protocol.WorkspaceCleanupRetain,
+			Root:                 workspaceRoot,
+			SourcePath:           workspaceRoot,
+			BaseRevision:         "refs/heads/main",
+			ResolvedBaseRevision: baseRevision,
+			Branch:               "orchestra/wlease-unified-http",
+			WorktreePath:         filepath.Join(workspaceRoot, ".orchestra-worktrees", leaseHTTPID),
+			Status:               "retained",
+			RetentionReason:      "policy",
+			CreatedAt:            nowText,
+			UpdatedAt:            nowText,
+		}
+		return nil
+	})
+
+	postVerificationRaw, err := json.Marshal(map[string]any{
+		"idempotencyKey": "author-handoff-verification",
+		"kind":           "finding",
+		"channel":        "verification",
+		"body":           "Ready for review @verifier",
+		"mentions":       []string{"@verifier"},
+		"wake":           true,
+		"nudgeTaskIds":   []string{verifierTaskID},
+	})
+	require.NoError(t, err)
+
+	postRespRaw, err := service.executeHubToolForSlave(
+		t.Context(),
+		"node-unified",
+		"run-author-active",
+		"post_room_message",
+		postVerificationRaw,
+	)
+	require.NoError(t, err)
+	var postResp PostRoomMessageResult
+	require.NoError(t, json.Unmarshal(postRespRaw, &postResp))
+	assert.Equal(t, "verification", postResp.Message.Channel)
+	assert.Contains(t, postResp.NudgedTaskIDs, verifierTaskID)
+
+	zeroRoomSeq := int64(0)
+	authorCaller := CallerIdentity{
+		Kind:       "run",
+		RunID:      "run-author-active",
+		TaskID:     authorTaskID,
+		ThreadID:   thread.ID,
+		InstanceID: authorSpawn.Instance.ID,
+	}
+	verifierCaller := CallerIdentity{
+		Kind:       "run",
+		RunID:      "run-verifier-active",
+		TaskID:     verifierTaskID,
+		ThreadID:   thread.ID,
+		InstanceID: verifierSpawn.Instance.ID,
+	}
+
+	authorWait, err := service.WaitForActivity(t.Context(), authorCaller, WaitForActivityInput{
+		AfterRoomSequence:   &zeroRoomSeq,
+		TimeoutMilliseconds: 0,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, authorWait.RoomMessages)
+
+	verifierWait, err := service.WaitForActivity(t.Context(), verifierCaller, WaitForActivityInput{
+		AfterRoomSequence:   &zeroRoomSeq,
+		TimeoutMilliseconds: 0,
+	})
+	require.NoError(t, err)
+	require.Len(t, verifierWait.RoomMessages, 1)
+	assert.Equal(t, "verification", verifierWait.RoomMessages[0].Channel)
+
+	readChannelArgs, err := json.Marshal(map[string]any{
+		"threadId":      thread.ID,
+		"channel":       "verification",
+		"afterSequence": 0,
+	})
+	require.NoError(t, err)
+	readChannelRaw, err := service.ExecuteOrchestratorTool(t.Context(), coordinatorCaller, "read_room", readChannelArgs)
+	require.NoError(t, err)
+	var readChannelResult ReadRoomResult
+	require.NoError(t, json.Unmarshal(readChannelRaw, &readChannelResult))
+	require.Len(t, readChannelResult.Messages, 1)
+	assert.Equal(t, postResp.Message.ID, readChannelResult.Messages[0].ID)
+
+	listLeasesArgs, err := json.Marshal(ListWorkspaceLeasesInput{ThreadID: thread.ID})
+	require.NoError(t, err)
+	listLeasesRaw, err := service.ExecuteOrchestratorTool(t.Context(), coordinatorCaller, "list_workspace_leases", listLeasesArgs)
+	require.NoError(t, err)
+	var listedLeases ListWorkspaceLeasesResponse
+	require.NoError(t, json.Unmarshal(listLeasesRaw, &listedLeases))
+	require.Len(t, listedLeases.WorkspaceLeases, 2)
+
+	go func() {
+		for message := range masterMessages {
+			if message.Type != "workspace.land" || message.Land == nil {
+				continue
+			}
+			revision := landedRevisionMCP
+			if message.Land.Lease.ID == leaseHTTPID {
+				revision = landedRevisionHTTP
+			}
+			replyBytes, marshalErr := json.Marshal(protocol.SlaveControlMessage{
+				Type:      "workspace.land.result",
+				RequestID: message.RequestID,
+				LandResult: &protocol.WorkspaceLeaseLandResult{
+					RequestID:      message.RequestID,
+					NodeID:         "node-unified",
+					LeaseID:        message.Land.Lease.ID,
+					Status:         protocol.WorkspaceLandingStatusLanded,
+					Mode:           protocol.WorkspaceLandingModeFastForward,
+					Landed:         true,
+					Cleaned:        message.Land.CleanupAfterLand,
+					TargetBranch:   "main",
+					BaseRevision:   baseRevision,
+					LandedRevision: revision,
+					CommitsLanded:  1,
+					Detail:         "fast-forwarded onto main",
+					ObservedAt:     service.nowUTC(),
+				},
+			})
+			if marshalErr == nil {
+				_ = slaveConnection.Write(context.Background(), websocket.MessageText, replyBytes)
+			}
+		}
+	}()
+
+	landMCPArgs, err := json.Marshal(LandWorkspaceLeaseInput{
+		LeaseID:          leaseMainID,
+		Mode:             protocol.WorkspaceLandingModeFastForward,
+		TargetBranch:     "main",
+		CleanupAfterLand: true,
+	})
+	require.NoError(t, err)
+	landMCPRaw, err := service.ExecuteOrchestratorTool(t.Context(), coordinatorCaller, "land_workspace_lease", landMCPArgs)
+	require.NoError(t, err)
+	var landedMCP LandWorkspaceLeaseResponse
+	require.NoError(t, json.Unmarshal(landMCPRaw, &landedMCP))
+	assert.True(t, landedMCP.Result.Landed)
+	assert.Equal(t, landedRevisionMCP, landedMCP.WorkspaceLease.LandedRevision)
+	assert.Equal(t, "cleaned", landedMCP.WorkspaceLease.Status)
+
+	httpBody, err := json.Marshal(map[string]any{
+		"mode":             protocol.WorkspaceLandingModeFastForward,
+		"targetBranch":     "main",
+		"cleanupAfterLand": false,
+	})
+	require.NoError(t, err)
+	landHTTPRequest, err := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		httpServer.URL+"/api/workspace-leases/"+leaseHTTPID+"/land",
+		bytes.NewReader(httpBody),
+	)
+	require.NoError(t, err)
+	landHTTPRequest.Header.Set("Authorization", "Bearer master-secret-token")
+	landHTTPRequest.Header.Set("Content-Type", "application/json")
+	landHTTPResponse, err := http.DefaultClient.Do(landHTTPRequest)
+	require.NoError(t, err)
+	defer landHTTPResponse.Body.Close()
+	require.Equal(t, http.StatusOK, landHTTPResponse.StatusCode)
+
+	var landedHTTP LandWorkspaceLeaseResponse
+	require.NoError(t, json.NewDecoder(landHTTPResponse.Body).Decode(&landedHTTP))
+	assert.True(t, landedHTTP.Result.Landed)
+	assert.Equal(t, landedRevisionHTTP, landedHTTP.WorkspaceLease.LandedRevision)
+	assert.Equal(t, "retained", landedHTTP.WorkspaceLease.Status)
 }

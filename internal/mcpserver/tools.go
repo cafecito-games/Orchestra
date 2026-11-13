@@ -57,12 +57,13 @@ func requirementsSchema() schema {
 		"minimumMemoryMegabytes": integer(),
 		"projectProfileId":       text(),
 		"workspace": object(schema{
-			"repository": text(),
-			"path":       text(),
-			"writable":   boolean(),
-			"isolation":  enum("git-worktree", "exclusive-existing"),
-			"cleanup":    enum("retain", "when-unchanged"),
-			"baseBranch": text(),
+			"repository":    text(),
+			"path":          text(),
+			"writable":      boolean(),
+			"isolation":     enum("git-worktree", "exclusive-existing"),
+			"cleanup":       enum("retain", "when-unchanged"),
+			"baseBranch":    text(),
+			"sourceLeaseId": text(),
 		}, "writable"),
 		"preferences": object(schema{
 			"nodeIds":    strings,
@@ -87,17 +88,20 @@ func leaseSchema() schema {
 
 func safeInstanceSchema() schema {
 	return resultSchema(schema{
-		"id":                 text(),
-		"threadId":           text(),
-		"handle":             text(),
-		"forkFromInstanceId": text(),
-		"purpose":            purposeSchema(true),
-		"delegation":         resultSchema(schema{"canDelegate": boolean()}, "canDelegate"),
-		"requirements":       anyObject(),
-		"lease":              leaseSchema(),
-		"status":             text(),
-		"createdAt":          text(),
-		"updatedAt":          text(),
+		"id":                   text(),
+		"threadId":             text(),
+		"handle":               text(),
+		"forkFromInstanceId":   text(),
+		"purpose":              purposeSchema(true),
+		"delegation":           resultSchema(schema{"canDelegate": boolean()}, "canDelegate"),
+		"requirements":         anyObject(),
+		"roomChannels":         list(text()),
+		"lastReadRoomSequence": integer(),
+		"lastPostRoomSequence": integer(),
+		"lease":                leaseSchema(),
+		"status":               text(),
+		"createdAt":            text(),
+		"updatedAt":            text(),
 	}, "id", "threadId", "delegation", "requirements", "lease", "status", "createdAt", "updatedAt")
 }
 
@@ -157,11 +161,12 @@ var definitions = map[string]toolDefinition{
 		description: "Read ordered blackboard entries for the current thread and advance your task's lastReadRoomSequence cursor.",
 		input: object(schema{
 			"afterSequence": schema{"type": "integer", "minimum": 0},
+			"channel":       text(),
 			"kinds":         list(enum(protocol.RoomMessageKinds...)),
 			"limit":         schema{"type": "integer", "minimum": 1, "maximum": protocol.MaximumRoomReadLimit},
 		}),
 		output: resultSchema(schema{
-			"threadId": text(), "room": anyObject(), "messages": objects(),
+			"threadId": text(), "room": anyObject(), "channel": text(), "messages": objects(),
 			"headSequence": integer(), "lastReadSequence": integer(), "requiredSequence": integer(),
 			"unreadNudge": boolean(), "throughSequence": integer(), "hasMore": boolean(),
 		}, "threadId", "room", "messages", "headSequence", "lastReadSequence", "unreadNudge", "hasMore"),
@@ -172,7 +177,9 @@ var definitions = map[string]toolDefinition{
 		description: "Append a structured blackboard entry (finding, contract, decision, gotcha, guidance, question, or answer) to the current thread's room.",
 		input:       postRoomMessageInputSchema(false),
 		output: resultSchema(schema{
-			"threadId": text(), "room": anyObject(), "message": anyObject(), "nudgedTaskIds": list(text()), "replayed": boolean(),
+			"threadId": text(), "room": anyObject(), "message": anyObject(),
+			"nudgedTaskIds": list(text()), "wokenInstanceIds": list(text()), "wakeTaskIds": list(text()),
+			"replayed": boolean(),
 		}, "threadId", "room", "message", "nudgedTaskIds", "replayed"),
 	},
 	"post_artifact": {
@@ -225,9 +232,35 @@ var definitions = map[string]toolDefinition{
 		}, "generatedAt", "nodes"),
 		readOnly: true,
 	},
+	"list_workspace_leases": {
+		title:       "List workspace leases",
+		description: "List provisioned or retained git-worktree and exclusive workspace leases in this thread, optionally filtered by taskId, nodeId, or status.",
+		input: object(schema{
+			"threadId": text(),
+			"taskId":   text(),
+			"nodeId":   text(),
+			"status":   enum(protocol.WorkspaceLeaseStatuses...),
+		}),
+		output:   resultSchema(schema{"workspaceLeases": objects()}, "workspaceLeases"),
+		readOnly: true,
+	},
+	"land_workspace_lease": {
+		title:       "Land workspace lease",
+		description: "Safely land a retained git-worktree lease branch onto its target branch via fast-forward, merge-ff-only, or cherry-pick, preserving the worktree on dirty/conflict diagnostics and optionally cleaning up after landing.",
+		input: object(schema{
+			"leaseId":          text(),
+			"mode":             enum(protocol.WorkspaceLandingModes...),
+			"targetBranch":     text(),
+			"cleanupAfterLand": boolean(),
+		}, "leaseId"),
+		output: resultSchema(schema{
+			"workspaceLease": anyObject(),
+			"result":         anyObject(),
+		}, "workspaceLease", "result"),
+	},
 	"spawn_instance": {
 		title:       "Spawn instance",
-		description: "Request one or more non-delegating resident instances for this thread, optionally assigning mail handles, posting a public contract brief to the room, sharding count instances, or seeding warm context from forkFromInstanceId.",
+		description: "Request one or more non-delegating resident instances for this thread, optionally assigning mail handles, posting a public contract brief to the room, sharding count instances, subscribing to roomChannels, or seeding warm context from forkFromInstanceId.",
 		input: object(schema{
 			"threadId":           text(),
 			"idempotencyKey":     text(),
@@ -236,6 +269,7 @@ var definitions = map[string]toolDefinition{
 			"brief":              text(),
 			"count":              schema{"type": "integer", "minimum": 1, "maximum": protocol.MaximumSpawnInstanceCount},
 			"forkFromInstanceId": text(),
+			"roomChannels":       list(text()),
 			"requirements":       requirementsSchema(),
 			"purpose":            purposeSchema(true),
 			"idleTimeoutSeconds": schema{"type": "integer", "minimum": protocol.MinimumInstanceIdleTimeoutSeconds, "maximum": protocol.MaximumInstanceIdleTimeoutSeconds},
@@ -430,14 +464,18 @@ func postRoomMessageInputSchema(canDelegate bool) schema {
 	properties := schema{
 		"idempotencyKey":     text(),
 		"kind":               enum(protocol.RoomMessageKinds...),
+		"channel":            text(),
 		"topic":              text(),
 		"body":               text(),
+		"mentions":           list(text()),
+		"wake":               boolean(),
 		"replyToSequence":    schema{"type": "integer", "minimum": 1},
 		"supersedesSequence": schema{"type": "integer", "minimum": 1},
 		"artifactIds":        list(text()),
+		"nudgeTaskIds":       list(text()),
 	}
 	if canDelegate {
-		properties["nudgeTaskIds"] = list(text())
+		properties["nudge"] = boolean()
 	}
 	return object(properties, "idempotencyKey", "kind", "body")
 }

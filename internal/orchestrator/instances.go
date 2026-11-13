@@ -22,6 +22,7 @@ type SpawnInstanceInput struct {
 	Brief              string                                  `json:"brief,omitempty"`
 	Count              int                                     `json:"count,omitempty"`
 	ForkFromInstanceID string                                  `json:"forkFromInstanceId,omitempty"`
+	RoomChannels       []string                                `json:"roomChannels,omitempty"`
 	Purpose            *protocol.InstancePurpose               `json:"purpose,omitempty"`
 	Delegation         *protocol.InstanceDelegationPolicy      `json:"delegation,omitempty"`
 	Requirements       *protocol.InstanceExecutionRequirements `json:"requirements,omitempty"`
@@ -133,6 +134,11 @@ func (service *Service) SpawnInstance(
 		return protocol.InstanceLifecycleResult{}, invalidRequest("forkFromInstanceId is malformed")
 	}
 
+	normalizedRoomChannels, channelErr := protocol.NormalizeRoomChannels(input.RoomChannels)
+	if channelErr != nil {
+		return protocol.InstanceLifecycleResult{}, invalidRequest(channelErr.Error())
+	}
+
 	sourceKey := caller.SourceKey()
 	receiptKey := sourceKey + "\x00create\x00" + threadID + "\x00" + idempotencyKey
 	digest := canonicalDigest(input)
@@ -198,6 +204,7 @@ func (service *Service) SpawnInstance(
 			instanceRequirements = cloneInstanceExecutionRequirements(*input.Requirements)
 		}
 
+		instanceRoomChannels := slices.Clone(normalizedRoomChannels)
 		basePurpose := cloneInstancePurpose(input.Purpose)
 		if forkFromInstanceID != "" {
 			sourceInstance, sourceExists := state.Instances[forkFromInstanceID]
@@ -209,6 +216,9 @@ func (service *Service) SpawnInstance(
 			}
 			if input.Requirements == nil {
 				instanceRequirements = cloneInstanceExecutionRequirements(sourceInstance.Requirements)
+			}
+			if len(input.RoomChannels) == 0 && len(sourceInstance.RoomChannels) > 0 {
+				instanceRoomChannels = slices.Clone(sourceInstance.RoomChannels)
 			}
 			warmContextDigest := service.buildInstanceForkWarmContext(state, sourceInstance)
 			basePurpose = mergeForkWarmContextIntoPurpose(basePurpose, sourceInstance, warmContextDigest)
@@ -267,6 +277,7 @@ func (service *Service) SpawnInstance(
 				Purpose:            shardPurpose,
 				Delegation:         delegation,
 				Requirements:       cloneInstanceExecutionRequirements(instanceRequirements),
+				RoomChannels:       slices.Clone(instanceRoomChannels),
 				Lease: protocol.InstanceLease{
 					IdleTimeoutSeconds: timeoutSeconds,
 					ExpiresAt:          expiresAt,
@@ -1533,6 +1544,11 @@ func (service *Service) appendRosterBriefToRoomInState(
 	}
 
 	redactedBody := protocol.TruncateUTF8Head(service.redactor.Redact(strings.TrimSpace(bodyBuilder.String())), protocol.TextMaximumBytes)
+	parsedMentions, mentionErr := protocol.ParseRoomMentions(redactedBody, nil)
+	var mentionTokens []string
+	if mentionErr == nil {
+		mentionTokens = slices.Clone(parsedMentions.Tokens)
+	}
 
 	roomMessage := protocol.RoomMessage{
 		Sequence:  nextSequence,
@@ -1541,14 +1557,50 @@ func (service *Service) appendRosterBriefToRoomInState(
 		CreatedAt: nowText,
 		Author:    service.roomAuthorForCaller(state, caller),
 		Kind:      "contract",
+		Channel:   protocol.DefaultRoomChannel,
 		Topic:     topic,
 		Body:      redactedBody,
+		Mentions:  mentionTokens,
 	}
 
 	head.HeadSequence = nextSequence
 	head.UpdatedAt = nowText
 	state.RoomHeads[thread.ID] = head
 	state.RoomMessages[thread.ID] = append(state.RoomMessages[thread.ID], roomMessage)
+
+	callerInstanceID := resolveCallerInstanceID(state, caller)
+	if caller.Kind == "run" {
+		if caller.TaskID != "" {
+			if callerTask, taskExists := state.Tasks[caller.TaskID]; taskExists && callerTask.ThreadID == thread.ID {
+				if callerTask.LastReadRoomSequence == nextSequence-1 {
+					callerTask.LastReadRoomSequence = nextSequence
+					callerTask.UpdatedAt = nowText
+					state.Tasks[callerTask.ID] = callerTask
+				}
+			}
+		}
+		if callerInstanceID != "" {
+			if callerInstance, instanceExists := state.Instances[callerInstanceID]; instanceExists && callerInstance.ThreadID == thread.ID {
+				if nextSequence > callerInstance.LastPostRoomSequence {
+					callerInstance.LastPostRoomSequence = nextSequence
+				}
+				if callerInstance.LastReadRoomSequence == nextSequence-1 {
+					callerInstance.LastReadRoomSequence = nextSequence
+				}
+				callerInstance.UpdatedAt = nowText
+				state.Instances[callerInstance.ID] = callerInstance
+			}
+		}
+	} else if caller.ClientID != "" {
+		if attachment, attached := state.ActiveAttachmentForThread(thread.ID); attached && attachment.ClientID == caller.ClientID {
+			if attachment.LastReadRoomSequence == nextSequence-1 {
+				attachment.LastReadRoomSequence = nextSequence
+				attachment.LastHeartbeatAt = nowText
+				attachment.UpdatedAt = nowText
+				state.Attachments[attachment.ID] = attachment
+			}
+		}
+	}
 
 	mutation.EmitEvent(protocol.TaskEventEntry{
 		ThreadID:   thread.ID,

@@ -179,18 +179,34 @@ func (service *Service) WaitForActivity(
 					return notFound(fmt.Sprintf("thread %s does not exist", threadID))
 				}
 
+				var callerRoomChannels []string
+				if caller.Kind == "run" {
+					callerInstanceID := resolveCallerInstanceID(state, caller)
+					if callerInstanceID != "" {
+						if callerInstance, instanceExists := state.Instances[callerInstanceID]; instanceExists {
+							callerRoomChannels = callerInstance.RoomChannels
+						}
+					}
+				}
+
 				roomHead := state.RoomHeads[threadID]
 				snapshot.RoomHeadSequence = roomHead.HeadSequence
 				allRoomMessages := state.RoomMessages[threadID]
+				visibleRoomMessageIDs := map[string]bool{}
 				for _, entry := range allRoomMessages {
 					if entry.Sequence <= roomBaselineSequence {
 						continue
 					}
+					if caller.Kind == "run" && !protocol.InstanceSubscribesToRoomChannel(callerRoomChannels, entry.Channel) {
+						continue
+					}
+					visibleRoomMessageIDs[entry.ID] = true
 					if len(snapshot.RoomMessages) >= limit {
-						break
+						continue
 					}
 					entryCopy := entry
 					entryCopy.ArtifactIDs = slices.Clone(entry.ArtifactIDs)
+					entryCopy.Mentions = slices.Clone(entry.Mentions)
 					snapshot.RoomMessages = append(snapshot.RoomMessages, entryCopy)
 				}
 
@@ -227,11 +243,19 @@ func (service *Service) WaitForActivity(
 					if entry.Sequence <= eventBaselineSequence {
 						continue
 					}
-					if caller.Kind == "run" &&
-						entry.Type != "room.message_posted" &&
-						!isEventVisibleToWorker(entry, caller.TaskID, caller.RunID, childTaskIDs, taskHasUnreadNudge) {
-						lastScanned = entry.Sequence
-						continue
+					if caller.Kind == "run" {
+						if entry.Type == "room.message_posted" {
+							if entry.MessageID != "" && !visibleRoomMessageIDs[entry.MessageID] {
+								if channelValue, hasChannel := entry.Detail["channel"].(string); hasChannel &&
+									!protocol.InstanceSubscribesToRoomChannel(callerRoomChannels, channelValue) {
+									lastScanned = entry.Sequence
+									continue
+								}
+							}
+						} else if !isEventVisibleToWorker(entry, caller.TaskID, caller.RunID, childTaskIDs, taskHasUnreadNudge) {
+							lastScanned = entry.Sequence
+							continue
+						}
 					}
 					if len(input.EventTypes) > 0 && !slices.Contains(input.EventTypes, entry.Type) {
 						lastScanned = entry.Sequence

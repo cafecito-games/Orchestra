@@ -262,9 +262,6 @@ func (server *Server) callTool(operationContext context.Context, activeGrant gra
 		if _, hasNudge := object["nudge"]; hasNudge {
 			return toolErrorResult(&ToolError{Code: "forbidden", Message: "Non-delegating worker runs cannot nudge tasks"})
 		}
-		if _, hasNudgeTaskIDs := object["nudgeTaskIds"]; hasNudgeTaskIDs {
-			return toolErrorResult(&ToolError{Code: "forbidden", Message: "Non-delegating worker runs cannot nudge tasks"})
-		}
 	}
 	var (
 		result json.RawMessage

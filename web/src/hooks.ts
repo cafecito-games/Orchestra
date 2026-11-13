@@ -35,21 +35,69 @@ export function useLive(): LiveControls {
 export interface Route {
   name: string;
   id?: string;
+  anchor?: string;
 }
 
 export function parseRoute(hash: string): Route {
-  const raw = hash.replace(/^#\/?/, "");
-  const parts = raw.split("/").filter(Boolean);
-  if (parts.length === 0) return { name: "overview" };
+  const withoutLeadingHash = hash.replace(/^#\/?/, "");
+  const [beforeSecondHash, inlineFragment] = withoutLeadingHash.split("#");
+  const [pathPart, queryPart] = (beforeSecondHash ?? "").split("?");
+  const parts = (pathPart ?? "").split("/").filter(Boolean);
+
+  let anchor: string | undefined;
+  if (queryPart) {
+    const parameters = new URLSearchParams(queryPart);
+    const anchorParameter = parameters.get("anchor");
+    if (anchorParameter) {
+      anchor = anchorParameter;
+    }
+  }
+  if (!anchor && inlineFragment) {
+    anchor = decodeURIComponent(inlineFragment);
+  }
+
+  if (parts.length === 0) return { name: "overview", anchor };
   const name = parts[0] ?? "overview";
   const rest = parts[1];
-  if (name === "thread" && rest) return { name: "thread", id: rest };
-  if (name === "mail" && rest) return { name: "mailbox", id: decodeURIComponent(rest) };
-  return { name };
+  if (name === "thread" && rest) {
+    return { name: "thread", id: decodeURIComponent(rest), anchor };
+  }
+  if (name === "mail" && rest) {
+    return { name: "mailbox", id: decodeURIComponent(rest), anchor };
+  }
+  return { name, anchor };
 }
 
 export function navigate(hash: string): void {
   window.location.hash = hash;
+}
+
+export function navigateToThread(threadId: string, anchor?: string): void {
+  const basePath = `/thread/${encodeURIComponent(threadId)}`;
+  if (anchor) {
+    navigate(`${basePath}?anchor=${encodeURIComponent(anchor)}`);
+    return;
+  }
+  navigate(basePath);
+}
+
+export function replaceThreadAnchor(threadId: string, anchor: string): void {
+  const nextHash = `#/thread/${encodeURIComponent(threadId)}?anchor=${encodeURIComponent(anchor)}`;
+  if (typeof window.history?.replaceState === "function") {
+    window.history.replaceState(null, "", nextHash);
+  }
+}
+
+export function scrollToAnchor(anchorId: string): boolean {
+  const targetElement = document.getElementById(anchorId);
+  if (!targetElement) {
+    return false;
+  }
+  targetElement.scrollIntoView({ behavior: "smooth", block: "center" });
+  targetElement.classList.remove("anchor-flash");
+  void targetElement.offsetWidth;
+  targetElement.classList.add("anchor-flash");
+  return true;
 }
 
 export function useRoute(): Route {
