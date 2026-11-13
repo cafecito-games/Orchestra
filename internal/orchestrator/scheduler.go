@@ -317,11 +317,11 @@ func (service *Service) findReusableResident(
 			continue
 		}
 		repositoryReport := state.RepositoryReports[node.ID]
-		_, resolvedSourcePath, workspaceFailure := resolveWorkspaceOnNode(node, repositoryReport, requirements)
+		_, resolvedSourcePath, workspaceFailure := resolveTaskWorkspaceInState(state, task.ThreadID, node, repositoryReport, requirements)
 		if workspaceFailure != "" {
 			continue
 		}
-		hasExplicitWorkspaceTarget := requirements.Workspace != nil && (requirements.Workspace.Path != "" || requirements.Workspace.Repository != "")
+		hasExplicitWorkspaceTarget := requirements.Workspace != nil && (requirements.Workspace.Path != "" || requirements.Workspace.Repository != "" || requirements.Workspace.SourceLeaseID != "")
 		requiresResolvedWorkspace := hasExplicitWorkspaceTarget || (instance.AutoManaged && task.PlacementInstanceID == "")
 		if requiresResolvedWorkspace && allocation.Workspace != resolvedSourcePath {
 			continue
@@ -334,7 +334,7 @@ func (service *Service) findReusableResident(
 			candidateWorkspace = resolvedSourcePath
 		}
 		hasBinding := false
-		if requirements.Workspace == nil || requirements.Workspace.Isolation == "" {
+		if requirements.Workspace == nil || (requirements.Workspace.Isolation == "" && requirements.Workspace.SourceLeaseID == "") {
 			_, hasBinding = findIdleSessionBinding(
 				state,
 				instance.ID,
@@ -416,8 +416,8 @@ func (service *Service) assignTaskToResident(
 	workspacePath := allocation.Workspace
 	node := state.Nodes[allocation.NodeID]
 	repositoryReport := state.RepositoryReports[node.ID]
-	workspaceRoot, resolvedSourcePath, _ := resolveWorkspaceOnNode(node, repositoryReport, requirements)
-	hasExplicitWorkspaceTarget := requirements.Workspace != nil && (requirements.Workspace.Path != "" || requirements.Workspace.Repository != "")
+	workspaceRoot, resolvedSourcePath, _ := resolveTaskWorkspaceInState(state, task.ThreadID, node, repositoryReport, requirements)
+	hasExplicitWorkspaceTarget := requirements.Workspace != nil && (requirements.Workspace.Path != "" || requirements.Workspace.Repository != "" || requirements.Workspace.SourceLeaseID != "")
 	requiresResolvedWorkspace := hasExplicitWorkspaceTarget || (instance.AutoManaged && task.PlacementInstanceID == "")
 	if requiresResolvedWorkspace && resolvedSourcePath != "" {
 		workspacePath = resolvedSourcePath
@@ -432,8 +432,8 @@ func (service *Service) assignTaskToResident(
 
 	var leaseGrantPtr *protocol.WorkspaceLeaseGrant
 	var leaseIDPtr *string
-	if requirements.Workspace != nil && requirements.Workspace.Isolation != "" {
-		lease := buildWorkspaceLease(
+	if requirements.Workspace != nil && (requirements.Workspace.Isolation != "" || requirements.Workspace.SourceLeaseID != "") {
+		lease := buildTaskWorkspaceLeaseInState(
 			state,
 			*task,
 			runID,
@@ -642,13 +642,16 @@ func (service *Service) selectOfferingForRequirements(
 		}
 
 		repositoryReport := state.RepositoryReports[nodeID]
-		workspaceRoot, workspacePath, workspaceFailure := resolveWorkspaceOnNode(node, repositoryReport, effectiveRequirements)
+		workspaceRoot, workspacePath, workspaceFailure := resolveWorkspaceForNodeInState(state, node, repositoryReport, effectiveRequirements)
 		if workspaceFailure != "" {
 			requirementLabel := "workspace-root"
 			if effectiveRequirements.Workspace != nil {
-				if effectiveRequirements.Workspace.Path == "" && effectiveRequirements.Workspace.Repository != "" {
+				switch {
+				case effectiveRequirements.Workspace.SourceLeaseID != "":
+					requirementLabel = "sourceLeaseId:" + effectiveRequirements.Workspace.SourceLeaseID
+				case effectiveRequirements.Workspace.Path == "" && effectiveRequirements.Workspace.Repository != "":
 					requirementLabel = "repository:" + effectiveRequirements.Workspace.Repository
-				} else if effectiveRequirements.Workspace.Path != "" {
+				case effectiveRequirements.Workspace.Path != "":
 					requirementLabel = "path:" + effectiveRequirements.Workspace.Path
 				}
 			}
@@ -755,10 +758,10 @@ func (service *Service) hasProvisioningCompatibleInstance(
 		if len(requirements.Transports) > 0 && !slices.Contains(requirements.Transports, allocation.Transport) {
 			continue
 		}
-		requiresResolvedWorkspace := (requirements.Workspace != nil && (requirements.Workspace.Path != "" || requirements.Workspace.Repository != "")) || instance.AutoManaged
+		requiresResolvedWorkspace := (requirements.Workspace != nil && (requirements.Workspace.Path != "" || requirements.Workspace.Repository != "" || requirements.Workspace.SourceLeaseID != "")) || instance.AutoManaged
 		if requiresResolvedWorkspace {
 			if node, exists := state.Nodes[allocation.NodeID]; exists {
-				_, resolvedSourcePath, failure := resolveWorkspaceOnNode(node, state.RepositoryReports[node.ID], requirements)
+				_, resolvedSourcePath, failure := resolveWorkspaceForNodeInState(state, node, state.RepositoryReports[node.ID], requirements)
 				if failure != "" || allocation.Workspace != resolvedSourcePath {
 					continue
 				}
@@ -857,11 +860,13 @@ func mergeProjectProfileRequirements(
 		if merged.Workspace.BaseBranch == "" && profile.Repository != nil {
 			merged.Workspace.BaseBranch = profile.Repository.DefaultBranch
 		}
-		if merged.Workspace.Isolation == "" {
-			merged.Workspace.Isolation = profile.WorkspacePolicy.Isolation
-		}
-		if merged.Workspace.Cleanup == "" {
-			merged.Workspace.Cleanup = profile.WorkspacePolicy.Cleanup
+		if merged.Workspace.SourceLeaseID == "" {
+			if merged.Workspace.Isolation == "" {
+				merged.Workspace.Isolation = profile.WorkspacePolicy.Isolation
+			}
+			if merged.Workspace.Cleanup == "" {
+				merged.Workspace.Cleanup = profile.WorkspacePolicy.Cleanup
+			}
 		}
 	}
 	return merged

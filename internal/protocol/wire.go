@@ -134,30 +134,32 @@ type SlaveControlMessage struct {
 	Method            string                    `json:"method,omitempty"`
 	Params            json.RawMessage           `json:"params,omitempty"`
 	At                string                    `json:"at,omitempty"`
+	LandResult        *WorkspaceLeaseLandResult `json:"landResult,omitempty"`
 }
 
 // Control-plane messages sent from the master `/control-agent` endpoint to a slave node.
 type MasterControlMessage struct {
-	Type           string                    `json:"type"`
-	At             string                    `json:"at,omitempty"`
-	RunID          string                    `json:"runId,omitempty"`
-	LeaseID        string                    `json:"leaseId,omitempty"`
-	Status         string                    `json:"status,omitempty"`
-	Mode           string                    `json:"mode,omitempty"`
-	InstanceID     string                    `json:"instanceId,omitempty"`
-	AllocationID   string                    `json:"allocationId,omitempty"`
-	Instance       *AgentInstance            `json:"instance,omitempty"`
-	Allocation     *InstanceAllocation       `json:"allocation,omitempty"`
-	Run            *Run                      `json:"run,omitempty"`
-	SessionBinding *DispatchSessionBinding   `json:"sessionBinding,omitempty"`
-	WorkspaceLease *WorkspaceLeaseGrant      `json:"workspaceLease,omitempty"`
-	Lease          *WorkspaceLeaseGrant      `json:"lease,omitempty"`
-	Decision       *ApprovalDecision         `json:"decision,omitempty"`
-	NodeUpdate     *NodeUpdateDirective      `json:"nodeUpdate,omitempty"`
-	Clone          *RepositoryCloneDirective `json:"clone,omitempty"`
-	RequestID      string                    `json:"requestId,omitempty"`
-	Result         json.RawMessage           `json:"result,omitempty"`
-	Error          *HubRPCError              `json:"error,omitempty"`
+	Type           string                     `json:"type"`
+	At             string                     `json:"at,omitempty"`
+	RunID          string                     `json:"runId,omitempty"`
+	LeaseID        string                     `json:"leaseId,omitempty"`
+	Status         string                     `json:"status,omitempty"`
+	Mode           string                     `json:"mode,omitempty"`
+	InstanceID     string                     `json:"instanceId,omitempty"`
+	AllocationID   string                     `json:"allocationId,omitempty"`
+	Instance       *AgentInstance             `json:"instance,omitempty"`
+	Allocation     *InstanceAllocation        `json:"allocation,omitempty"`
+	Run            *Run                       `json:"run,omitempty"`
+	SessionBinding *DispatchSessionBinding    `json:"sessionBinding,omitempty"`
+	WorkspaceLease *WorkspaceLeaseGrant       `json:"workspaceLease,omitempty"`
+	Lease          *WorkspaceLeaseGrant       `json:"lease,omitempty"`
+	Decision       *ApprovalDecision          `json:"decision,omitempty"`
+	NodeUpdate     *NodeUpdateDirective       `json:"nodeUpdate,omitempty"`
+	Clone          *RepositoryCloneDirective  `json:"clone,omitempty"`
+	RequestID      string                     `json:"requestId,omitempty"`
+	Result         json.RawMessage            `json:"result,omitempty"`
+	Error          *HubRPCError               `json:"error,omitempty"`
+	Land           *WorkspaceLeaseLandRequest `json:"land,omitempty"`
 }
 
 type HubRPCError struct {

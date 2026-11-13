@@ -172,12 +172,13 @@ type ExecutionPreferences struct {
 }
 
 type WorkspaceRequirements struct {
-	Repository string `json:"repository,omitempty"`
-	Path       string `json:"path,omitempty"`
-	Writable   bool   `json:"writable,omitempty"`
-	Isolation  string `json:"isolation,omitempty"`
-	Cleanup    string `json:"cleanup,omitempty"`
-	BaseBranch string `json:"baseBranch,omitempty"`
+	Repository    string `json:"repository,omitempty"`
+	Path          string `json:"path,omitempty"`
+	Writable      bool   `json:"writable,omitempty"`
+	Isolation     string `json:"isolation,omitempty"`
+	Cleanup       string `json:"cleanup,omitempty"`
+	BaseBranch    string `json:"baseBranch,omitempty"`
+	SourceLeaseID string `json:"sourceLeaseId,omitempty"`
 }
 
 type ExecutionRequirements struct {
