@@ -30,6 +30,9 @@ const STATUS_TONE: Record<string, Tone> = {
   streaming: "info",
   retained: "warn",
   cleaned: "faint",
+  stalled: "err",
+  quota_exhausted: "err",
+  rate_limited: "warn",
 };
 
 export function toneForStatus(status: string): Tone {
