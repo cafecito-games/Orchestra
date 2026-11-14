@@ -43,6 +43,17 @@ func TestMCPServerGrantDelegationAndPostArtifact(t *testing.T) {
 					"uploadPath": "/api/artifacts/art-1/content",
 				})
 			}
+			if method == "post_room_message" {
+				return json.Marshal(map[string]any{
+					"threadId":         "thr-1",
+					"room":             map[string]any{"headSequence": 1},
+					"message":          map[string]any{"sequence": 1, "id": "rmsg-1"},
+					"nudgedTaskIds":    []string{"task-1"},
+					"wokenInstanceIds": []string{"inst-verifier"},
+					"wakeTaskIds":      []string{"task-wake-1"},
+					"replayed":         false,
+				})
+			}
 			return json.Marshal(map[string]any{"runId": runID, "method": method})
 		},
 		func(_ context.Context, uploadPath string, content io.Reader, _ int64) error {
@@ -99,32 +110,63 @@ func TestMCPServerGrantDelegationAndPostArtifact(t *testing.T) {
 		}
 	}
 	require.NotNil(t, leafPostRoomSchema)
-	assert.NotContains(t, leafPostRoomSchema["properties"].(map[string]any), "nudgeTaskIds")
+	leafProperties := leafPostRoomSchema["properties"].(map[string]any)
+	assert.Contains(t, leafProperties, "nudgeTaskIds")
+	assert.Contains(t, leafProperties, "channel")
+	assert.Contains(t, leafProperties, "mentions")
+	assert.Contains(t, leafProperties, "wake")
+	assert.NotContains(t, leafProperties, "nudge")
 
-	_, leafNudgeDenied := callMCP(workerConfiguration, "tools/call", map[string]any{
+	_, leafBroadcastNudgeDenied := callMCP(workerConfiguration, "tools/call", map[string]any{
 		"name": "post_room_message",
 		"arguments": map[string]any{
-			"idempotencyKey": "k-nudge",
+			"idempotencyKey": "k-broadcast-nudge",
 			"kind":           "guidance",
-			"body":           "attempt nudge",
+			"body":           "attempt broadcast nudge",
+			"nudge":          true,
+		},
+	})
+	assert.Equal(t, true, leafBroadcastNudgeDenied["result"].(map[string]any)["isError"])
+
+	_, leafSiblingNudgeAllowed := callMCP(workerConfiguration, "tools/call", map[string]any{
+		"name": "post_room_message",
+		"arguments": map[string]any{
+			"idempotencyKey": "k-sibling-nudge",
+			"kind":           "finding",
+			"channel":        "verification",
+			"body":           "ready for @verifier",
+			"mentions":       []string{"@verifier"},
+			"wake":           true,
 			"nudgeTaskIds":   []string{"task-1"},
 		},
 	})
-	assert.Equal(t, true, leafNudgeDenied["result"].(map[string]any)["isError"])
+	assert.NotEqual(t, true, leafSiblingNudgeAllowed["result"].(map[string]any)["isError"])
+
+	_, leafLandDenied := callMCP(workerConfiguration, "tools/call", map[string]any{
+		"name":      "land_workspace_lease",
+		"arguments": map[string]any{"leaseId": "lease-1"},
+	})
+	assert.Equal(t, true, leafLandDenied["result"].(map[string]any)["isError"])
 
 	delegatingConfiguration, err := server.Grant("run-delegator", workspaceDirectory, true)
 	require.NoError(t, err)
 	defer server.Revoke(delegatingConfiguration.Token)
 	_, delegatingList := callMCP(delegatingConfiguration, "tools/list", map[string]any{})
 	var delegatingPostRoomSchema map[string]any
+	var delegatingToolNames []string
 	for _, rawTool := range delegatingList["result"].(map[string]any)["tools"].([]any) {
 		toolMap := rawTool.(map[string]any)
+		delegatingToolNames = append(delegatingToolNames, toolMap["name"].(string))
 		if toolMap["name"] == "post_room_message" {
 			delegatingPostRoomSchema = toolMap["inputSchema"].(map[string]any)
 		}
 	}
 	require.NotNil(t, delegatingPostRoomSchema)
 	assert.Contains(t, delegatingPostRoomSchema["properties"].(map[string]any), "nudgeTaskIds")
+	assert.Contains(t, delegatingPostRoomSchema["properties"].(map[string]any), "nudge")
+	assert.Contains(t, delegatingToolNames, "list_workspace_leases")
+	assert.Contains(t, delegatingToolNames, "land_workspace_lease")
+	assert.Contains(t, delegatingToolNames, "reconfigure_instance")
 
 	_, delegateDenied := callMCP(workerConfiguration, "tools/call", map[string]any{
 		"name":      "submit_tasks",

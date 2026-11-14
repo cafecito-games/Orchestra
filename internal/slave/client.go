@@ -454,6 +454,10 @@ func (client *Client) dispatchMasterMessage(message protocol.MasterControlMessag
 		client.waitGroup.Go(func() {
 			client.handleInstanceProvision(message.Instance, message.Allocation)
 		})
+	case protocol.InstanceReconfigureControlType:
+		client.waitGroup.Go(func() {
+			client.handleInstanceReconfigure(message)
+		})
 	case "instance.release":
 		client.waitGroup.Go(func() {
 			client.handleInstanceRelease(message.InstanceID, message.AllocationID, message.Mode)
@@ -474,6 +478,13 @@ func (client *Client) dispatchMasterMessage(message protocol.MasterControlMessag
 			mode := message.Mode
 			client.waitGroup.Go(func() {
 				client.leases.handleCleanupCommand(grantCopy, mode)
+			})
+		}
+	case "workspace.land":
+		if message.Land != nil {
+			requestCopy := *message.Land
+			client.waitGroup.Go(func() {
+				client.leases.handleLandCommand(requestCopy)
 			})
 		}
 	case "hub.rpc.response":

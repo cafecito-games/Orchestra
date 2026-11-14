@@ -21,11 +21,15 @@ var HubToolNames = []string{
 	"send_mail",
 	"read_mail",
 	"wait_for_mail",
+	"wait_for_activity",
 	"get_execution_inventory",
+	"list_workspace_leases",
+	"land_workspace_lease",
 	"submit_tasks",
 	"delegate_task",
 	"spawn_instance",
 	"get_instance",
+	"reconfigure_instance",
 	"renew_instance",
 	"release_instance",
 }
@@ -33,10 +37,13 @@ var HubToolNames = []string{
 // DelegationHubToolNames are the subset of HubToolNames gated on CanDelegate == true.
 var DelegationHubToolNames = []string{
 	"get_execution_inventory",
+	"list_workspace_leases",
+	"land_workspace_lease",
 	"submit_tasks",
 	"delegate_task",
 	"spawn_instance",
 	"get_instance",
+	"reconfigure_instance",
 	"renew_instance",
 	"release_instance",
 }
@@ -46,6 +53,8 @@ var OrchestratorToolNames = []string{
 	"get_execution_inventory",
 	"refresh_repositories",
 	"clone_repository",
+	"list_workspace_leases",
+	"land_workspace_lease",
 	"update_nodes",
 	"create_thread",
 	"list_threads",
@@ -63,6 +72,7 @@ var OrchestratorToolNames = []string{
 	"post_artifact",
 	"spawn_instance",
 	"get_instance",
+	"reconfigure_instance",
 	"renew_instance",
 	"release_instance",
 	"list_approvals",
@@ -73,6 +83,7 @@ var OrchestratorToolNames = []string{
 	"send_mail",
 	"read_mail",
 	"wait_for_mail",
+	"wait_for_activity",
 }
 
 // RelayToolNames are the communication-only tools exposed by an Orchestra relay.
@@ -119,6 +130,7 @@ type SlaveControlMessage struct {
 	Chunk             *string                   `json:"chunk,omitempty"`
 	Output            *string                   `json:"output,omitempty"`
 	Error             *string                   `json:"error,omitempty"`
+	ErrorKind         string                    `json:"errorKind,omitempty"`
 	Reason            string                    `json:"reason,omitempty"`
 	ProviderSessionID string                    `json:"providerSessionId,omitempty"`
 	Transport         *RunTransportSelection    `json:"transport,omitempty"`
@@ -134,30 +146,33 @@ type SlaveControlMessage struct {
 	Method            string                    `json:"method,omitempty"`
 	Params            json.RawMessage           `json:"params,omitempty"`
 	At                string                    `json:"at,omitempty"`
+	LandResult        *WorkspaceLeaseLandResult `json:"landResult,omitempty"`
 }
 
 // Control-plane messages sent from the master `/control-agent` endpoint to a slave node.
 type MasterControlMessage struct {
-	Type           string                    `json:"type"`
-	At             string                    `json:"at,omitempty"`
-	RunID          string                    `json:"runId,omitempty"`
-	LeaseID        string                    `json:"leaseId,omitempty"`
-	Status         string                    `json:"status,omitempty"`
-	Mode           string                    `json:"mode,omitempty"`
-	InstanceID     string                    `json:"instanceId,omitempty"`
-	AllocationID   string                    `json:"allocationId,omitempty"`
-	Instance       *AgentInstance            `json:"instance,omitempty"`
-	Allocation     *InstanceAllocation       `json:"allocation,omitempty"`
-	Run            *Run                      `json:"run,omitempty"`
-	SessionBinding *DispatchSessionBinding   `json:"sessionBinding,omitempty"`
-	WorkspaceLease *WorkspaceLeaseGrant      `json:"workspaceLease,omitempty"`
-	Lease          *WorkspaceLeaseGrant      `json:"lease,omitempty"`
-	Decision       *ApprovalDecision         `json:"decision,omitempty"`
-	NodeUpdate     *NodeUpdateDirective      `json:"nodeUpdate,omitempty"`
-	Clone          *RepositoryCloneDirective `json:"clone,omitempty"`
-	RequestID      string                    `json:"requestId,omitempty"`
-	Result         json.RawMessage           `json:"result,omitempty"`
-	Error          *HubRPCError              `json:"error,omitempty"`
+	Type           string                     `json:"type"`
+	At             string                     `json:"at,omitempty"`
+	RunID          string                     `json:"runId,omitempty"`
+	LeaseID        string                     `json:"leaseId,omitempty"`
+	Status         string                     `json:"status,omitempty"`
+	Mode           string                     `json:"mode,omitempty"`
+	Model          string                     `json:"model,omitempty"`
+	InstanceID     string                     `json:"instanceId,omitempty"`
+	AllocationID   string                     `json:"allocationId,omitempty"`
+	Instance       *AgentInstance             `json:"instance,omitempty"`
+	Allocation     *InstanceAllocation        `json:"allocation,omitempty"`
+	Run            *Run                       `json:"run,omitempty"`
+	SessionBinding *DispatchSessionBinding    `json:"sessionBinding,omitempty"`
+	WorkspaceLease *WorkspaceLeaseGrant       `json:"workspaceLease,omitempty"`
+	Lease          *WorkspaceLeaseGrant       `json:"lease,omitempty"`
+	Decision       *ApprovalDecision          `json:"decision,omitempty"`
+	NodeUpdate     *NodeUpdateDirective       `json:"nodeUpdate,omitempty"`
+	Clone          *RepositoryCloneDirective  `json:"clone,omitempty"`
+	RequestID      string                     `json:"requestId,omitempty"`
+	Result         json.RawMessage            `json:"result,omitempty"`
+	Error          *HubRPCError               `json:"error,omitempty"`
+	Land           *WorkspaceLeaseLandRequest `json:"land,omitempty"`
 }
 
 type HubRPCError struct {
@@ -247,6 +262,7 @@ type NodeDetail struct {
 	RepositoryReport  *NodeRepositoryReport     `json:"repositoryReport,omitempty"`
 	UpdateStatus      *NodeUpdateState          `json:"updateStatus,omitempty"`
 	ResidentInstances []string                  `json:"residentInstances,omitempty"`
+	OfferingCooldowns []OfferingCooldown        `json:"offeringCooldowns,omitempty"`
 }
 
 type ThreadDetailResponse struct {
@@ -262,6 +278,7 @@ type ThreadDetailResponse struct {
 	SessionBindings []HarnessSessionBinding `json:"sessionBindings"`
 	Messages        []TaskMessage           `json:"messages"`
 	Room            ThreadRoomHead          `json:"room"`
+	Stall           *ThreadStallReport      `json:"stall,omitempty"`
 	Activities      []RunActivity           `json:"activities"`
 	Transcripts     []RunTranscript         `json:"transcripts"`
 	EventStream     ThreadEventStream       `json:"eventStream"`

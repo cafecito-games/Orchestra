@@ -3,6 +3,7 @@ package slave
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/cafecito-games/Orchestra/internal/activitylog"
 	"github.com/cafecito-games/Orchestra/internal/protocol"
@@ -302,10 +303,98 @@ func (client *Client) acquireResidentForRun(
 	if dispatchedInstance != nil && dispatchedInstance.ID == resident.instance.ID {
 		resident.instance = *dispatchedInstance
 	}
+	if dispatchedAllocation != nil && dispatchedAllocation.ID == resident.allocation.ID && strings.TrimSpace(dispatchedAllocation.Model) != "" {
+		if client.runner == nil || client.runner.AdmitModel(resident.allocation.HarnessID, dispatchedAllocation.Model) == nil {
+			resident.allocation.Model = dispatchedAllocation.Model
+			if dispatchedAllocation.UpdatedAt != "" {
+				resident.allocation.UpdatedAt = dispatchedAllocation.UpdatedAt
+			}
+		}
+	}
 	resident.activeRunID = run.ID
 	snapshot := *resident
 	client.mutex.Unlock()
 	return snapshot, nil
+}
+
+func (client *Client) handleInstanceReconfigure(message protocol.MasterControlMessage) {
+	instanceID := message.InstanceID
+	if instanceID == "" && message.Instance != nil {
+		instanceID = message.Instance.ID
+	}
+	allocationID := message.AllocationID
+	if allocationID == "" && message.Allocation != nil {
+		allocationID = message.Allocation.ID
+	}
+	targetModel := strings.TrimSpace(message.Model)
+	if targetModel == "" && message.Allocation != nil {
+		targetModel = strings.TrimSpace(message.Allocation.Model)
+	}
+	if !protocol.IsIdentifier(instanceID) || targetModel == "" {
+		return
+	}
+
+	client.mutex.Lock()
+	if client.restartingForUpdate {
+		client.mutex.Unlock()
+		return
+	}
+	resident, exists := client.instances[instanceID]
+	if !exists {
+		client.mutex.Unlock()
+		return
+	}
+	if allocationID != "" && resident.allocation.ID != allocationID {
+		client.mutex.Unlock()
+		return
+	}
+	if resident.status != "active" || resident.activeRunID != "" {
+		client.mutex.Unlock()
+		return
+	}
+	harnessID := resident.allocation.HarnessID
+	client.mutex.Unlock()
+
+	if client.runner != nil {
+		if err := client.runner.AdmitModel(harnessID, targetModel); err != nil {
+			client.activityLogger.Warn(
+				"instance",
+				"reconfigure rejected",
+				activitylog.String("instance", instanceID),
+				activitylog.String("harness", harnessID),
+				activitylog.String("model", targetModel),
+				activitylog.String("error", protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))),
+			)
+			return
+		}
+	}
+
+	client.mutex.Lock()
+	resident, exists = client.instances[instanceID]
+	if !exists || resident.status != "active" || resident.activeRunID != "" {
+		client.mutex.Unlock()
+		return
+	}
+	if allocationID != "" && resident.allocation.ID != allocationID {
+		client.mutex.Unlock()
+		return
+	}
+	resident.allocation.Model = targetModel
+	if message.Allocation != nil && message.Allocation.ID == resident.allocation.ID && message.Allocation.UpdatedAt != "" {
+		resident.allocation.UpdatedAt = message.Allocation.UpdatedAt
+	}
+	if message.Instance != nil && message.Instance.ID == resident.instance.ID {
+		resident.instance = *message.Instance
+	}
+	client.mutex.Unlock()
+
+	client.activityLogger.Info(
+		"instance",
+		"reconfigured",
+		activitylog.String("instance", instanceID),
+		activitylog.String("harness", harnessID),
+		activitylog.String("model", targetModel),
+	)
 }
 
 func (client *Client) completeResidentRun(instanceID, allocationID, runID string) (bool, string) {

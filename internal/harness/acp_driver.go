@@ -352,9 +352,9 @@ func (driver *ACPDriver) Execute(operationContext context.Context, invocation In
 
 	if runErr != nil {
 		if diagnostic := process.stderr.String(); diagnostic != "" {
-			return "", fmt.Errorf("%w%s%s", runErr, adapterStderrSeparator, diagnostic)
+			return "", WrapClassifiedError(fmt.Errorf("%w%s%s", runErr, adapterStderrSeparator, diagnostic))
 		}
-		return "", runErr
+		return "", WrapClassifiedError(runErr)
 	}
 	if forced {
 		client.Warn(warningForcedShutdown, "ACP adapter did not exit after its session ended and was terminated")

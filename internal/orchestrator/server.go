@@ -1079,20 +1079,27 @@ func (service *Service) handleAPIWorkspaceLeases(writer http.ResponseWriter, req
 func (service *Service) handleAPIWorkspaceLeaseSubroutes(writer http.ResponseWriter, request *http.Request) {
 	remainder := strings.TrimPrefix(request.URL.Path, "/api/workspace-leases/")
 	leaseID, action, hasAction := strings.Cut(remainder, "/")
-	if !hasAction || action != "cleanup" {
+	if !hasAction {
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
-	if request.Method != http.MethodPost {
-		writer.WriteHeader(http.StatusMethodNotAllowed)
-		return
+	switch action {
+	case "cleanup":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		updated, err := service.CleanupWorkspaceLease(leaseID)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, map[string]any{"workspaceLease": updated})
+	case "land":
+		service.HandleAPIWorkspaceLeaseLand(writer, request, leaseID)
+	default:
+		writer.WriteHeader(http.StatusNotFound)
 	}
-	updated, err := service.CleanupWorkspaceLease(leaseID)
-	if err != nil {
-		writeOperationError(writer, err)
-		return
-	}
-	writeJSONResponse(writer, http.StatusOK, map[string]any{"workspaceLease": updated})
 }
 
 func (service *Service) handleAPIMailAgents(writer http.ResponseWriter, request *http.Request) {

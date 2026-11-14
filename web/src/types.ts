@@ -142,6 +142,8 @@ export interface Task {
   assignment?: TaskAssignment;
   summary?: string;
   blockerReason?: string;
+  lastReadRoomSequence?: number;
+  requiredRoomSequence?: number;
 }
 
 export interface InstancePurpose {
@@ -158,6 +160,9 @@ export interface InstanceLease {
 export interface AgentInstance {
   id: string;
   threadId: string;
+  handle?: string;
+  forkFromInstanceId?: string;
+  roomChannels?: string[];
   purpose?: InstancePurpose;
   status: string;
   autoManaged?: boolean;
@@ -185,8 +190,10 @@ export interface Run {
   status: string;
   output: string;
   error?: string;
+  errorKind?: string;
   taskId?: string;
   createdAt: string;
+  finishedAt?: string;
 }
 
 export interface ApprovalOption {
@@ -217,12 +224,16 @@ export interface Artifact {
   id: string;
   threadId: string;
   taskId?: string;
+  runId?: string;
   name: string;
+  kind?: string;
   mediaType: string;
   sizeBytes: number;
+  summary?: string;
   uploaded: boolean;
   downloadPath: string;
   createdAt: string;
+  uploadedAt?: string;
 }
 
 export interface TaskMessage {
@@ -233,12 +244,145 @@ export interface TaskMessage {
   createdAt: string;
 }
 
+export type RoomMessageKind =
+  | "finding"
+  | "contract"
+  | "decision"
+  | "gotcha"
+  | "guidance"
+  | "question"
+  | "answer";
+
+export interface RoomAuthor {
+  kind: string;
+  taskId?: string;
+  runId?: string;
+  instanceId?: string;
+  handle?: string;
+  title?: string;
+  clientId?: string;
+  operatorId?: string;
+}
+
+export interface RoomMessage {
+  seq: number;
+  id: string;
+  threadId: string;
+  createdAt: string;
+  author: RoomAuthor;
+  kind: RoomMessageKind | string;
+  channel?: string;
+  topic?: string;
+  body: string;
+  mentions?: string[];
+  replyToSequence?: number;
+  supersedesSequence?: number;
+  artifactIds?: string[];
+}
+
+export interface ThreadRoomHead {
+  threadId: string;
+  directoryName: string;
+  headSequence: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReadRoomResult {
+  threadId: string;
+  room: ThreadRoomHead;
+  path?: string;
+  messages: RoomMessage[];
+  headSequence: number;
+  lastReadSequence: number;
+  requiredSequence: number;
+  unreadNudge: boolean;
+  throughSequence: number;
+  hasMore: boolean;
+}
+
+export interface PostRoomMessageRequest {
+  idempotencyKey: string;
+  kind: RoomMessageKind;
+  channel?: string;
+  topic?: string;
+  body: string;
+  replyToSequence?: number;
+  supersedesSequence?: number;
+  artifactIds?: string[];
+  nudge?: boolean;
+  nudgeTaskIds?: string[];
+}
+
+export interface PostRoomMessageResult {
+  threadId: string;
+  room: ThreadRoomHead;
+  message: RoomMessage;
+  nudgedTaskIds: string[];
+  replayed: boolean;
+}
+
+export interface NudgeRoomResult {
+  threadId: string;
+  room: ThreadRoomHead;
+  requiredSequence: number;
+  nudgedTaskIds: string[];
+  replayed: boolean;
+}
+
+export interface ThreadStallCondition {
+  kind?: string;
+  reason?: string;
+  summary?: string;
+  detail?: string;
+  handle?: string;
+  instanceId?: string;
+  taskId?: string;
+  taskIds?: string[];
+  runId?: string;
+  seq?: number;
+  sequence?: number;
+  roomSequence?: number;
+}
+
+export interface ThreadStallReport {
+  threadId?: string;
+  stalled?: boolean;
+  kind?: string;
+  reason?: string;
+  reasons?: string[];
+  summary?: string;
+  conditions?: Array<string | ThreadStallCondition>;
+  detectedAt?: string;
+  evaluatedAt?: string;
+  occurredAt?: string;
+  roomSequence?: number;
+  headRoomSequence?: number;
+  throughRoomSequence?: number;
+  lastReadRoomSequence?: number;
+  throughSequence?: number;
+  blockedTaskIds?: string[];
+  unansweredMentions?: Array<
+    | string
+    | {
+        handle?: string;
+        instanceId?: string;
+        seq?: number;
+        sequence?: number;
+        roomSequence?: number;
+        taskId?: string;
+        runId?: string;
+      }
+  >;
+}
+
 export interface ThreadAttachment {
   id: string;
   threadId: string;
   clientId: string;
   sessionId: string;
   status: string;
+  lastReadRoomSequence?: number;
 }
 
 export interface ThreadDetail {
@@ -251,6 +395,8 @@ export interface ThreadDetail {
   approvals: ApprovalRequest[];
   artifacts: Artifact[];
   messages: TaskMessage[];
+  room?: ThreadRoomHead;
+  stall?: ThreadStallReport | null;
   eventStream: { threadId: string; head: number; floor: number; updatedAt: string };
 }
 

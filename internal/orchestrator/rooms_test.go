@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cafecito-games/Orchestra/internal/protocol"
@@ -132,20 +134,20 @@ func TestRoomBlackboardIsolationValidationRedactionAndIdempotency(t *testing.T) 
 	assertOperationErrorCode(t, err, "invalid_request")
 
 	_, err = service.PostRoomMessage(siblingCaller, PostRoomMessageInput{
-		IdempotencyKey: "leaf-nudge",
+		IdempotencyKey: "leaf-broadcast-nudge",
 		Kind:           "guidance",
-		Body:           "try nudge",
-		NudgeTaskIDs:   []string{parentTaskID},
+		Body:           "non-delegating run cannot broadcast thread-wide nudge",
+		Nudge:          true,
 	})
 	assertOperationErrorCode(t, err, "forbidden")
 
-	_, err = service.PostRoomMessage(parentCaller, PostRoomMessageInput{
-		IdempotencyKey: "parent-nudge-sibling",
+	_, err = service.PostRoomMessage(siblingCaller, PostRoomMessageInput{
+		IdempotencyKey: "cross-thread-nudge",
 		Kind:           "guidance",
-		Body:           "cannot nudge sibling",
-		NudgeTaskIDs:   []string{siblingTaskID},
+		Body:           "cannot nudge task in another thread",
+		NudgeTaskIDs:   []string{otherTaskID},
 	})
-	assertOperationErrorCode(t, err, "forbidden")
+	assertOperationErrorCode(t, err, "invalid_request")
 
 	postedOne, err := service.PostRoomMessage(siblingCaller, PostRoomMessageInput{
 		IdempotencyKey: "post-1",
@@ -743,4 +745,643 @@ func TestRoomMirrorRecoverySingleShotNudgeRetryBoundAndAuthorRedaction(t *testin
 	finalMirroredJSONL, err := os.ReadFile(jsonlPath)
 	require.NoError(t, err)
 	require.NotContains(t, string(finalMirroredJSONL), "master-secret-token")
+}
+
+func TestRoomMentionsSiblingHandoffsPrefixWakeupsAndDoorbells(t *testing.T) {
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	service, err := NewService(ServiceOptions{
+		Store:            openedStore,
+		Token:            "master-secret-token",
+		DoorbellDebounce: 2 * time.Second,
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	httpServer := httptest.NewServer(service.Handler())
+	defer httpServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/orchestrator-client"
+	coordinatorSocket, dialResponse, err := websocket.Dial(t.Context(), wsURL, &websocket.DialOptions{
+		HTTPHeader: map[string][]string{"Authorization": {"Bearer master-secret-token"}},
+	})
+	if dialResponse != nil && dialResponse.Body != nil {
+		_ = dialResponse.Body.Close()
+	}
+	require.NoError(t, err)
+	defer coordinatorSocket.CloseNow()
+
+	registerCoordinator, err := json.Marshal(protocol.OrchestratorClientMessage{
+		Type:            "register",
+		ProtocolVersion: protocol.ProtocolVersion,
+		ClientID:        "coord-client",
+		SessionID:       "coord-session",
+		Mail: &protocol.ClientMailRegistration{
+			RequestedName: "shepherd",
+			Harness:       "claude",
+			PushCapable:   true,
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, coordinatorSocket.Write(t.Context(), websocket.MessageText, registerCoordinator))
+
+	readContext, cancelRead := context.WithTimeout(t.Context(), 2*time.Second)
+	_, rawWelcome, err := coordinatorSocket.Read(readContext)
+	cancelRead()
+	require.NoError(t, err)
+	var welcomeResponse protocol.OrchestratorServerMessage
+	require.NoError(t, json.Unmarshal(rawWelcome, &welcomeResponse))
+	require.Equal(t, "welcome", welcomeResponse.Type)
+	require.NotNil(t, welcomeResponse.Mailbox)
+
+	coordinatorSessionID := welcomeResponse.SessionID
+	if coordinatorSessionID == "" {
+		coordinatorSessionID = "coord-session"
+	}
+	coordinatorCaller := CallerIdentity{
+		Kind:      "orchestrator-client",
+		ClientID:  "coord-client",
+		SessionID: coordinatorSessionID,
+	}
+
+	thread, _, err := service.CreateThread(coordinatorCaller, CreateThreadInput{Title: "Sibling handoff thread"})
+	require.NoError(t, err)
+	_, _, err = service.AttachThread(coordinatorCaller, AttachThreadInput{ThreadID: thread.ID})
+	require.NoError(t, err)
+
+	otherThread, _, err := service.CreateThread(coordinatorCaller, CreateThreadInput{Title: "Other isolated thread"})
+	require.NoError(t, err)
+
+	submitted, err := service.SubmitTasks(coordinatorCaller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "sub-siblings",
+		Tasks: []SubmittedTaskSpec{
+			{ClientTaskID: "author-task", Title: "Author", Instructions: "Write parser"},
+			{ClientTaskID: "peer-task", Title: "Peer", Instructions: "Write lexer"},
+		},
+	})
+	require.NoError(t, err)
+	authorTaskID := submitted.ClientTaskMap["author-task"]
+	peerTaskID := submitted.ClientTaskMap["peer-task"]
+
+	workspace := t.TempDir()
+	nowText := service.nowUTC()
+	authorName := "author"
+	verifierName := "verifier"
+	reviewerOneName := "reviewer-1"
+	reviewerTwoName := "reviewer-2"
+	reviewerAlphaName := "reviewer-alpha"
+
+	_, err = openedStore.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		attempt := 1
+		registerInstance := func(instanceID string, targetThreadID string, name string, status string) {
+			nameCopy := name
+			instance := protocol.AgentInstance{
+				ID:        instanceID,
+				ThreadID:  targetThreadID,
+				Purpose:   &protocol.InstancePurpose{Name: &nameCopy},
+				Status:    status,
+				CreatedAt: nowText,
+				UpdatedAt: nowText,
+				Lease:     protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+			}
+			allocation := protocol.InstanceAllocation{
+				ID: "alloc-" + instanceID, InstanceID: instanceID, NodeID: "node-1", HarnessID: "claude-cli", Model: "sonnet",
+				Transport: "acp-v1", Workspace: workspace, Status: "active", CreatedAt: nowText, UpdatedAt: nowText,
+				Lease: protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+			}
+			state.Instances[instanceID] = instance
+			state.Allocations[allocation.ID] = allocation
+			service.ensureInstanceMailboxInState(state, instance, allocation, nowText)
+		}
+
+		registerInstance("inst-author", thread.ID, authorName, "busy")
+		registerInstance("inst-peer", thread.ID, "peer", "busy")
+		registerInstance("inst-verifier", thread.ID, verifierName, "idle")
+		registerInstance("inst-rev-1", thread.ID, reviewerOneName, "idle")
+		registerInstance("inst-rev-2", thread.ID, reviewerTwoName, "ready")
+		registerInstance("inst-rev-alpha", thread.ID, reviewerAlphaName, "idle")
+		registerInstance("inst-other-verifier", otherThread.ID, verifierName, "idle")
+
+		authorTask := state.Tasks[authorTaskID]
+		authorTask.Status = "running"
+		authorTask.Assignment = &protocol.TaskAssignment{
+			RunID: "run-author", InstanceID: "inst-author", AllocationID: "alloc-inst-author", NodeID: "node-1", Attempt: 1, AssignedAt: nowText,
+		}
+		state.Tasks[authorTaskID] = authorTask
+		state.Runs["run-author"] = protocol.Run{
+			ID: "run-author", ThreadID: thread.ID, InstanceID: "inst-author", AllocationID: "alloc-inst-author",
+			NodeID: "node-1", Status: "running", CreatedAt: nowText, TaskID: &authorTaskID, Attempt: &attempt,
+		}
+
+		peerTask := state.Tasks[peerTaskID]
+		peerTask.Status = "running"
+		peerTask.Assignment = &protocol.TaskAssignment{
+			RunID: "run-peer", InstanceID: "inst-peer", AllocationID: "alloc-inst-peer", NodeID: "node-1", Attempt: 1, AssignedAt: nowText,
+		}
+		state.Tasks[peerTaskID] = peerTask
+		state.Runs["run-peer"] = protocol.Run{
+			ID: "run-peer", ThreadID: thread.ID, InstanceID: "inst-peer", AllocationID: "alloc-inst-peer",
+			NodeID: "node-1", Status: "running", CreatedAt: nowText, TaskID: &peerTaskID, Attempt: &attempt,
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Non-delegating sibling run can nudge a peer task in the same thread and wake @verifier.
+	authorCaller := CallerIdentity{
+		Kind:        "run",
+		RunID:       "run-author",
+		TaskID:      authorTaskID,
+		ThreadID:    thread.ID,
+		InstanceID:  "inst-author",
+		CanDelegate: false,
+	}
+
+	handoffResult, err := service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "sibling-handoff-1",
+		Kind:           "finding",
+		Topic:          "parser-ready",
+		Body:           "Parser AST landed; @verifier please audit and sync with peer.",
+		NudgeTaskIDs:   []string{peerTaskID},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), handoffResult.Message.Sequence)
+	assert.Equal(t, "main", handoffResult.Message.Channel)
+	assert.Equal(t, []string{"@verifier"}, handoffResult.Message.Mentions)
+	assert.Equal(t, []string{peerTaskID}, handoffResult.NudgedTaskIDs)
+	assert.Equal(t, []string{"inst-verifier"}, handoffResult.WokenInstanceIDs)
+	require.Len(t, handoffResult.WakeTaskIDs, 1)
+
+	wakeTaskID := handoffResult.WakeTaskIDs[0]
+	require.NoError(t, openedStore.Read(func(state *store.State) error {
+		wakeTask, exists := state.Tasks[wakeTaskID]
+		require.True(t, exists)
+		assert.Equal(t, "ready", wakeTask.Status)
+		assert.Equal(t, "inst-verifier", wakeTask.PlacementInstanceID)
+		assert.Equal(t, "room-wake", wakeTask.Origin.Kind)
+		assert.Contains(t, wakeTask.Instructions, "Room #1")
+		assert.Contains(t, wakeTask.Instructions, "Channel: main")
+		assert.Contains(t, wakeTask.Instructions, "Kind: finding")
+		assert.Contains(t, wakeTask.Instructions, "@author")
+		assert.Contains(t, wakeTask.Instructions, "read_room")
+		assert.Contains(t, wakeTask.Instructions, "update_task")
+		assert.Equal(t, int64(1), state.Instances["inst-author"].LastPostRoomSequence)
+		return nil
+	}))
+
+	// Idempotent replay returns identical wake metadata without creating another wake task.
+	replayedHandoff, err := service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "sibling-handoff-1",
+		Kind:           "finding",
+		Topic:          "parser-ready",
+		Body:           "Parser AST landed; @verifier please audit and sync with peer.",
+		NudgeTaskIDs:   []string{peerTaskID},
+	})
+	require.NoError(t, err)
+	assert.True(t, replayedHandoff.Replayed)
+	assert.Equal(t, handoffResult.WokenInstanceIDs, replayedHandoff.WokenInstanceIDs)
+	assert.Equal(t, handoffResult.WakeTaskIDs, replayedHandoff.WakeTaskIDs)
+
+	// Prefix @reviewer wakes reviewer-1 and reviewer-2, excluding reviewer-alpha.
+	prefixResult, err := service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "prefix-wake-2",
+		Kind:           "question",
+		Body:           "Need two eyes from @reviewer on lexer edge cases.",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"@reviewer"}, prefixResult.Message.Mentions)
+	assert.Equal(t, []string{"inst-rev-1", "inst-rev-2"}, prefixResult.WokenInstanceIDs)
+	assert.Len(t, prefixResult.WakeTaskIDs, 2)
+
+	// Wake: false suppresses wake tasks even when handles are mentioned.
+	wakeDisabled := false
+	quietPost, err := service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "quiet-mention-3",
+		Kind:           "finding",
+		Body:           "FYI @reviewer-alpha minor formatting cleanup.",
+		Wake:           &wakeDisabled,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"@reviewer-alpha"}, quietPost.Message.Mentions)
+	assert.Empty(t, quietPost.WokenInstanceIDs)
+	assert.Empty(t, quietPost.WakeTaskIDs)
+
+	// Mentioning @shepherd (attached MCP session handle) or @coordinator rings urgent doorbell immediately.
+	_, err = service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "doorbell-mention-4",
+		Kind:           "question",
+		Body:           "@shepherd @coordinator should we merge the parser branch now?",
+	})
+	require.NoError(t, err)
+
+	doorbellDeadline, cancelDoorbell := context.WithTimeout(t.Context(), 2*time.Second)
+	_, rawDoorbell, err := coordinatorSocket.Read(doorbellDeadline)
+	cancelDoorbell()
+	require.NoError(t, err)
+	var doorbellEnvelope protocol.OrchestratorServerMessage
+	require.NoError(t, json.Unmarshal(rawDoorbell, &doorbellEnvelope))
+	require.Equal(t, "doorbell", doorbellEnvelope.Type)
+	require.NotNil(t, doorbellEnvelope.Doorbell)
+	assert.Equal(t, thread.ID, doorbellEnvelope.Doorbell.ThreadID)
+	assert.True(t, doorbellEnvelope.Doorbell.Urgent)
+	assert.Contains(t, doorbellEnvelope.Doorbell.Summary, "Room #4")
+}
+
+func TestRoomSubChannelsSubscriptionFilteringAndMainMentionRefusal(t *testing.T) {
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	service, err := NewService(ServiceOptions{
+		Store: openedStore,
+		Token: "master-secret-token",
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	coordinatorCaller := CallerIdentity{Kind: "orchestrator-client", ClientID: "coord-1", SessionID: "sess-1"}
+	thread, _, err := service.CreateThread(coordinatorCaller, CreateThreadInput{
+		Title:  "Subchannel room thread",
+		Attach: true,
+	})
+	require.NoError(t, err)
+
+	submitted, err := service.SubmitTasks(coordinatorCaller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "sub-channels",
+		Tasks: []SubmittedTaskSpec{
+			{ClientTaskID: "main-worker", Title: "Main Worker", Instructions: "Build"},
+			{ClientTaskID: "qa-worker", Title: "QA Worker", Instructions: "Verify"},
+		},
+	})
+	require.NoError(t, err)
+	mainTaskID := submitted.ClientTaskMap["main-worker"]
+	qaTaskID := submitted.ClientTaskMap["qa-worker"]
+
+	nowText := service.nowUTC()
+	_, err = openedStore.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		qaSubName := "qa-subscriber"
+		plainIdleName := "plain-idle"
+		state.Instances["inst-main"] = protocol.AgentInstance{
+			ID: "inst-main", ThreadID: thread.ID, Status: "busy", CreatedAt: nowText, UpdatedAt: nowText,
+			Lease: protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+		}
+		state.Instances["inst-qa"] = protocol.AgentInstance{
+			ID:           "inst-qa",
+			ThreadID:     thread.ID,
+			RoomChannels: []string{"verification"},
+			Status:       "busy",
+			CreatedAt:    nowText,
+			UpdatedAt:    nowText,
+			Lease:        protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+		}
+		state.Instances["inst-qa-idle"] = protocol.AgentInstance{
+			ID:           "inst-qa-idle",
+			ThreadID:     thread.ID,
+			Purpose:      &protocol.InstancePurpose{Name: &qaSubName},
+			RoomChannels: []string{"verification"},
+			Status:       "idle",
+			CreatedAt:    nowText,
+			UpdatedAt:    nowText,
+			Lease:        protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+		}
+		state.Instances["inst-plain-idle"] = protocol.AgentInstance{
+			ID:        "inst-plain-idle",
+			ThreadID:  thread.ID,
+			Purpose:   &protocol.InstancePurpose{Name: &plainIdleName},
+			Status:    "idle",
+			CreatedAt: nowText,
+			UpdatedAt: nowText,
+			Lease:     protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+		}
+
+		state.Runs["run-main"] = protocol.Run{
+			ID: "run-main", ThreadID: thread.ID, InstanceID: "inst-main", NodeID: "node-1",
+			Status: "running", CreatedAt: nowText, TaskID: &mainTaskID,
+		}
+		state.Runs["run-qa"] = protocol.Run{
+			ID: "run-qa", ThreadID: thread.ID, InstanceID: "inst-qa", NodeID: "node-1",
+			Status: "running", CreatedAt: nowText, TaskID: &qaTaskID,
+		}
+		mainTask := state.Tasks[mainTaskID]
+		mainTask.Status = "running"
+		state.Tasks[mainTaskID] = mainTask
+
+		qaTask := state.Tasks[qaTaskID]
+		qaTask.Status = "running"
+		state.Tasks[qaTaskID] = qaTask
+		return nil
+	})
+	require.NoError(t, err)
+
+	mainCaller := CallerIdentity{Kind: "run", RunID: "run-main", TaskID: mainTaskID, ThreadID: thread.ID, InstanceID: "inst-main"}
+	qaCaller := CallerIdentity{Kind: "run", RunID: "run-qa", TaskID: qaTaskID, ThreadID: thread.ID, InstanceID: "inst-qa"}
+
+	// Refuse @#main in Body and Mentions, and refuse invalid channel names.
+	_, err = service.PostRoomMessage(mainCaller, PostRoomMessageInput{
+		IdempotencyKey: "reject-main-channel-mention",
+		Kind:           "guidance",
+		Body:           "Do not allow @#main",
+	})
+	assertOperationErrorCode(t, err, "invalid_request")
+
+	_, err = service.PostRoomMessage(mainCaller, PostRoomMessageInput{
+		IdempotencyKey: "reject-explicit-main-mention",
+		Kind:           "guidance",
+		Body:           "Normal body",
+		Mentions:       []string{"@#main"},
+	})
+	assertOperationErrorCode(t, err, "invalid_request")
+
+	_, err = service.PostRoomMessage(mainCaller, PostRoomMessageInput{
+		IdempotencyKey: "reject-invalid-channel",
+		Channel:        "invalid.channel",
+		Kind:           "finding",
+		Body:           "Invalid channel characters",
+	})
+	assertOperationErrorCode(t, err, "invalid_request")
+
+	_, err = service.ReadRoom(mainCaller, ReadRoomInput{Channel: "invalid.channel"})
+	assertOperationErrorCode(t, err, "invalid_request")
+
+	// Post #1 on main (nudging mainTaskID), #2 on verification waking @#verification, and #3 on telemetry.
+	postMain, err := service.PostRoomMessage(coordinatorCaller, PostRoomMessageInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "ch-main-1",
+		Kind:           "contract",
+		Body:           "Main contract v1",
+		NudgeTaskIDs:   []string{mainTaskID},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "main", postMain.Message.Channel)
+
+	postVerification, err := service.PostRoomMessage(mainCaller, PostRoomMessageInput{
+		IdempotencyKey: "ch-verify-2",
+		Channel:        "Verification",
+		Kind:           "question",
+		Body:           "@#verification please run integration suite",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "verification", postVerification.Message.Channel)
+	assert.Equal(t, []string{"@#verification"}, postVerification.Message.Mentions)
+	assert.Equal(t, []string{"inst-qa-idle"}, postVerification.WokenInstanceIDs)
+
+	postTelemetry, err := service.PostRoomMessage(coordinatorCaller, PostRoomMessageInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "ch-telemetry-3",
+		Channel:        "telemetry",
+		Kind:           "finding",
+		Body:           "p99 latency is 4ms",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "telemetry", postTelemetry.Message.Channel)
+
+	// Narrow sub-channel read on mainCaller must NOT clear unread main nudge (#1).
+	telemetryRead, err := service.ReadRoom(mainCaller, ReadRoomInput{Channel: "telemetry"})
+	require.NoError(t, err)
+	require.Len(t, telemetryRead.Messages, 1)
+	assert.Equal(t, int64(3), telemetryRead.Messages[0].Sequence)
+	assert.True(t, telemetryRead.UnreadNudge)
+	assert.Equal(t, int64(0), telemetryRead.LastReadSequence)
+
+	// Default ReadRoom ("") on mainCaller reads "main" only (unsubscribed to verification/telemetry) and clears nudge.
+	mainDefaultRead, err := service.ReadRoom(mainCaller, ReadRoomInput{})
+	require.NoError(t, err)
+	require.Len(t, mainDefaultRead.Messages, 1)
+	assert.Equal(t, int64(1), mainDefaultRead.Messages[0].Sequence)
+	assert.False(t, mainDefaultRead.UnreadNudge)
+	assert.Equal(t, int64(3), mainDefaultRead.LastReadSequence)
+
+	// Default ReadRoom ("") on qaCaller (subscribed to "verification") reads "main" + "verification".
+	qaDefaultRead, err := service.ReadRoom(qaCaller, ReadRoomInput{})
+	require.NoError(t, err)
+	require.Len(t, qaDefaultRead.Messages, 2)
+	assert.Equal(t, int64(1), qaDefaultRead.Messages[0].Sequence)
+	assert.Equal(t, int64(2), qaDefaultRead.Messages[1].Sequence)
+
+	// Wildcard ReadRoom ("*") reads all channels.
+	wildcardRead, err := service.ReadRoom(mainCaller, ReadRoomInput{Channel: "*"})
+	require.NoError(t, err)
+	require.Len(t, wildcardRead.Messages, 3)
+}
+
+func TestRoomSubChannelNonRunReadsAndCursorPreservation(t *testing.T) {
+	openedStore, err := store.Open(t.TempDir())
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	service, err := NewService(ServiceOptions{
+		Store: openedStore,
+		Token: "master-secret-token",
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	coordinatorCaller := CallerIdentity{Kind: "orchestrator-client", ClientID: "coord-1", SessionID: "sess-1"}
+	thread, _, err := service.CreateThread(coordinatorCaller, CreateThreadInput{
+		Title:  "Subchannel non-run and cursor preservation",
+		Attach: true,
+	})
+	require.NoError(t, err)
+
+	submitted, err := service.SubmitTasks(coordinatorCaller, SubmitTasksInput{
+		ThreadID:       thread.ID,
+		IdempotencyKey: "cursor-subchannels",
+		Tasks: []SubmittedTaskSpec{
+			{ClientTaskID: "qa-worker", Title: "QA Worker", Instructions: "Verify"},
+			{ClientTaskID: "author-worker", Title: "Author Worker", Instructions: "Author"},
+		},
+	})
+	require.NoError(t, err)
+	qaTaskID := submitted.ClientTaskMap["qa-worker"]
+	authorTaskID := submitted.ClientTaskMap["author-worker"]
+
+	nowText := service.nowUTC()
+	_, err = openedStore.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		state.Instances["inst-qa"] = protocol.AgentInstance{
+			ID:           "inst-qa",
+			ThreadID:     thread.ID,
+			RoomChannels: []string{"verification"},
+			Status:       "busy",
+			CreatedAt:    nowText,
+			UpdatedAt:    nowText,
+			Lease:        protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+		}
+		state.Instances["inst-author"] = protocol.AgentInstance{
+			ID:        "inst-author",
+			ThreadID:  thread.ID,
+			Status:    "busy",
+			CreatedAt: nowText,
+			UpdatedAt: nowText,
+			Lease:     protocol.InstanceLease{IdleTimeoutSeconds: 600, ExpiresAt: extendLeaseTimestamp(nowText, 600)},
+		}
+		state.Runs["run-qa"] = protocol.Run{
+			ID: "run-qa", ThreadID: thread.ID, InstanceID: "inst-qa", NodeID: "node-1",
+			Status: "running", CreatedAt: nowText, TaskID: &qaTaskID,
+		}
+		state.Runs["run-author"] = protocol.Run{
+			ID: "run-author", ThreadID: thread.ID, InstanceID: "inst-author", NodeID: "node-1",
+			Status: "running", CreatedAt: nowText, TaskID: &authorTaskID,
+		}
+		qaTask := state.Tasks[qaTaskID]
+		qaTask.Status = "running"
+		state.Tasks[qaTaskID] = qaTask
+
+		authorTask := state.Tasks[authorTaskID]
+		authorTask.Status = "running"
+		state.Tasks[authorTaskID] = authorTask
+		return nil
+	})
+	require.NoError(t, err)
+
+	qaCaller := CallerIdentity{Kind: "run", RunID: "run-qa", TaskID: qaTaskID, ThreadID: thread.ID, InstanceID: "inst-qa"}
+	authorCaller := CallerIdentity{Kind: "run", RunID: "run-author", TaskID: authorTaskID, ThreadID: thread.ID, InstanceID: "inst-author"}
+
+	// Post #1 on "verification", #2 on "main" (nudging qaTaskID), and #3 on "telemetry" (from worker, unread by coordinator).
+	wakeDisabled := false
+	_, err = service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "post-verif-1",
+		Channel:        "verification",
+		Kind:           "finding",
+		Body:           "Regression suite output ready",
+		Wake:           &wakeDisabled,
+	})
+	require.NoError(t, err)
+
+	_, err = service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "post-main-2",
+		Channel:        "main",
+		Kind:           "contract",
+		Body:           "Updated API contract on main",
+		NudgeTaskIDs:   []string{qaTaskID},
+		Wake:           &wakeDisabled,
+	})
+	require.NoError(t, err)
+
+	_, err = service.PostRoomMessage(authorCaller, PostRoomMessageInput{
+		IdempotencyKey: "post-telemetry-3",
+		Channel:        "telemetry",
+		Kind:           "finding",
+		Body:           "Benchmark p95 = 2.1ms",
+		Wake:           &wakeDisabled,
+	})
+	require.NoError(t, err)
+
+	// 1. Operator GET /api/threads/{id}/room (default Channel: "") returns all messages across all sub-channels.
+	httpServer := httptest.NewServer(service.Handler())
+	defer httpServer.Close()
+
+	getRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpServer.URL+"/api/threads/"+thread.ID+"/room", nil)
+	require.NoError(t, err)
+	getRequest.Header.Set("Authorization", "Bearer master-secret-token")
+	getResponse, err := http.DefaultClient.Do(getRequest)
+	require.NoError(t, err)
+	defer getResponse.Body.Close()
+	require.Equal(t, http.StatusOK, getResponse.StatusCode)
+
+	var roomHTTPPayload ReadRoomResult
+	require.NoError(t, json.NewDecoder(getResponse.Body).Decode(&roomHTTPPayload))
+	require.Len(t, roomHTTPPayload.Messages, 3)
+	assert.Equal(t, "verification", roomHTTPPayload.Messages[0].Channel)
+	assert.Equal(t, "main", roomHTTPPayload.Messages[1].Channel)
+	assert.Equal(t, "telemetry", roomHTTPPayload.Messages[2].Channel)
+
+	// 2. Subscribed instance ("inst-qa" with RoomChannels: ["verification"]) reading explicit Channel: "main" or Kinds-filtered
+	// preserves instance.LastReadRoomSequence == 0 so unread #1 on "verification" is not skipped, while clearing task nudge.
+	qaMainOnlyRead, err := service.ReadRoom(qaCaller, ReadRoomInput{Channel: "main"})
+	require.NoError(t, err)
+	require.Len(t, qaMainOnlyRead.Messages, 1)
+	assert.Equal(t, int64(2), qaMainOnlyRead.Messages[0].Sequence)
+	assert.False(t, qaMainOnlyRead.UnreadNudge)
+	assert.Equal(t, int64(3), qaMainOnlyRead.LastReadSequence)
+
+	require.NoError(t, openedStore.Read(func(state *store.State) error {
+		assert.Equal(t, int64(0), state.Instances["inst-qa"].LastReadRoomSequence)
+		assert.Equal(t, int64(3), state.Tasks[qaTaskID].LastReadRoomSequence)
+		return nil
+	}))
+
+	qaKindsFilteredRead, err := service.ReadRoom(qaCaller, ReadRoomInput{Kinds: []string{"contract"}})
+	require.NoError(t, err)
+	require.Len(t, qaKindsFilteredRead.Messages, 1)
+	assert.Equal(t, int64(2), qaKindsFilteredRead.Messages[0].Sequence)
+	require.NoError(t, openedStore.Read(func(state *store.State) error {
+		assert.Equal(t, int64(0), state.Instances["inst-qa"].LastReadRoomSequence)
+		return nil
+	}))
+
+	// Default ReadRoom (Channel: "", no Kinds filter) on qaCaller reads "verification" (#1) + "main" (#2) and advances instance cursor.
+	qaSubscribedRead, err := service.ReadRoom(qaCaller, ReadRoomInput{})
+	require.NoError(t, err)
+	require.Len(t, qaSubscribedRead.Messages, 2)
+	assert.Equal(t, int64(1), qaSubscribedRead.Messages[0].Sequence)
+	assert.Equal(t, int64(2), qaSubscribedRead.Messages[1].Sequence)
+	require.NoError(t, openedStore.Read(func(state *store.State) error {
+		assert.Equal(t, int64(3), state.Instances["inst-qa"].LastReadRoomSequence)
+		return nil
+	}))
+
+	// 3. Coordinator explicit single-channel read (Channel: "main") does not advance attachment cursor past unread sub-channels,
+	// whereas default ReadRoom (Channel: "") returns all sub-channels and advances attachment cursor cleanly.
+	coordMainOnlyRead, err := service.ReadRoom(coordinatorCaller, ReadRoomInput{
+		ThreadID: thread.ID,
+		Channel:  "main",
+	})
+	require.NoError(t, err)
+	require.Len(t, coordMainOnlyRead.Messages, 1)
+	assert.Equal(t, int64(2), coordMainOnlyRead.Messages[0].Sequence)
+	assert.Equal(t, int64(0), coordMainOnlyRead.LastReadSequence)
+
+	// Settle runs/tasks to verify unread_by_coordinator is still detected before coordinator reads all channels, and cleared after.
+	_, err = openedStore.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		for _, instanceID := range []string{"inst-qa", "inst-author"} {
+			instance := state.Instances[instanceID]
+			instance.Status = "idle"
+			state.Instances[instanceID] = instance
+		}
+		for _, runID := range []string{"run-qa", "run-author"} {
+			run := state.Runs[runID]
+			run.Status = "completed"
+			state.Runs[runID] = run
+		}
+		for _, taskID := range []string{qaTaskID, authorTaskID} {
+			task := state.Tasks[taskID]
+			task.Status = "completed"
+			state.Tasks[taskID] = task
+		}
+		return nil
+	})
+	require.NoError(t, err)
+
+	_, err = openedStore.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		attachment, attached := state.ActiveAttachmentForThread(thread.ID)
+		require.True(t, attached)
+		if events := state.ThreadEvents[thread.ID]; len(events) > 0 {
+			attachment.AcknowledgedSeq = events[len(events)-1].Sequence
+		}
+		state.Attachments[attachment.ID] = attachment
+		return nil
+	})
+	require.NoError(t, err)
+
+	detailBeforeDefaultRead, err := service.GetThreadDetail(thread.ID)
+	require.NoError(t, err)
+	require.NotNil(t, detailBeforeDefaultRead.Stall)
+	assert.True(t, detailBeforeDefaultRead.Stall.Stalled)
+	assert.Contains(t, detailBeforeDefaultRead.Stall.Reasons, "unread_by_coordinator")
+
+	coordDefaultRead, err := service.ReadRoom(coordinatorCaller, ReadRoomInput{ThreadID: thread.ID})
+	require.NoError(t, err)
+	require.Len(t, coordDefaultRead.Messages, 3)
+	assert.Equal(t, "verification", coordDefaultRead.Messages[0].Channel)
+	assert.Equal(t, "main", coordDefaultRead.Messages[1].Channel)
+	assert.Equal(t, "telemetry", coordDefaultRead.Messages[2].Channel)
+	assert.Equal(t, int64(3), coordDefaultRead.LastReadSequence)
+
+	detailAfterDefaultRead, err := service.GetThreadDetail(thread.ID)
+	require.NoError(t, err)
+	assert.Nil(t, detailAfterDefaultRead.Stall)
 }

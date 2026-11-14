@@ -315,6 +315,10 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 				}
 			}
 
+			if workspaceErr := validateSubmittedTaskWorkspaceInState(state, threadID, index, taskSpecification, placementInstanceID); workspaceErr != nil {
+				return workspaceErr
+			}
+
 			proposedTasks[index] = protocol.Task{
 				ID:                  taskID,
 				ThreadID:            threadID,

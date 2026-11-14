@@ -224,6 +224,9 @@ func (session *runSession) execute(
 	if session.run.FallbackTransport != nil {
 		fallbackTransport = *session.run.FallbackTransport
 	}
+	if strings.TrimSpace(session.run.Model) == "" {
+		session.run.Model = session.resident.allocation.Model
+	}
 	if err := session.client.runner.AdmitModel(session.run.HarnessID, session.run.Model); err != nil {
 		terminalMessage = session.buildTerminalFailure(err)
 		return
@@ -508,6 +511,10 @@ func (session *runSession) buildTerminalFailureWithSession(err error, providerSe
 		}
 	}
 	errorMessage := protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))
+	errorKind := harness.ClassifyError(err)
+	if errorKind == "" {
+		errorKind = harness.ClassifyDiagnostic(errorMessage)
+	}
 	session.client.activityLogger.Error(
 		"run",
 		"failed",
@@ -519,6 +526,7 @@ func (session *runSession) buildTerminalFailureWithSession(err error, providerSe
 		Type:              "run.failed",
 		RunID:             session.run.ID,
 		Error:             new(errorMessage),
+		ErrorKind:         errorKind,
 		ProviderSessionID: providerSessionID,
 		At:                session.client.nowUTC(),
 	}

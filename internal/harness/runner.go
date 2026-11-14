@@ -77,13 +77,13 @@ func (driver nativeDriver) Execute(operationContext context.Context, invocation 
 	final, readErr := readEvents(stdout, run.HarnessID, output, invocation.ProviderSession)
 	waitErr := command.Wait()
 	if readErr != nil {
-		return "", redactHarnessDiagnostic(readErr, mcpConfiguration.Token)
+		return "", WrapClassifiedError(redactHarnessDiagnostic(readErr, mcpConfiguration.Token))
 	}
 	if waitErr != nil {
 		if message := strings.TrimSpace(stderr.String()); message != "" {
-			return "", redactHarnessDiagnostic(errors.New(message), mcpConfiguration.Token)
+			return "", WrapClassifiedError(redactHarnessDiagnostic(errors.New(message), mcpConfiguration.Token))
 		}
-		return "", waitErr
+		return "", WrapClassifiedError(waitErr)
 	}
 	if strings.TrimSpace(final) == "" {
 		return emptyResponse, nil
@@ -441,6 +441,9 @@ func readableEvent(harnessID string, line []byte) string {
 	}
 	if harnessID == protocol.HarnessClaudeCLI {
 		if event["type"] == "result" {
+			if isError, _ := event["is_error"].(bool); isError {
+				return ""
+			}
 			result, _ := event["result"].(string)
 			return result
 		}
@@ -481,19 +484,78 @@ func readableEvent(harnessID string, line []byte) string {
 }
 
 func harnessEventError(harnessID string, line []byte) error {
-	if harnessID != protocol.HarnessOpenCodeCLI {
-		return nil
-	}
-	var event struct {
-		Type  string `json:"type"`
-		Error struct {
-			Data struct {
+	switch harnessID {
+	case protocol.HarnessClaudeCLI:
+		var claudeEvent struct {
+			Type    string `json:"type"`
+			IsError bool   `json:"is_error"`
+			Result  string `json:"result"`
+			Message string `json:"message"`
+			Error   struct {
 				Message string `json:"message"`
-			} `json:"data"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(line, &event) != nil || event.Type != "error" || strings.TrimSpace(event.Error.Data.Message) == "" {
+			} `json:"error"`
+		}
+		if json.Unmarshal(line, &claudeEvent) != nil {
+			return nil
+		}
+		if claudeEvent.Type == "result" && claudeEvent.IsError {
+			if message := strings.TrimSpace(claudeEvent.Result); message != "" {
+				return errors.New(message)
+			}
+			return errors.New("claude turn reported an error")
+		}
+		if claudeEvent.Type == "error" {
+			if message := strings.TrimSpace(claudeEvent.Error.Message); message != "" {
+				return errors.New(message)
+			}
+			if message := strings.TrimSpace(claudeEvent.Message); message != "" {
+				return errors.New(message)
+			}
+		}
+		return nil
+	case protocol.HarnessCodexCLI:
+		var codexEvent struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Error   struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(line, &codexEvent) != nil {
+			return nil
+		}
+		if codexEvent.Type == "error" && strings.TrimSpace(codexEvent.Message) != "" {
+			return errors.New(strings.TrimSpace(codexEvent.Message))
+		}
+		if codexEvent.Type == "turn.failed" && strings.TrimSpace(codexEvent.Error.Message) != "" {
+			return errors.New(strings.TrimSpace(codexEvent.Error.Message))
+		}
+		return nil
+	case protocol.HarnessOpenCodeCLI:
+		var openCodeEvent struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+			Error   struct {
+				Message string `json:"message"`
+				Data    struct {
+					Message string `json:"message"`
+				} `json:"data"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(line, &openCodeEvent) != nil || openCodeEvent.Type != "error" {
+			return nil
+		}
+		if message := strings.TrimSpace(openCodeEvent.Error.Data.Message); message != "" {
+			return errors.New(message)
+		}
+		if message := strings.TrimSpace(openCodeEvent.Error.Message); message != "" {
+			return errors.New(message)
+		}
+		if message := strings.TrimSpace(openCodeEvent.Message); message != "" {
+			return errors.New(message)
+		}
+		return nil
+	default:
 		return nil
 	}
-	return errors.New(strings.TrimSpace(event.Error.Data.Message))
 }

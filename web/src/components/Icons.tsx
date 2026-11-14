@@ -135,3 +135,65 @@ export function SparkIcon(props: IconProps) {
     </Icon>
   );
 }
+
+export function AlertIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M8 2.2 14 13H2z" />
+      <path d="M8 6.4v3.2M8 11.4h.01" />
+    </Icon>
+  );
+}
+
+export function BellIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M8 2.2a3.8 3.8 0 0 1 3.8 3.8v2.2l1.2 1.8H3l1.2-1.8V6A3.8 3.8 0 0 1 8 2.2Z" />
+      <path d="M6.6 12.2a1.6 1.6 0 0 0 2.8 0" />
+    </Icon>
+  );
+}
+
+export function SendIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M13.8 2.2 7.2 8.8" />
+      <path d="M13.8 2.2 9.4 13.8 7.2 8.8 2.2 6.6z" />
+    </Icon>
+  );
+}
+
+export function ImageIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
+      <circle cx="5.5" cy="6" r="1.1" />
+      <path d="M2.5 11.5 6 8.2l2.6 2.4 2-1.8 2.9 2.7" />
+    </Icon>
+  );
+}
+
+export function DownloadIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M8 2.5v7.5m0 0-3-3m3 3 3-3" />
+      <path d="M3 12.8h10" />
+    </Icon>
+  );
+}
+
+export function ChevronLeftIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M10 3.5 5.5 8 10 12.5" />
+    </Icon>
+  );
+}
+
+export function ChevronRightIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M6 3.5 10.5 8 6 12.5" />
+    </Icon>
+  );
+}

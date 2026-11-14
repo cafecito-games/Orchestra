@@ -336,6 +336,135 @@ func (coordinator *leaseCoordinator) handleCleanupCommand(grant protocol.Workspa
 	_ = coordinator.sendTransition(cleanupContext, runID, &currentStatus, outcome, grant.ID, false)
 }
 
+func (coordinator *leaseCoordinator) handleLandCommand(request protocol.WorkspaceLeaseLandRequest) {
+	if !protocol.IsIdentifier(request.RequestID) {
+		return
+	}
+	mode := request.EffectiveMode()
+	if mode != protocol.WorkspaceLandingModeFastForward &&
+		mode != protocol.WorkspaceLandingModeMergeFFOnly &&
+		mode != protocol.WorkspaceLandingModeCherryPick {
+		mode = protocol.WorkspaceLandingModeFastForward
+	}
+	sendResult := func(result protocol.WorkspaceLeaseLandResult) {
+		observedAt := coordinator.client.nowUTC()
+		result.RequestID = request.RequestID
+		result.NodeID = coordinator.client.node.ID
+		if result.LeaseID == "" {
+			result.LeaseID = request.Lease.ID
+		}
+		if result.Mode == "" {
+			result.Mode = mode
+		}
+		result.ObservedAt = observedAt
+		resultCopy := result
+		coordinator.client.sendOrQueue(protocol.SlaveControlMessage{
+			Type:       "workspace.land.result",
+			NodeID:     coordinator.client.node.ID,
+			RequestID:  request.RequestID,
+			LandResult: &resultCopy,
+			At:         observedAt,
+		})
+	}
+
+	if err := request.Validate(); err != nil {
+		sanitized := protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))
+		sendResult(protocol.WorkspaceLeaseLandResult{
+			LeaseID:          request.Lease.ID,
+			Status:           protocol.WorkspaceLandingStatusFailed,
+			Mode:             mode,
+			Landed:           false,
+			WorktreeRetained: true,
+			Error:            sanitized,
+			Detail:           sanitized,
+		})
+		return
+	}
+	if coordinator.manager == nil {
+		sendResult(protocol.WorkspaceLeaseLandResult{
+			LeaseID:          request.Lease.ID,
+			Status:           protocol.WorkspaceLandingStatusFailed,
+			Mode:             mode,
+			Landed:           false,
+			WorktreeRetained: true,
+			Error:            "workspace manager is not configured on this worker node",
+			Detail:           "workspace manager is not configured on this worker node",
+		})
+		return
+	}
+
+	releaseOwner, err := coordinator.manager.Own(request.Lease)
+	if err != nil {
+		if errors.Is(err, workspace.ErrLeaseOwned) {
+			sendResult(protocol.WorkspaceLeaseLandResult{
+				LeaseID:          request.Lease.ID,
+				Status:           protocol.WorkspaceLandingStatusConflict,
+				Mode:             mode,
+				Landed:           false,
+				WorktreeRetained: true,
+				Reason:           "lease_busy",
+				Detail:           "workspace lease is currently owned by another operation",
+			})
+			return
+		}
+		sanitized := protocol.BoundedDiagnostic(protocol.RedactText(err.Error()))
+		sendResult(protocol.WorkspaceLeaseLandResult{
+			LeaseID:          request.Lease.ID,
+			Status:           protocol.WorkspaceLandingStatusFailed,
+			Mode:             mode,
+			Landed:           false,
+			WorktreeRetained: true,
+			Error:            sanitized,
+			Detail:           sanitized,
+		})
+		return
+	}
+	defer releaseOwner()
+
+	landContext, cancel := context.WithTimeout(coordinator.client.rootContext, 2*time.Minute)
+	defer cancel()
+
+	result, landErr := coordinator.manager.LandLease(landContext, request)
+	if landErr != nil {
+		coordinator.client.activityLogger.Error(
+			"lease",
+			"land failed",
+			activitylog.String("lease", request.Lease.ID),
+			activitylog.String("mode", mode),
+			activitylog.String("error", result.Error),
+		)
+		sendResult(result)
+		return
+	}
+
+	if result.Cleaned {
+		currentStatus := request.Lease.Status
+		runID := runIDFromBranch(request.Lease.Branch)
+		_ = coordinator.sendTransition(
+			landContext,
+			runID,
+			&currentStatus,
+			workspace.Outcome{
+				Status:               "cleaned",
+				ResolvedBaseRevision: result.BaseRevision,
+				Detail:               result.Detail,
+			},
+			request.Lease.ID,
+			false,
+		)
+	}
+
+	coordinator.client.activityLogger.Info(
+		"lease",
+		"land "+result.Status,
+		activitylog.String("lease", request.Lease.ID),
+		activitylog.String("mode", result.Mode),
+		activitylog.String("target", result.TargetBranch),
+		activitylog.Bool("cleaned", result.Cleaned),
+	)
+	sendResult(result)
+}
+
 func runIDFromBranch(branch string) string {
 	remainder, ok := strings.CutPrefix(branch, protocol.WorkspaceLeaseBranchPrefix)
 	if !ok {
