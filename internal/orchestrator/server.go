@@ -46,6 +46,8 @@ const (
 
 type Configuration struct {
 	Mode                ServiceMode
+	ConfigFilePath      string
+	Profile             string
 	ListenAddress       string
 	ListenExplicit      bool
 	AuthMode            string
@@ -1296,7 +1298,16 @@ func (flagValue *repeatStringFlag) Set(raw string) error {
 }
 
 func ParseConfiguration(arguments []string, lookupEnvironment func(string) (string, bool)) (Configuration, error) {
-	defaultConnectionFile := localstate.ResolveConnectionFilePath(lookupEnvironment)
+	return parseServerConfiguration(ServiceModeOrchestrator, arguments, lookupEnvironment)
+}
+
+func parseServerConfiguration(
+	mode ServiceMode,
+	arguments []string,
+	rawLookupEnvironment func(string) (string, bool),
+) (Configuration, error) {
+	defaultConnectionFile := localstate.ResolveConnectionFilePath(rawLookupEnvironment)
+	lookupEnvironment := rawLookupEnvironment
 	if lookupEnvironment == nil {
 		lookupEnvironment = os.LookupEnv
 	}
@@ -1312,9 +1323,14 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	}
 	defaultToken := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_TOKEN")
 	defaultTailscaleBinary := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_TAILSCALE_BINARY")
-	defaultDataDirectory := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_DATA_DIR", "ORCHESTRA_DATA_ROOT")
+	environmentDataDirectory := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_DATA_DIR", "ORCHESTRA_DATA_ROOT")
+	defaultDataDirectory := environmentDataDirectory
 	if defaultDataDirectory == "" {
-		defaultDataDirectory = filepath.Join(setup.DefaultDataRoot(), "master")
+		if mode == ServiceModeRelay {
+			defaultDataDirectory = filepath.Join(setup.DefaultDataRoot(), "relay")
+		} else {
+			defaultDataDirectory = filepath.Join(setup.DefaultDataRoot(), "master")
+		}
 	}
 	defaultTLSCert := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_TLS_CERT")
 	defaultTLSKey := firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_TLS_KEY")
@@ -1333,11 +1349,19 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	var tailscaleAllowUsersFlag repeatStringFlag
 	var tailscaleAllowTagsFlag repeatStringFlag
 
-	flagSet := flag.NewFlagSet("orchestra master", flag.ContinueOnError)
+	flagSetName := "orchestra master"
+	subcommand := localstate.SubcommandMaster
+	if mode == ServiceModeRelay {
+		flagSetName = "orchestra relay"
+		subcommand = localstate.SubcommandRelay
+	}
+	flagSet := flag.NewFlagSet(flagSetName, flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
 
 	var configuration Configuration
-	configuration.Mode = ServiceModeOrchestrator
+	configuration.Mode = mode
+	var configFileFlag string
+	var profileFlag string
 	var authModeRaw string
 	var workerName string
 	var workerID string
@@ -1348,6 +1372,8 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	var logLevelRaw string
 	var logFormatRaw string
 
+	flagSet.StringVar(&configFileFlag, "config", "", "Path to Orchestra TOML config file (default ~/.orchestra/config.toml)")
+	flagSet.StringVar(&profileFlag, "profile", "", "Configuration profile name in config.toml (default \"default\")")
 	flagSet.StringVar(&configuration.ListenAddress, "listen", defaultListen, "HTTP/WebSocket listen address (e.g. 127.0.0.1:8787)")
 	flagSet.StringVar(&authModeRaw, "auth", defaultAuthModeRaw, "Authentication mode: token or tailscale (env ORCHESTRA_AUTH_MODE)")
 	flagSet.StringVar(&configuration.Token, "token", defaultToken, "Bearer token matching ORCHESTRA_TOKEN (auto-persisted in <data-dir>/token in token auth mode)")
@@ -1358,17 +1384,19 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	flagSet.StringVar(&configuration.ConnectionFilePath, "connection-file", defaultConnectionFile, "Local connection discovery state file path")
 	flagSet.StringVar(&configuration.TLSCertPath, "tls-cert", defaultTLSCert, "Optional TLS certificate PEM path for wss:// / https://")
 	flagSet.StringVar(&configuration.TLSKeyPath, "tls-key", defaultTLSKey, "Optional TLS private key PEM path for wss:// / https://")
-	flagSet.StringVar(&configuration.ProjectProfilePath, "project-profiles", defaultProfiles, "Optional JSON file containing project profiles")
-	flagSet.BoolVar(&configuration.WithLocalWorker, "with-local-worker", defaultWithLocal, "Run an embedded local slave worker connected to loopback")
-	flagSet.StringVar(&workerName, "worker-name", firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_NAME"), "Display name for embedded local worker")
-	flagSet.StringVar(&workerID, "worker-id", firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_NODE_ID"), "Node ID for embedded local worker")
-	flagSet.IntVar(&workerConcurrency, "worker-concurrency", 2, "Concurrency for embedded local worker")
-	flagSet.IntVar(&workerInstanceCapacity, "worker-instance-capacity", 4, "Instance capacity for embedded local worker")
-	flagSet.StringVar(&claudeAuthMode, "claude-acp-auth-mode", firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_CLAUDE_ACP_AUTH_MODE"), "Claude ACP auth mode for embedded local worker")
-	flagSet.Var(&workspaceRootsFlag, "workspace-root", "Workspace root for embedded local worker (repeatable)")
-	flagSet.Var(&workerLabelsFlag, "worker-label", "Label for embedded local worker (repeatable)")
-	flagSet.Var(&approvalPolicyFlag, "approval-policy", "Approval policy for embedded local worker")
-	flagSet.Var(&acpAdapterFlag, "acp-adapter", "ACP adapter override for embedded local worker")
+	if mode == ServiceModeOrchestrator {
+		flagSet.StringVar(&configuration.ProjectProfilePath, "project-profiles", defaultProfiles, "Optional JSON file containing project profiles")
+		flagSet.BoolVar(&configuration.WithLocalWorker, "with-local-worker", defaultWithLocal, "Run an embedded local slave worker connected to loopback")
+		flagSet.StringVar(&workerName, "worker-name", firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_NAME"), "Display name for embedded local worker")
+		flagSet.StringVar(&workerID, "worker-id", firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_NODE_ID"), "Node ID for embedded local worker")
+		flagSet.IntVar(&workerConcurrency, "worker-concurrency", 2, "Concurrency for embedded local worker")
+		flagSet.IntVar(&workerInstanceCapacity, "worker-instance-capacity", 4, "Instance capacity for embedded local worker")
+		flagSet.StringVar(&claudeAuthMode, "claude-acp-auth-mode", firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_CLAUDE_ACP_AUTH_MODE"), "Claude ACP auth mode for embedded local worker")
+		flagSet.Var(&workspaceRootsFlag, "workspace-root", "Workspace root for embedded local worker (repeatable)")
+		flagSet.Var(&workerLabelsFlag, "worker-label", "Label for embedded local worker (repeatable)")
+		flagSet.Var(&approvalPolicyFlag, "approval-policy", "Approval policy for embedded local worker")
+		flagSet.Var(&acpAdapterFlag, "acp-adapter", "ACP adapter override for embedded local worker")
+	}
 	flagSet.BoolVar(&verbose, "verbose", defaultVerbose, "Enable debug-level operational logs")
 	flagSet.StringVar(&logLevelRaw, "log-level", defaultLogLevelRaw, "Operational log level: debug, info, warn, error, or quiet")
 	flagSet.StringVar(&logFormatRaw, "log-format", defaultLogFormatRaw, "Operational log format: text or json")
@@ -1379,6 +1407,25 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	if flagSet.NArg() > 0 {
 		return Configuration{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flagSet.Args(), " "))
 	}
+
+	cliFlags := map[string]bool{}
+	flagSet.Visit(func(visited *flag.Flag) {
+		cliFlags[visited.Name] = true
+	})
+
+	appliedProfile, profileErr := localstate.ApplyProfileToFlagSet(flagSet, localstate.ProfileOptions{
+		Subcommand:        subcommand,
+		ConfigFlag:        configFileFlag,
+		ConfigFlagSet:     cliFlags["config"],
+		ProfileFlag:       profileFlag,
+		ProfileFlagSet:    cliFlags["profile"],
+		LookupEnvironment: rawLookupEnvironment,
+	})
+	if profileErr != nil {
+		return Configuration{}, profileErr
+	}
+	configuration.ConfigFilePath = appliedProfile.ConfigFilePath
+	configuration.Profile = appliedProfile.Profile
 
 	explicitFlags := map[string]bool{}
 	flagSet.Visit(func(visited *flag.Flag) {
@@ -1424,8 +1471,13 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	configuration.LogLevel = parsedLevel
 	configuration.LogFormat = parsedFormat
 
-	if configuration.WithLocalWorker {
+	if mode == ServiceModeOrchestrator && configuration.WithLocalWorker {
 		var workerArgs []string
+		if appliedProfile.ConfigFilePath != "" {
+			workerArgs = append(workerArgs, "--config", appliedProfile.ConfigFilePath, "--profile", appliedProfile.Profile)
+		} else {
+			workerArgs = append(workerArgs, "--config", "none")
+		}
 		if configuration.Token != "" {
 			workerArgs = append(workerArgs, "--token", configuration.Token)
 		}
@@ -1435,8 +1487,12 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 		if workerID != "" {
 			workerArgs = append(workerArgs, "--id", workerID)
 		}
-		workerArgs = append(workerArgs, "--concurrency", strconv.Itoa(workerConcurrency))
-		workerArgs = append(workerArgs, "--instance-capacity", strconv.Itoa(workerInstanceCapacity))
+		if explicitFlags["worker-concurrency"] {
+			workerArgs = append(workerArgs, "--concurrency", strconv.Itoa(workerConcurrency))
+		}
+		if explicitFlags["worker-instance-capacity"] {
+			workerArgs = append(workerArgs, "--instance-capacity", strconv.Itoa(workerInstanceCapacity))
+		}
 		if claudeAuthMode != "" {
 			workerArgs = append(workerArgs, "--claude-acp-auth-mode", claudeAuthMode)
 		}
@@ -1452,7 +1508,7 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 		for _, adapter := range acpAdapterFlag.values {
 			workerArgs = append(workerArgs, "--acp-adapter", adapter)
 		}
-		workerConfig, workerErr := slave.ParseConfiguration(workerArgs, lookupEnvironment)
+		workerConfig, workerErr := slave.ParseConfiguration(workerArgs, rawLookupEnvironment)
 		if workerErr != nil {
 			return Configuration{}, fmt.Errorf("local worker configuration: %w", workerErr)
 		}
@@ -1471,10 +1527,6 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 }
 
 func ParseRelayConfiguration(arguments []string, lookupEnvironment func(string) (string, bool)) (Configuration, error) {
-	configuration, err := ParseConfiguration(arguments, lookupEnvironment)
-	if err != nil {
-		return Configuration{}, err
-	}
 	for _, disallowed := range []string{
 		"project-profiles",
 		"with-local-worker",
@@ -1492,26 +1544,18 @@ func ParseRelayConfiguration(arguments []string, lookupEnvironment func(string) 
 			return Configuration{}, fmt.Errorf("--%s is unavailable in relay mode", disallowed)
 		}
 	}
-	if configuration.WithLocalWorker {
+	effectiveLookup := lookupEnvironment
+	if effectiveLookup == nil {
+		effectiveLookup = os.LookupEnv
+	}
+	if firstMasterEnvironment(effectiveLookup, "ORCHESTRA_WITH_LOCAL_WORKER") == "1" ||
+		strings.EqualFold(firstMasterEnvironment(effectiveLookup, "ORCHESTRA_WITH_LOCAL_WORKER"), "true") {
 		return Configuration{}, errors.New("embedded workers are unavailable in relay mode")
 	}
-	if strings.TrimSpace(configuration.ProjectProfilePath) != "" {
+	if firstMasterEnvironment(effectiveLookup, "ORCHESTRA_PROJECT_PROFILES") != "" {
 		return Configuration{}, errors.New("project profiles are unavailable in relay mode")
 	}
-	dataDirectoryExplicit := commandLineHasFlag(arguments, "data-dir")
-	if lookupEnvironment == nil {
-		lookupEnvironment = os.LookupEnv
-	}
-	if firstMasterEnvironment(lookupEnvironment, "ORCHESTRA_DATA_DIR", "ORCHESTRA_DATA_ROOT") != "" {
-		dataDirectoryExplicit = true
-	}
-	if !dataDirectoryExplicit {
-		configuration.DataDirectory = filepath.Join(setup.DefaultDataRoot(), "relay")
-	}
-	configuration.Mode = ServiceModeRelay
-	configuration.WithLocalWorker = false
-	configuration.LocalWorker = slave.Configuration{}
-	return configuration, nil
+	return parseServerConfiguration(ServiceModeRelay, arguments, lookupEnvironment)
 }
 
 func commandLineHasFlag(arguments []string, name string) bool {

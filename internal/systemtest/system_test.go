@@ -333,7 +333,11 @@ type mcpStdioSession struct {
 func startMCPStdioSession(t *testing.T, orchestraBinary string, endpoint string, token string, clientID string, extraArguments ...string) *mcpStdioSession {
 	t.Helper()
 	sessionContext, cancelSession := context.WithCancel(context.Background())
-	commandArguments := append([]string{"mcp", "--endpoint", endpoint, "--token", token, "--client-id", clientID}, extraArguments...)
+	commandArguments := []string{"mcp", "--endpoint", endpoint, "--token", token, "--client-id", clientID}
+	if !slices.Contains(extraArguments, "--config") {
+		commandArguments = append(commandArguments, "--config", "none")
+	}
+	commandArguments = append(commandArguments, extraArguments...)
 	command := exec.CommandContext(sessionContext, orchestraBinary, commandArguments...)
 	stdinPipe, err := command.StdinPipe()
 	require.NoError(t, err)
@@ -496,6 +500,12 @@ func formatFakeScript(t *testing.T, steps ...map[string]any) string {
 
 func buildWorkerEnvironment(fakeHarnesses fakeHarnessInstallation, extra ...string) []string {
 	var filtered []string
+	overridesHome := slices.ContainsFunc(extra, func(item string) bool {
+		return strings.HasPrefix(item, "HOME=")
+	})
+	overridesConfig := slices.ContainsFunc(extra, func(item string) bool {
+		return strings.HasPrefix(item, "ORCHESTRA_CONFIG=")
+	})
 	blockedPrefixes := []string{
 		"ANTHROPIC_",
 		"CLAUDE_CODE_",
@@ -503,6 +513,9 @@ func buildWorkerEnvironment(fakeHarnesses fakeHarnessInstallation, extra ...stri
 		"CLOUD_ML_REGION=",
 		"ORCHESTRA_",
 		"WORKSPACE_ROOTS=",
+	}
+	if overridesHome {
+		blockedPrefixes = append(blockedPrefixes, "HOME=", "XDG_CONFIG_HOME=")
 	}
 	for _, entry := range os.Environ() {
 		if strings.HasPrefix(entry, "PATH=") {
@@ -525,6 +538,9 @@ func buildWorkerEnvironment(fakeHarnesses fakeHarnessInstallation, extra ...stri
 		"ORCHESTRA_FAKE_SESSION_DIRECTORY="+fakeHarnesses.sessionDirectory,
 		"ORCHESTRA_FAKE_GATE_DIRECTORY="+fakeHarnesses.gateDirectory,
 	)
+	if !overridesConfig && !overridesHome {
+		filtered = append(filtered, "ORCHESTRA_CONFIG=none")
+	}
 	return append(filtered, extra...)
 }
 
@@ -2865,4 +2881,104 @@ func TestSlaveSelfUpdateInPlacePreservesPIDAndACPResidentSession(t *testing.T) {
 	var buildInfo map[string]string
 	require.NoError(t, json.Unmarshal([]byte(versionAfterOut), &buildInfo))
 	assert.Equal(t, "0.2.0", buildInfo["version"])
+}
+
+func TestZeroFlagConfigProfileStartup(t *testing.T) {
+	binaries := ensureCompiledBinaries(t)
+	fakeHarnesses := installFakeHarnesses(t, binaries.fakeHarnessPath)
+
+	homeDirectory := t.TempDir()
+	defaultWorkspaceRaw := filepath.Join(homeDirectory, "CafecitoGames")
+	gpuWorkspaceRaw := filepath.Join(homeDirectory, "GPUProjects")
+	require.NoError(t, os.MkdirAll(defaultWorkspaceRaw, 0o755))
+	require.NoError(t, os.MkdirAll(gpuWorkspaceRaw, 0o755))
+
+	defaultCanonicalRoots, err := slave.CanonicalizeWorkspaceRoots([]string{defaultWorkspaceRaw})
+	require.NoError(t, err)
+	gpuCanonicalRoots, err := slave.CanonicalizeWorkspaceRoots([]string{gpuWorkspaceRaw})
+	require.NoError(t, err)
+
+	initializeGitRepository(t, filepath.Join(defaultCanonicalRoots[0], "orchestra-demo"))
+	initializeGitRepository(t, filepath.Join(gpuCanonicalRoots[0], "shader-lab"))
+
+	listenAddress := allocateFreeLoopbackAddress(t)
+	masterBaseURL := "http://" + listenAddress
+	configPath := filepath.Join(homeDirectory, ".orchestra", "config.toml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(configPath), 0o700))
+
+	configContent := fmt.Sprintf(`
+[default]
+endpoint = %q
+token = "profile-zero-flag-token"
+workspace-root = "~/CafecitoGames"
+claude-acp-auth-mode = "local-subscription"
+approval-policy = "auto"
+connection-file = "~/connection.json"
+
+[default.master]
+listen = %q
+data-dir = "~/master-data"
+
+[default.slave]
+id = "worker-default"
+name = "Default Worker"
+concurrency = 3
+label = ["macos"]
+
+[gpu]
+id = "worker-gpu"
+name = "GPU Worker"
+kind = "home-server"
+workspace-root = ["~/GPUProjects"]
+accelerator = ["cuda"]
+concurrency = 6
+`, masterBaseURL, listenAddress)
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0o600))
+
+	sharedEnvironment := buildWorkerEnvironment(fakeHarnesses, "HOME="+homeDirectory)
+
+	// Start master and default slave with zero flags (`orchestra master` and `orchestra slave`),
+	// plus a second slave selecting `--profile gpu`.
+	masterProcess := startManagedProcess(t, "profile-master", binaries.orchestraPath, []string{"master"}, sharedEnvironment)
+	waitForMasterReady(t, masterBaseURL, masterProcess)
+
+	defaultSlaveProcess := startManagedProcess(t, "profile-slave-default", binaries.orchestraPath, []string{"slave"}, sharedEnvironment)
+	gpuSlaveProcess := startManagedProcess(t, "profile-slave-gpu", binaries.orchestraPath, []string{"slave", "--profile", "gpu"}, sharedEnvironment)
+
+	require.Eventually(t, func() bool {
+		output, _ := invokeOrchestraCLI(t, binaries.orchestraPath, sharedEnvironment, "nodes", "--json")
+		var response struct {
+			Nodes []protocol.NodeDetail `json:"nodes"`
+		}
+		if json.Unmarshal([]byte(output), &response) != nil || len(response.Nodes) < 2 {
+			return false
+		}
+		onlineByID := map[string]protocol.NodeDetail{}
+		for _, detail := range response.Nodes {
+			if detail.Connected && detail.Node.Status == "online" {
+				onlineByID[detail.Node.ID] = detail
+			}
+		}
+		defaultDetail, hasDefault := onlineByID["worker-default"]
+		gpuDetail, hasGPU := onlineByID["worker-gpu"]
+		if !hasDefault || !hasGPU || defaultDetail.CapabilityReport == nil || gpuDetail.CapabilityReport == nil {
+			return false
+		}
+		hasCapability := func(report *protocol.NodeCapabilityReport, capabilityID string) bool {
+			return slices.ContainsFunc(report.Evidence, func(item protocol.NodeCapabilityEvidence) bool {
+				return item.CapabilityID == capabilityID && item.Success
+			})
+		}
+		return slices.Equal(defaultDetail.Node.WorkspaceRoots, defaultCanonicalRoots) &&
+			defaultDetail.Node.Concurrency == 3 &&
+			hasCapability(defaultDetail.CapabilityReport, "label:macos") &&
+			defaultDetail.RepositoryReport != nil &&
+			len(defaultDetail.RepositoryReport.Repositories) == 1 &&
+			slices.Equal(gpuDetail.Node.WorkspaceRoots, gpuCanonicalRoots) &&
+			gpuDetail.Node.Kind == "home-server" &&
+			gpuDetail.Node.Concurrency == 6 &&
+			hasCapability(gpuDetail.CapabilityReport, "accelerator:cuda") &&
+			gpuDetail.RepositoryReport != nil &&
+			len(gpuDetail.RepositoryReport.Repositories) == 1
+	}, 15*time.Second, 100*time.Millisecond, "master:\n%s\ndefault-slave:\n%s\ngpu-slave:\n%s", masterProcess.logs(), defaultSlaveProcess.logs(), gpuSlaveProcess.logs())
 }

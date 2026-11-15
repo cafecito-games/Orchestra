@@ -25,10 +25,14 @@ const operatorRequestTimeout = 30 * time.Second
 
 type operatorConnectionFlags struct {
 	flagSet                 *flag.FlagSet
-	connectionFilePath      string
+	rawLookupEnvironment    func(string) (string, bool)
+	profileApplied          *bool
 	endpointFromEnvironment string
 	tokenFromEnvironment    string
 	tlsExplicitEnvironment  bool
+	configFile              *string
+	profile                 *string
+	connectionFile          *string
 	endpoint                *string
 	token                   *string
 	asJSON                  *bool
@@ -37,7 +41,7 @@ type operatorConnectionFlags struct {
 }
 
 func registerOperatorFlags(flagSet *flag.FlagSet, lookupEnvironment func(string) (string, bool)) operatorConnectionFlags {
-	connectionFilePath := localstate.ResolveConnectionFilePath(lookupEnvironment)
+	defaultConnectionFile := localstate.ResolveConnectionFilePath(lookupEnvironment)
 	endpointFromEnvironment := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_ENDPOINT", "CONTROL_ENDPOINT")
 	defaultEndpoint := endpointFromEnvironment
 	if defaultEndpoint == "" {
@@ -49,6 +53,9 @@ func registerOperatorFlags(flagSet *flag.FlagSet, lookupEnvironment func(string)
 	defaultTLSInsecure := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_INSECURE") == "1" ||
 		strings.EqualFold(firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_INSECURE"), "true")
 
+	configFile := flagSet.String("config", "", "Path to Orchestra TOML config file (default ~/.orchestra/config.toml)")
+	profile := flagSet.String("profile", "", "Configuration profile name in config.toml (default \"default\")")
+	connectionFile := flagSet.String("connection-file", defaultConnectionFile, "Local connection discovery state file path")
 	endpoint := flagSet.String("endpoint", defaultEndpoint, "Orchestra master HTTP or WebSocket endpoint")
 	flagSet.StringVar(endpoint, "control-endpoint", defaultEndpoint, "Orchestra master HTTP or WebSocket endpoint")
 	token := flagSet.String("token", defaultToken, "Bearer token matching ORCHESTRA_TOKEN")
@@ -56,12 +63,17 @@ func registerOperatorFlags(flagSet *flag.FlagSet, lookupEnvironment func(string)
 	tlsCACert := flagSet.String("tls-ca", defaultTLSCACert, "CA certificate PEM path for https://")
 	tlsInsecure := flagSet.Bool("tls-insecure", defaultTLSInsecure, "Skip TLS certificate verification")
 
+	applied := false
 	return operatorConnectionFlags{
 		flagSet:                 flagSet,
-		connectionFilePath:      connectionFilePath,
+		rawLookupEnvironment:    lookupEnvironment,
+		profileApplied:          &applied,
 		endpointFromEnvironment: endpointFromEnvironment,
 		tokenFromEnvironment:    tokenFromEnvironment,
 		tlsExplicitEnvironment:  defaultTLSCACert != "" || defaultTLSInsecure,
+		configFile:              configFile,
+		profile:                 profile,
+		connectionFile:          connectionFile,
 		endpoint:                endpoint,
 		token:                   token,
 		asJSON:                  asJSON,
@@ -70,13 +82,33 @@ func registerOperatorFlags(flagSet *flag.FlagSet, lookupEnvironment func(string)
 	}
 }
 
-func (connection operatorConnectionFlags) resolvedTarget() (string, string, string, bool) {
+func (connection operatorConnectionFlags) resolvedTarget() (string, string, string, bool, error) {
+	if connection.flagSet != nil && connection.profileApplied != nil && !*connection.profileApplied {
+		cliFlags := map[string]bool{}
+		connection.flagSet.Visit(func(visited *flag.Flag) {
+			cliFlags[visited.Name] = true
+		})
+		_, profileErr := localstate.ApplyProfileToFlagSet(connection.flagSet, localstate.ProfileOptions{
+			Subcommand:        localstate.SubcommandOperator,
+			ConfigFlag:        *connection.configFile,
+			ConfigFlagSet:     cliFlags["config"],
+			ProfileFlag:       *connection.profile,
+			ProfileFlagSet:    cliFlags["profile"],
+			LookupEnvironment: connection.rawLookupEnvironment,
+		})
+		if profileErr != nil {
+			return "", "", "", false, profileErr
+		}
+		*connection.profileApplied = true
+	}
+
 	explicitFlags := map[string]bool{}
 	if connection.flagSet != nil {
 		connection.flagSet.Visit(func(visited *flag.Flag) {
 			explicitFlags[visited.Name] = true
 		})
 	}
+	connectionFilePath := *connection.connectionFile
 	endpoint := *connection.endpoint
 	token := *connection.token
 	tlsCACert := *connection.tlsCACert
@@ -86,8 +118,8 @@ func (connection operatorConnectionFlags) resolvedTarget() (string, string, stri
 	tokenExplicit := explicitFlags["token"] || connection.tokenFromEnvironment != ""
 	tlsExplicit := explicitFlags["tls-ca"] || explicitFlags["tls-insecure"] || connection.tlsExplicitEnvironment
 
-	if connection.connectionFilePath != "" && (!endpointExplicit || !tokenExplicit || !tlsExplicit) {
-		if discovered, found, readErr := localstate.ReadConnectionState(connection.connectionFilePath); readErr == nil && found {
+	if connectionFilePath != "" && (!endpointExplicit || !tokenExplicit || !tlsExplicit) {
+		if discovered, found, readErr := localstate.ReadConnectionState(connectionFilePath); readErr == nil && found {
 			if !endpointExplicit && strings.TrimSpace(discovered.Endpoint) != "" {
 				endpoint = strings.TrimSpace(discovered.Endpoint)
 			}
@@ -104,7 +136,7 @@ func (connection operatorConnectionFlags) resolvedTarget() (string, string, stri
 			}
 		}
 	}
-	return endpoint, token, tlsCACert, tlsInsecure
+	return endpoint, token, tlsCACert, tlsInsecure, nil
 }
 
 func normalizeFlagOrder(flagSet *flag.FlagSet, arguments []string) []string {
@@ -168,7 +200,10 @@ func (connection operatorConnectionFlags) requestJSONWithTimeout(
 	destination any,
 	timeout time.Duration,
 ) error {
-	resolvedEndpoint, resolvedToken, resolvedTLSCACert, resolvedTLSInsecure := connection.resolvedTarget()
+	resolvedEndpoint, resolvedToken, resolvedTLSCACert, resolvedTLSInsecure, targetErr := connection.resolvedTarget()
+	if targetErr != nil {
+		return targetErr
+	}
 	baseURL, err := resolveHTTPBaseURL(resolvedEndpoint)
 	if err != nil {
 		return err

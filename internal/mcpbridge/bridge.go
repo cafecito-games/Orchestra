@@ -39,6 +39,8 @@ const (
 )
 
 type Configuration struct {
+	ConfigFilePath     string
+	Profile            string
 	Endpoint           string
 	Token              string
 	ClientID           string
@@ -53,8 +55,9 @@ type Configuration struct {
 	TLSExplicit        bool
 }
 
-func ParseConfiguration(arguments []string, lookupEnvironment func(string) (string, bool)) (Configuration, error) {
-	defaultConnectionFile := localstate.ResolveConnectionFilePath(lookupEnvironment)
+func ParseConfiguration(arguments []string, rawLookupEnvironment func(string) (string, bool)) (Configuration, error) {
+	defaultConnectionFile := localstate.ResolveConnectionFilePath(rawLookupEnvironment)
+	lookupEnvironment := rawLookupEnvironment
 	if lookupEnvironment == nil {
 		lookupEnvironment = os.LookupEnv
 	}
@@ -64,20 +67,11 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	environmentTLSCACert := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_CA")
 	environmentTLSInsecureRaw := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_TLS_INSECURE")
 
-	discoveredState, hasDiscoveredState, _ := localstate.ReadConnectionState(defaultConnectionFile)
-
 	defaultEndpoint := environmentEndpoint
-	if defaultEndpoint == "" && hasDiscoveredState && discoveredState.Endpoint != "" {
-		defaultEndpoint = discoveredState.Endpoint
-	}
 	if defaultEndpoint == "" {
 		defaultEndpoint = slave.DefaultEndpoint
 	}
-
 	defaultToken := environmentToken
-	if defaultToken == "" && hasDiscoveredState && discoveredState.Token != "" {
-		defaultToken = discoveredState.Token
-	}
 
 	defaultClientID := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_CLIENT_ID")
 	if defaultClientID == "" {
@@ -87,20 +81,18 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	defaultMailHost := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_MAIL_HOST")
 
 	defaultTLSCACert := environmentTLSCACert
-	if defaultTLSCACert == "" && hasDiscoveredState && discoveredState.TLSCACert != "" {
-		defaultTLSCACert = discoveredState.TLSCACert
-	}
 	defaultTLSInsecure := environmentTLSInsecureRaw == "1" || strings.EqualFold(environmentTLSInsecureRaw, "true")
-	if environmentTLSInsecureRaw == "" && hasDiscoveredState {
-		defaultTLSInsecure = discoveredState.TLSInsecure
-	}
 
 	flagSet := flag.NewFlagSet("orchestra mcp", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
 
 	var configuration Configuration
+	var configFileFlag string
+	var profileFlag string
 	var tlsCACert string
 	var tlsInsecure bool
+	flagSet.StringVar(&configFileFlag, "config", "", "Path to Orchestra TOML config file (default ~/.orchestra/config.toml)")
+	flagSet.StringVar(&profileFlag, "profile", "", "Configuration profile name in config.toml (default \"default\")")
 	flagSet.StringVar(&configuration.Endpoint, "endpoint", defaultEndpoint, "Orchestra master HTTP or WebSocket endpoint")
 	flagSet.StringVar(&configuration.Endpoint, "control-endpoint", defaultEndpoint, "Orchestra master HTTP or WebSocket endpoint")
 	flagSet.StringVar(&configuration.Token, "token", defaultToken, "Bearer token matching ORCHESTRA_TOKEN")
@@ -118,6 +110,25 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 		return Configuration{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flagSet.Args(), " "))
 	}
 
+	cliFlags := map[string]bool{}
+	flagSet.Visit(func(visited *flag.Flag) {
+		cliFlags[visited.Name] = true
+	})
+
+	appliedProfile, profileErr := localstate.ApplyProfileToFlagSet(flagSet, localstate.ProfileOptions{
+		Subcommand:        localstate.SubcommandMCP,
+		ConfigFlag:        configFileFlag,
+		ConfigFlagSet:     cliFlags["config"],
+		ProfileFlag:       profileFlag,
+		ProfileFlagSet:    cliFlags["profile"],
+		LookupEnvironment: rawLookupEnvironment,
+	})
+	if profileErr != nil {
+		return Configuration{}, profileErr
+	}
+	configuration.ConfigFilePath = appliedProfile.ConfigFilePath
+	configuration.Profile = appliedProfile.Profile
+
 	configuration.EndpointExplicit = environmentEndpoint != ""
 	configuration.TokenExplicit = environmentToken != ""
 	configuration.TLSExplicit = environmentTLSCACert != "" || environmentTLSInsecureRaw != ""
@@ -131,6 +142,25 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 			configuration.TLSExplicit = true
 		}
 	})
+
+	if configuration.ConnectionFilePath != "" && (!configuration.EndpointExplicit || !configuration.TokenExplicit || !configuration.TLSExplicit) {
+		if discoveredState, hasDiscoveredState, readErr := localstate.ReadConnectionState(configuration.ConnectionFilePath); readErr == nil && hasDiscoveredState {
+			if !configuration.EndpointExplicit && discoveredState.Endpoint != "" {
+				configuration.Endpoint = discoveredState.Endpoint
+			}
+			if !configuration.TokenExplicit && (discoveredState.Token != "" || strings.EqualFold(discoveredState.AuthMode, "tailscale")) {
+				configuration.Token = discoveredState.Token
+			}
+			if !configuration.TLSExplicit {
+				if discoveredState.TLSCACert != "" {
+					tlsCACert = discoveredState.TLSCACert
+				}
+				if discoveredState.TLSInsecure {
+					tlsInsecure = discoveredState.TLSInsecure
+				}
+			}
+		}
+	}
 
 	if !protocol.IsIdentifier(configuration.ClientID) {
 		return Configuration{}, fmt.Errorf("invalid --client-id %q", configuration.ClientID)

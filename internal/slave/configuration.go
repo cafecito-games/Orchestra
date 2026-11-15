@@ -39,6 +39,8 @@ const (
 var nonSlugCharacters = regexp.MustCompile(`[^a-z0-9-]+`)
 
 type Configuration struct {
+	ConfigFilePath       string
+	Profile              string
 	ControlEndpoint      string
 	EndpointExplicit     bool
 	MasterPort           int
@@ -106,8 +108,9 @@ func (flagValue *repeatFlag) Set(raw string) error {
 	return nil
 }
 
-func ParseConfiguration(arguments []string, lookupEnvironment func(string) (string, bool)) (Configuration, error) {
-	defaultConnectionFile := localstate.ResolveConnectionFilePath(lookupEnvironment)
+func ParseConfiguration(arguments []string, rawLookupEnvironment func(string) (string, bool)) (Configuration, error) {
+	defaultConnectionFile := localstate.ResolveConnectionFilePath(rawLookupEnvironment)
+	lookupEnvironment := rawLookupEnvironment
 	if lookupEnvironment == nil {
 		lookupEnvironment = os.LookupEnv
 	}
@@ -206,11 +209,15 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	flagSet.SetOutput(io.Discard)
 
 	var configuration Configuration
+	var configFileFlag string
+	var profileFlag string
 	var tlsCACert string
 	var tlsInsecure bool
 	var verbose bool
 	var logLevelRaw string
 	var logFormatRaw string
+	flagSet.StringVar(&configFileFlag, "config", "", "Path to Orchestra TOML config file (default ~/.orchestra/config.toml)")
+	flagSet.StringVar(&profileFlag, "profile", "", "Configuration profile name in config.toml (default \"default\")")
 	flagSet.StringVar(&configuration.ControlEndpoint, "control-endpoint", defaultEndpoint, "Orchestrator HTTP or WebSocket base endpoint")
 	flagSet.StringVar(&configuration.ControlEndpoint, "endpoint", defaultEndpoint, "Orchestrator HTTP or WebSocket base endpoint")
 	flagSet.IntVar(&configuration.MasterPort, "master-port", defaultMasterPort, "Master port probed during automatic Tailscale discovery")
@@ -248,6 +255,25 @@ func ParseConfiguration(arguments []string, lookupEnvironment func(string) (stri
 	if flagSet.NArg() > 0 {
 		return Configuration{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flagSet.Args(), " "))
 	}
+
+	cliFlags := map[string]bool{}
+	flagSet.Visit(func(visited *flag.Flag) {
+		cliFlags[visited.Name] = true
+	})
+
+	appliedProfile, profileErr := localstate.ApplyProfileToFlagSet(flagSet, localstate.ProfileOptions{
+		Subcommand:        localstate.SubcommandSlave,
+		ConfigFlag:        configFileFlag,
+		ConfigFlagSet:     cliFlags["config"],
+		ProfileFlag:       profileFlag,
+		ProfileFlagSet:    cliFlags["profile"],
+		LookupEnvironment: rawLookupEnvironment,
+	})
+	if profileErr != nil {
+		return Configuration{}, profileErr
+	}
+	configuration.ConfigFilePath = appliedProfile.ConfigFilePath
+	configuration.Profile = appliedProfile.Profile
 
 	explicitFlags := map[string]bool{}
 	flagSet.Visit(func(visited *flag.Flag) {
