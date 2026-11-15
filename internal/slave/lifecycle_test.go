@@ -568,3 +568,81 @@ printf '{"type":"result","session_id":"sess-warm-42","result":"model=%s resume=%
 	assert.Equal(t, "model=haiku resume=sess-warm-42", *completedMessage.Output)
 	assert.Equal(t, "sess-warm-42", completedMessage.ProviderSessionID)
 }
+
+func TestClient_ConnectionLifecycle_CancelDuringAdmissionHandshake(t *testing.T) {
+	rawRoot := t.TempDir()
+	rootPath, err := filepath.EvalSymlinks(rawRoot)
+	require.NoError(t, err)
+
+	repositoryGitDirectory := filepath.Join(rootPath, "project", ".git")
+	require.NoError(t, os.MkdirAll(repositoryGitDirectory, 0o755))
+
+	markerPath := filepath.Join(t.TempDir(), "handshake-entered")
+	slowGitBinary := filepath.Join(t.TempDir(), "fake-git")
+	slowGitScript := "#!/bin/sh\n: > \"" + markerPath + "\"\nexec sleep 5\n"
+	require.NoError(t, os.WriteFile(slowGitBinary, []byte(slowGitScript), 0o755))
+
+	workspaceManager := workspace.NewManager([]string{rootPath}, &workspace.Git{
+		Binary:             slowGitBinary,
+		Timeout:            5 * time.Second,
+		MaximumOutputBytes: 64 * 1024,
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, acceptErr := websocket.Accept(writer, request, nil)
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close(websocket.StatusNormalClosure, "done")
+
+		for {
+			_, payload, readErr := connection.Read(request.Context())
+			if readErr != nil {
+				return
+			}
+			var message protocol.SlaveControlMessage
+			if unmarshalErr := json.Unmarshal(payload, &message); unmarshalErr != nil {
+				continue
+			}
+			if message.Type == "register" {
+				pingBytes, _ := json.Marshal(protocol.MasterControlMessage{
+					Type: "ping",
+					At:   time.Now().UTC().Format(time.RFC3339Nano),
+				})
+				_ = connection.Write(request.Context(), websocket.MessageText, pingBytes)
+			}
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(ClientOptions{
+		Endpoint:          server.URL,
+		Token:             "test-token",
+		Node:              protocol.ComputeNode{ID: "worker-cancel-handshake", Concurrency: 1, WorkspaceRoots: []string{rootPath}},
+		WorkspaceManager:  workspaceManager,
+		ReconnectMinDelay: 20 * time.Millisecond,
+		ReconnectMaxDelay: 50 * time.Millisecond,
+	})
+
+	runContext, cancelClient := context.WithCancel(t.Context())
+	defer cancelClient()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Run(runContext)
+	}()
+
+	require.Eventually(t, func() bool {
+		_, statErr := os.Stat(markerPath)
+		return statErr == nil
+	}, 5*time.Second, 10*time.Millisecond)
+
+	cancelClient()
+
+	select {
+	case runErr := <-done:
+		require.NoError(t, runErr)
+	case <-time.After(3 * time.Second):
+		require.FailNow(t, "client.Run deadlocked when canceled during admission handshake")
+	}
+}
