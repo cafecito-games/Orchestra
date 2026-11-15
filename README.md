@@ -271,6 +271,42 @@ orchestra slave \
 
 Both `orchestra master` and `orchestra slave` emit structured, secret-redacted operational logs to `stderr` (`info` by default; customize with `--verbose`, `--log-level debug|info|warn|error|quiet`, and `--log-format text|json`).
 
+### 4. Zero-Flag Startup with `~/.orchestra/config.toml`
+
+Instead of repeating CLI flags or environment variables on each machine, create `~/.orchestra/config.toml` (or `$XDG_CONFIG_HOME/orchestra/config.toml`). `orchestra master`, `orchestra slave`, `orchestra relay`, `orchestra mcp`, `orchestra doctor`, and operator CLI commands automatically load `[default]`, or you can select a named profile with `--profile <name>` (or `ORCHESTRA_PROFILE`):
+
+```toml
+[default]
+auth = "tailscale"
+workspace-root = ["~/Projects"]
+claude-acp-auth-mode = "local-subscription"
+approval-policy = "auto"
+
+[default.master]
+with-local-worker = true
+
+[default.slave]
+concurrency = 4
+label = ["macos", "apple-silicon"]
+
+# Named profiles inherit unset keys from [default]:
+[gpu]
+kind = "home-server"
+workspace-root = "/srv/workspaces"
+accelerator = ["cuda"]
+concurrency = 6
+```
+
+With `~/.orchestra/config.toml` in place, starting nodes requires no flags:
+
+```bash
+orchestra master
+orchestra slave
+orchestra slave --profile gpu
+```
+
+Precedence is `explicit CLI flags` > `ORCHESTRA_* environment variables` > `[<profile>.<subcommand>]` > `[<profile>]` > `[default.<subcommand>]` > `[default]` > `built-in defaults`. Pass `--config <path>` (or `ORCHESTRA_CONFIG=none`) to override or disable config loading.
+
 ### Supported Harnesses at a Glance
 
 | Harness ID | CLI Binary | Default Transport | Zero-Download Ready? | Notes |

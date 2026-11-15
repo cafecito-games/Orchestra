@@ -217,6 +217,14 @@ func runMaster(
 			activitylog.String("file", running.ConnectionFilePath),
 		)
 	}
+	if configuration.ConfigFilePath != "" {
+		logger.Info(
+			"config",
+			"loaded configuration profile",
+			activitylog.String("profile", configuration.Profile),
+			activitylog.String("file", configuration.ConfigFilePath),
+		)
+	}
 	if waitErr := running.Wait(); waitErr != nil && !errors.Is(waitErr, context.Canceled) {
 		logger.Error("master", "stopped with error", activitylog.String("error", waitErr.Error()))
 		return 1
@@ -281,6 +289,14 @@ func runRelay(
 	if running.ConnectionFilePath != "" {
 		logger.Info("config", "wrote local discovery state", activitylog.String("file", running.ConnectionFilePath))
 	}
+	if configuration.ConfigFilePath != "" {
+		logger.Info(
+			"config",
+			"loaded configuration profile",
+			activitylog.String("profile", configuration.Profile),
+			activitylog.String("file", configuration.ConfigFilePath),
+		)
+	}
 	if waitErr := running.Wait(); waitErr != nil && !errors.Is(waitErr, context.Canceled) {
 		logger.Error("relay", "stopped with error", activitylog.String("error", waitErr.Error()))
 		return 1
@@ -296,6 +312,8 @@ connect through orchestra mcp; no workers, tasks, scheduler, or process lifecycl
 management are enabled.
 
 Flags:
+  --config string                TOML configuration file path (default ~/.orchestra/config.toml, env ORCHESTRA_CONFIG)
+  --profile string               Configuration profile in config.toml (default "default", env ORCHESTRA_PROFILE)
   --listen string                HTTP/WebSocket listen address (default 127.0.0.1:8787, or <tailscale-ip>:8787 with --auth tailscale)
   --auth string                  Authentication mode: token or tailscale (default token)
   --token string                 Bearer token (auto-generated in <data-dir>/token in token mode)
@@ -316,6 +334,8 @@ func printMasterUsage(output io.Writer) {
 	fmt.Fprintf(output, `Usage: orchestra master [flags]
 
 Flags:
+  --config string                TOML configuration file path (default ~/.orchestra/config.toml, env ORCHESTRA_CONFIG)
+  --profile string               Configuration profile in config.toml (default "default", env ORCHESTRA_PROFILE)
   --listen string                HTTP/WebSocket listen address (default 127.0.0.1:8787, or <tailscale-ip>:8787 with --auth tailscale, env ORCHESTRA_LISTEN)
   --auth string                  Authentication mode: token or tailscale (default token, env ORCHESTRA_AUTH_MODE)
   --token string                 Bearer token (auto-generated in <data-dir>/token in token mode, env ORCHESTRA_TOKEN)
@@ -403,6 +423,14 @@ func runSlave(
 		logger = logger.WithSecrets(configuration.Token)
 	}
 
+	if configuration.ConfigFilePath != "" {
+		logger.Info(
+			"config",
+			"loaded configuration profile",
+			activitylog.String("profile", configuration.Profile),
+			activitylog.String("file", configuration.ConfigFilePath),
+		)
+	}
 	logger.Info(
 		"slave",
 		fmt.Sprintf("orchestra slave %s starting", protocol.EffectiveBuildVersion()),
@@ -426,6 +454,8 @@ func printSlaveUsage(output io.Writer) {
 	fmt.Fprintf(output, `Usage: orchestra slave [flags]
 
 Flags:
+  --config string               TOML configuration file path (default ~/.orchestra/config.toml, env ORCHESTRA_CONFIG)
+  --profile string              Configuration profile in config.toml (default "default", env ORCHESTRA_PROFILE)
   --endpoint string             Orchestrator HTTP/WebSocket endpoint (auto-discovered via localhost/Tailscale if omitted, env ORCHESTRA_ENDPOINT)
   --master-port int             Master port probed during Tailscale auto-discovery (default 8787, env ORCHESTRA_MASTER_PORT)
   --tailscale-binary string     Optional explicit path to tailscale CLI binary (env ORCHESTRA_TAILSCALE_BINARY)
@@ -486,6 +516,8 @@ Subcommands:
   status      Inspect local master discovery state and per-harness MCP registration
 
 Bridge Flags (stdio MCP server):
+  --config string           TOML configuration file path (default ~/.orchestra/config.toml, env ORCHESTRA_CONFIG)
+  --profile string          Configuration profile in config.toml (default "default", env ORCHESTRA_PROFILE)
   --endpoint string         Explicit Orchestra master endpoint override (auto-discovered from connection.json if omitted)
   --token string            Explicit bearer token override (auto-discovered from connection.json if omitted)
   --connection-file string  Local connection discovery state file path (env ORCHESTRA_CONNECTION_FILE)

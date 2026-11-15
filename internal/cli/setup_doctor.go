@@ -581,22 +581,34 @@ func runDoctor(
 	standardError io.Writer,
 	lookupEnvironment func(string) (string, bool),
 ) int {
-	connectionFilePath := localstate.ResolveConnectionFilePath(lookupEnvironment)
+	defaultConnectionFile := localstate.ResolveConnectionFilePath(lookupEnvironment)
 	endpointFromEnvironment := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_ENDPOINT", "CONTROL_ENDPOINT")
 	defaultEndpoint := endpointFromEnvironment
 	if defaultEndpoint == "" {
 		defaultEndpoint = slave.DefaultEndpoint
 	}
 	defaultClaudeAuthMode := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_CLAUDE_ACP_AUTH_MODE")
+	defaultInstanceCapacity := slave.DefaultInstanceCapacity
+	if rawCapacity := firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_INSTANCE_CAPACITY"); rawCapacity != "" {
+		var parsedCapacity int
+		if _, scanErr := fmt.Sscanf(rawCapacity, "%d", &parsedCapacity); scanErr != nil || parsedCapacity < 0 {
+			fmt.Fprintf(standardError, "orchestra doctor: invalid ORCHESTRA_INSTANCE_CAPACITY %q\n", rawCapacity)
+			return 2
+		}
+		defaultInstanceCapacity = parsedCapacity
+	}
 
 	flagSet := flag.NewFlagSet("orchestra doctor", flag.ContinueOnError)
 	flagSet.SetOutput(standardError)
+	configFile := flagSet.String("config", "", "Path to Orchestra TOML config file (default ~/.orchestra/config.toml)")
+	profile := flagSet.String("profile", "", "Configuration profile name in config.toml (default \"default\")")
+	connectionFile := flagSet.String("connection-file", defaultConnectionFile, "Local connection discovery state file path")
 	dataRoot := flagSet.String("data-root", defaultSetupDataRoot(lookupEnvironment), "Orchestra-owned data root")
 	manifestPath := flagSet.String("manifest", firstEnvironmentValue(lookupEnvironment, "ORCHESTRA_ADAPTER_MANIFEST"), "Optional path to component manifest JSON file")
 	controlEndpoint := flagSet.String("endpoint", defaultEndpoint, "Orchestra master endpoint to test for TCP reachability")
 	flagSet.StringVar(controlEndpoint, "control-endpoint", defaultEndpoint, "Orchestra master endpoint to test for TCP reachability")
 	claudeACPAuthMode := flagSet.String("claude-acp-auth-mode", defaultClaudeAuthMode, "Claude ACP auth mode policy (local-subscription or api)")
-	instanceCapacity := flagSet.Int("instance-capacity", slave.DefaultInstanceCapacity, "Resident instance capacity")
+	instanceCapacity := flagSet.Int("instance-capacity", defaultInstanceCapacity, "Resident instance capacity")
 	asJSON := flagSet.Bool("json", false, "Format readiness report as JSON")
 	var approvalPolicyValues repeatedStringValues
 	flagSet.Var(&approvalPolicyValues, "approval-policy", "Harness approval policy manual|auto|bypass or harness=policy (repeatable)")
@@ -612,12 +624,30 @@ func runDoctor(
 		return 2
 	}
 
+	cliFlags := map[string]bool{}
+	flagSet.Visit(func(visited *flag.Flag) {
+		cliFlags[visited.Name] = true
+	})
+
+	appliedProfile, profileErr := localstate.ApplyProfileToFlagSet(flagSet, localstate.ProfileOptions{
+		Subcommand:        localstate.SubcommandDoctor,
+		ConfigFlag:        *configFile,
+		ConfigFlagSet:     cliFlags["config"],
+		ProfileFlag:       *profile,
+		ProfileFlagSet:    cliFlags["profile"],
+		LookupEnvironment: lookupEnvironment,
+	})
+	if profileErr != nil {
+		fmt.Fprintf(standardError, "orchestra doctor: %v\n", profileErr)
+		return 2
+	}
+
 	explicitFlags := map[string]bool{}
 	flagSet.Visit(func(visited *flag.Flag) {
 		explicitFlags[visited.Name] = true
 	})
-	if !explicitFlags["endpoint"] && !explicitFlags["control-endpoint"] && endpointFromEnvironment == "" && connectionFilePath != "" {
-		if discovered, found, readErr := localstate.ReadConnectionState(connectionFilePath); readErr == nil && found && strings.TrimSpace(discovered.Endpoint) != "" {
+	if !explicitFlags["endpoint"] && !explicitFlags["control-endpoint"] && endpointFromEnvironment == "" && *connectionFile != "" {
+		if discovered, found, readErr := localstate.ReadConnectionState(*connectionFile); readErr == nil && found && strings.TrimSpace(discovered.Endpoint) != "" {
 			*controlEndpoint = strings.TrimSpace(discovered.Endpoint)
 		}
 	}
@@ -694,6 +724,10 @@ func runDoctor(
 		return writePrettyJSON(standardOutput, standardError, report)
 	}
 
+	if appliedProfile.ConfigFilePath != "" {
+		fmt.Fprintf(standardOutput, "config profile: %s (%s)\n", appliedProfile.Profile, appliedProfile.ConfigFilePath)
+	}
+
 	for _, entry := range report.Components {
 		harnessState := "not-applicable"
 		if entry.HarnessApplicable {
@@ -759,22 +793,27 @@ func runDoctor(
 
 func parseDoctorApprovalPolicies(entries []string) (harness.ApprovalPolicies, error) {
 	policies := harness.ApprovalPolicies{}
-	for _, rawEntry := range entries {
-		if strings.Contains(rawEntry, "=") {
-			harnessID, policy, found := strings.Cut(rawEntry, "=")
-			harnessID = strings.TrimSpace(harnessID)
-			policy = strings.TrimSpace(policy)
-			if !found || !slices.Contains(harness.ApprovalPolicyHarnessIDs, harnessID) || !slices.Contains(protocol.ApprovalPolicies, policy) {
-				return nil, errors.New("approval-policy must be manual|auto|bypass or harness=manual|auto|bypass")
+	for _, entryGroup := range entries {
+		for rawEntry := range strings.SplitSeq(entryGroup, ",") {
+			trimmedEntry := strings.TrimSpace(rawEntry)
+			if trimmedEntry == "" {
+				continue
 			}
-			policies[harnessID] = policy
-		} else {
-			policy := strings.TrimSpace(rawEntry)
-			if !slices.Contains(protocol.ApprovalPolicies, policy) {
-				return nil, errors.New("approval-policy must be manual|auto|bypass or harness=manual|auto|bypass")
-			}
-			for _, harnessID := range harness.ApprovalPolicyHarnessIDs {
+			if strings.Contains(trimmedEntry, "=") {
+				harnessID, policy, found := strings.Cut(trimmedEntry, "=")
+				harnessID = strings.TrimSpace(harnessID)
+				policy = strings.TrimSpace(policy)
+				if !found || !slices.Contains(harness.ApprovalPolicyHarnessIDs, harnessID) || !slices.Contains(protocol.ApprovalPolicies, policy) {
+					return nil, errors.New("approval-policy must be manual|auto|bypass or harness=manual|auto|bypass")
+				}
 				policies[harnessID] = policy
+			} else {
+				if !slices.Contains(protocol.ApprovalPolicies, trimmedEntry) {
+					return nil, errors.New("approval-policy must be manual|auto|bypass or harness=manual|auto|bypass")
+				}
+				for _, harnessID := range harness.ApprovalPolicyHarnessIDs {
+					policies[harnessID] = trimmedEntry
+				}
 			}
 		}
 	}

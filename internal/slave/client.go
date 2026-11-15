@@ -297,10 +297,11 @@ func (client *Client) runConnection(operationContext context.Context) (bool, err
 	}
 
 	admitted := false
+	heartbeatStarted := false
 	heartbeatDone := make(chan struct{})
 	defer func() {
 		cancelConnection()
-		if admitted {
+		if heartbeatStarted {
 			<-heartbeatDone
 		}
 	}()
@@ -335,6 +336,7 @@ func (client *Client) runConnection(operationContext context.Context) (bool, err
 					activitylog.String("endpoint", client.endpoint),
 					activitylog.Int("concurrency", client.node.Concurrency),
 				)
+				heartbeatStarted = true
 				go func() {
 					defer close(heartbeatDone)
 					ticker := time.NewTicker(heartbeatInterval)
