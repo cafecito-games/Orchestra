@@ -240,9 +240,50 @@ func TestScopedAccessGrantsAuthorizationMatrixAndMonotonicNarrowing(t *testing.T
 
 	// 6. Forbidden: cluster admin & unauthorized delegation/claim operations.
 	assert.Equal(t, http.StatusForbidden, doReq(http.MethodGet, "/api/nodes", "", grantRes.Token).Code)
+	assert.Equal(t, http.StatusForbidden, doReq(http.MethodPost, "/api/nodes/update", `{}`, grantRes.Token).Code)
 	assert.Equal(t, http.StatusForbidden, doReq(http.MethodGet, "/api/status", "", grantRes.Token).Code)
+	assert.Equal(t, http.StatusForbidden, doReq(http.MethodGet, "/api/approvals", "", grantRes.Token).Code)
+	assert.Equal(t, http.StatusForbidden, doReq(http.MethodPost, "/api/approvals/appr_1/resolve", `{"status":"approved"}`, grantRes.Token).Code)
+	assert.Equal(t, http.StatusForbidden, doReq(http.MethodGet, "/api/workspace-leases", "", grantRes.Token).Code)
+	assert.Equal(t, http.StatusForbidden, doReq(http.MethodPost, "/api/runs/run_1/cancel", `{}`, grantRes.Token).Code)
+	assert.Equal(t, http.StatusForbidden, doReq(http.MethodPost, "/api/cancel/task_1", `{}`, grantRes.Token).Code)
+	assert.Equal(t, http.StatusForbidden, doReq(http.MethodPost, "/api/tasks/task_1/cancel", `{}`, grantRes.Token).Code)
+	assert.Equal(t, http.StatusForbidden, doReq(http.MethodPost, "/api/mail/rename", `{"address":"a@b","name":"c"}`, grantRes.Token).Code)
+	assert.Equal(t, http.StatusForbidden, doReq(http.MethodGet, "/api/mail/traffic", "", grantRes.Token).Code)
 	assert.Equal(t, http.StatusForbidden, doReq(http.MethodPost, "/api/threads/"+threadAllowed.ID+"/tasks", `{"idempotencyKey":"t1","tasks":[{"title":"X","instructions":"Y"}]}`, grantRes.Token).Code)
 	assert.Equal(t, http.StatusForbidden, doReq(http.MethodPost, "/api/threads/"+threadAllowed.ID+"/tasks/claim", `{}`, grantRes.Token).Code)
+
+	// Cross-thread & operation-restricted MCP tool calls are rejected with forbidden.
+	scopedCaller := CallerIdentity{
+		Kind:      "orchestrator-client",
+		ClientID:  "scoped-bot",
+		SessionID: "scoped-sess",
+		Scope: &protocol.AccessGrantScope{
+			ThreadIDs:    []string{threadAllowed.ID},
+			RoomChannels: []string{"review-*"},
+			Operations:   []string{protocol.AccessOpRead},
+		},
+	}
+	var opErr *OperationError
+	_, err = service.ExecuteOrchestratorTool(t.Context(), scopedCaller, "send_task_message", json.RawMessage(`{"threadId":"`+threadOther.ID+`","toTaskId":"task_1","idempotencyKey":"m1","kind":"guidance","body":"hi"}`))
+	require.ErrorAs(t, err, &opErr)
+	assert.Equal(t, "forbidden", opErr.Code)
+
+	_, err = service.ExecuteOrchestratorTool(t.Context(), scopedCaller, "post_artifact", json.RawMessage(`{"threadId":"`+threadOther.ID+`","name":"x.txt","sizeBytes":1,"sha256":"`+protocol.DigestAccessGrantToken("a")+`"}`))
+	require.ErrorAs(t, err, &opErr)
+	assert.Equal(t, "forbidden", opErr.Code)
+
+	_, err = service.ExecuteOrchestratorTool(t.Context(), scopedCaller, "wait_for_activity", json.RawMessage(`{"threadId":"`+threadOther.ID+`","timeoutMilliseconds":50}`))
+	require.ErrorAs(t, err, &opErr)
+	assert.Equal(t, "forbidden", opErr.Code)
+
+	_, err = service.ExecuteOrchestratorTool(t.Context(), scopedCaller, "send_mail", json.RawMessage(`{"idempotencyKey":"sm1","to":"a@b","body":"hi"}`))
+	require.ErrorAs(t, err, &opErr)
+	assert.Equal(t, "forbidden", opErr.Code)
+
+	_, err = service.ExecuteOrchestratorTool(t.Context(), scopedCaller, "set_mail_identity", json.RawMessage(`{"name":"evil"}`))
+	require.ErrorAs(t, err, &opErr)
+	assert.Equal(t, "forbidden", opErr.Code)
 
 	// 7. Monotonic narrowing: scoped grant CANNOT mint a broader grant (e.g. adding "delegate" or threadOther).
 	rec = doReq(http.MethodPost, "/api/tokens", `{"scope":{"threadIds":["`+threadAllowed.ID+`"],"roomChannels":["review-*"],"operations":["read","delegate"]}}`, grantRes.Token)
@@ -257,9 +298,11 @@ func TestScopedAccessGrantsAuthorizationMatrixAndMonotonicNarrowing(t *testing.T
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &subGrant))
 	assert.Equal(t, http.StatusOK, doReq(http.MethodGet, "/api/threads/"+threadAllowed.ID+"/room", "", subGrant.Token).Code)
 	assert.Equal(t, http.StatusForbidden, doReq(http.MethodPost, "/api/threads/"+threadAllowed.ID+"/room/messages", `{"idempotencyKey":"p3","channel":"review-1","kind":"finding","body":"No post"}`, subGrant.Token).Code)
+	assert.Equal(t, http.StatusForbidden, doReq(http.MethodPost, "/api/mail/messages", `{"idempotencyKey":"m2","to":"a@b","body":"No mail post"}`, subGrant.Token).Code)
 
-	// 9. Revoking a grant immediately rejects subsequent requests with 401.
+	// 9. Revoking a parent grant immediately rejects both the parent AND its derived child sub-grant with 401.
 	_, err = service.RevokeAccessGrant(adminCaller, grantRes.Grant.ID)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusUnauthorized, doReq(http.MethodGet, "/api/threads/"+threadAllowed.ID+"/room", "", grantRes.Token).Code)
+	assert.Equal(t, http.StatusUnauthorized, doReq(http.MethodGet, "/api/threads/"+threadAllowed.ID+"/room", "", subGrant.Token).Code)
 }

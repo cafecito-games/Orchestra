@@ -150,13 +150,27 @@ func (service *Service) lookupAccessGrantByToken(rawToken string) (protocol.Acce
 	_ = service.store.Read(func(state *store.State) error {
 		for _, record := range state.AccessGrants {
 			if subtle.ConstantTimeCompare([]byte(record.TokenDigest), []byte(providedDigest)) == 1 {
-				if record.RevokedAt != "" {
-					return nil
-				}
-				if record.ExpiresAt != "" {
-					if expiresAt, valid := protocol.ParseTimestamp(record.ExpiresAt); valid && !now.Before(expiresAt) {
+				// Walk parent grant chain so revoking or expiring an ancestor invalidates all derived sub-grants.
+				visited := map[string]bool{}
+				current := record
+				for {
+					if current.RevokedAt != "" {
 						return nil
 					}
+					if current.ExpiresAt != "" {
+						if expiresAt, valid := protocol.ParseTimestamp(current.ExpiresAt); valid && !now.Before(expiresAt) {
+							return nil
+						}
+					}
+					if current.ParentGrantID == "" || visited[current.ID] {
+						break
+					}
+					visited[current.ID] = true
+					parent, exists := state.AccessGrants[current.ParentGrantID]
+					if !exists {
+						return nil
+					}
+					current = parent
 				}
 				matched = record
 				found = true

@@ -44,6 +44,9 @@ func (service *Service) WaitForActivity(
 	caller CallerIdentity,
 	input WaitForActivityInput,
 ) (WaitForActivityResult, error) {
+	if err := requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+		return WaitForActivityResult{}, err
+	}
 	if input.AfterMailSequence < 0 {
 		return WaitForActivityResult{}, invalidRequest("afterMailSequence must be non-negative")
 	}
@@ -140,6 +143,9 @@ func (service *Service) WaitForActivity(
 		if !protocol.IsIdentifier(threadID) {
 			return invalidRequest("threadId is malformed")
 		}
+		if err := requireScopeThread(caller, threadID); err != nil {
+			return err
+		}
 		if _, exists := state.Threads[threadID]; !exists {
 			return notFound(fmt.Sprintf("thread %s does not exist", threadID))
 		}
@@ -203,6 +209,9 @@ func (service *Service) WaitForActivity(
 						continue
 					}
 					if caller.Kind == "run" && !protocol.InstanceSubscribesToRoomChannel(callerRoomChannels, entry.Channel) {
+						continue
+					}
+					if !protocol.ScopeAllowsRoomChannel(caller.Scope, entry.Channel) {
 						continue
 					}
 					if !protocol.MatchesLabelFilters(entry.Labels, labelFilters) {

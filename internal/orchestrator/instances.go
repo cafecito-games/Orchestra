@@ -502,6 +502,9 @@ func (service *Service) GetInstance(caller CallerIdentity, input GetInstanceInpu
 		if caller.Kind == "run" && caller.ThreadID != "" && instance.ThreadID != caller.ThreadID {
 			return forbiddenError("worker run cannot inspect instances in another thread")
 		}
+		if err := requireScopeThread(caller, instance.ThreadID); err != nil {
+			return err
+		}
 		snapshot.Instance = instance
 		if allocation, found := state.LatestAllocationForInstance(instance.ID); found {
 			allocationCopy := allocation
@@ -562,6 +565,9 @@ func (service *Service) ReconfigureInstance(
 			if caller.ThreadID != "" && instance.ThreadID != caller.ThreadID {
 				return forbiddenError("worker run cannot reconfigure instances in another thread")
 			}
+		}
+		if err := requireScopeThread(caller, instance.ThreadID); err != nil {
+			return err
 		}
 
 		if existingReceipt, found := state.InstanceReceipts[receiptKey]; found {
@@ -734,6 +740,9 @@ func (service *Service) RenewInstance(
 				return forbiddenError("worker run cannot renew instances in another thread")
 			}
 		}
+		if err := requireScopeThread(caller, instance.ThreadID); err != nil {
+			return err
+		}
 		if existingReceipt, found := state.InstanceReceipts[receiptKey]; found {
 			if existingReceipt.Digest != digest {
 				return conflictError("idempotency_conflict", "idempotencyKey was already used for a different renew_instance request")
@@ -843,6 +852,9 @@ func (service *Service) ReleaseInstance(
 			if caller.ThreadID != "" && instance.ThreadID != caller.ThreadID {
 				return forbiddenError("worker run cannot release instances in another thread")
 			}
+		}
+		if err := requireScopeThread(caller, instance.ThreadID); err != nil {
+			return err
 		}
 
 		if existingReceipt, found := state.InstanceReceipts[receiptKey]; found {

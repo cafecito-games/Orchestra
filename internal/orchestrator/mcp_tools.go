@@ -941,12 +941,18 @@ func (service *Service) ExecuteOrchestratorTool(
 		}
 		responseValue = map[string]any{"approval": approval}
 	case "get_mail_identity":
+		if err = requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+			return nil, err
+		}
 		mailbox, identityErr := service.GetMailIdentity(caller)
 		if identityErr != nil {
 			return nil, identityErr
 		}
 		responseValue = map[string]any{"mailbox": mailbox}
 	case "set_mail_identity":
+		if err = requireScopeOperation(caller, protocol.AccessOpPost); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[SetMailIdentityInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
@@ -957,24 +963,36 @@ func (service *Service) ExecuteOrchestratorTool(
 		}
 		responseValue = map[string]any{"mailbox": mailbox}
 	case "list_mailboxes":
+		if err = requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[ListMailboxesInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.ListMailboxes(input)
 	case "send_mail":
+		if err = requireScopeOperation(caller, protocol.AccessOpPost); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[SendMailInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.SendMail(caller, input)
 	case "read_mail":
+		if err = requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[ReadMailInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.ReadMail(caller, input)
 	case "wait_for_mail":
+		if err = requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[WaitForMailInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr

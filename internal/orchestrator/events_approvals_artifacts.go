@@ -1294,8 +1294,16 @@ func (service *Service) PostArtifact(
 			taskID = caller.TaskID
 		}
 	}
+	if err := requireScopeOperation(caller, protocol.AccessOpPost); err != nil {
+		return PostArtifactResult{}, err
+	}
 	if threadID != "" && !protocol.IsIdentifier(threadID) {
 		return PostArtifactResult{}, invalidRequest("threadId must be a valid identifier")
+	}
+	if threadID != "" {
+		if err := requireScopeThread(caller, threadID); err != nil {
+			return PostArtifactResult{}, err
+		}
 	}
 	name := strings.TrimSpace(input.Name)
 	if name == "" && input.RelativePath != "" {
