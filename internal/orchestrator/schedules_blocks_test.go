@@ -253,4 +253,40 @@ func TestDurableScheduledMessagesFakeClockRestartAndCancellation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, protocol.ScheduleStatusCancelled, cancelled.Status)
 	assert.NotEqual(t, recurring.Schedule.ID, cancelled.ID)
+
+	// Scoped grant (read-only OR post-scoped) cannot cancel an operator-created schedule.
+	opSched, err := restarted.ScheduleMessage(operator, ScheduleMessageInput{
+		IdempotencyKey: "op-sched-1",
+		TargetKind:     protocol.ScheduleTargetKindMail,
+		To:             betaBox.Address,
+		Body:           "Operator schedule",
+		InSeconds:      300,
+	})
+	require.NoError(t, err)
+
+	readOnlyGrantCaller := CallerIdentity{
+		Kind:       "operator",
+		OperatorID: "cli",
+		GrantID:    "grant_readonly",
+		Scope: &protocol.AccessGrantScope{
+			ThreadIDs:  []string{thread.ID},
+			Operations: []string{protocol.AccessOpRead},
+		},
+	}
+	_, err = restarted.CancelSchedule(readOnlyGrantCaller, CancelScheduleInput{ScheduleID: opSched.Schedule.ID})
+	require.ErrorAs(t, err, &opErr)
+	assert.Equal(t, "forbidden", opErr.Code)
+
+	postGrantCaller := CallerIdentity{
+		Kind:       "operator",
+		OperatorID: "cli",
+		GrantID:    "grant_poster",
+		Scope: &protocol.AccessGrantScope{
+			ThreadIDs:  []string{thread.ID},
+			Operations: []string{protocol.AccessOpRead, protocol.AccessOpPost},
+		},
+	}
+	_, err = restarted.CancelSchedule(postGrantCaller, CancelScheduleInput{ScheduleID: opSched.Schedule.ID})
+	require.ErrorAs(t, err, &opErr)
+	assert.Equal(t, "forbidden", opErr.Code)
 }

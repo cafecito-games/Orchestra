@@ -54,6 +54,16 @@ func invalidBlockError(err error) *OperationError {
 	return newError("invalid_block", http.StatusBadRequest, err.Error())
 }
 
+func scheduleCreatorKey(caller CallerIdentity) string {
+	if caller.GrantID != "" {
+		return "grant:" + caller.GrantID
+	}
+	if sourceKey := caller.SourceKey(); sourceKey != "" {
+		return sourceKey
+	}
+	return "orchestrator-client:default"
+}
+
 func (service *Service) ScheduleMessage(caller CallerIdentity, input ScheduleMessageInput) (ScheduleMessageResult, error) {
 	if err := requireScopeOperation(caller, protocol.AccessOpPost); err != nil {
 		return ScheduleMessageResult{}, err
@@ -208,10 +218,7 @@ func (service *Service) ScheduleMessage(caller CallerIdentity, input ScheduleMes
 	wake := input.Wake == nil || *input.Wake
 	cancelOnClose := targetKind == protocol.ScheduleTargetKindRoom && (input.CancelOnThreadClose == nil || *input.CancelOnThreadClose)
 
-	sourceKey := caller.SourceKey()
-	if sourceKey == "" {
-		sourceKey = "orchestrator-client:default"
-	}
+	sourceKey := scheduleCreatorKey(caller)
 	digest := canonicalDigest(struct {
 		TargetKind          string                     `json:"targetKind"`
 		ThreadID            string                     `json:"threadId,omitempty"`
@@ -393,10 +400,14 @@ func (service *Service) ListSchedules(caller CallerIdentity, input ListSchedules
 }
 
 func (service *Service) CancelSchedule(caller CallerIdentity, input CancelScheduleInput) (protocol.ScheduledMessage, error) {
+	if err := requireScopeOperation(caller, protocol.AccessOpPost); err != nil {
+		return protocol.ScheduledMessage{}, err
+	}
 	scheduleID := strings.TrimSpace(input.ScheduleID)
 	if !protocol.IsIdentifier(scheduleID) {
 		return protocol.ScheduledMessage{}, invalidRequest("scheduleId is required")
 	}
+	callerKey := scheduleCreatorKey(caller)
 	var cancelled protocol.ScheduledMessage
 	_, err := service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
 		schedule, exists := state.Schedules[scheduleID]
@@ -408,9 +419,9 @@ func (service *Service) CancelSchedule(caller CallerIdentity, input CancelSchedu
 				return err
 			}
 		}
-		isFullOperator := caller.Kind == "operator" && caller.Scope == nil
-		isCreator := schedule.SourceKey == caller.SourceKey() ||
-			(caller.ClientID != "" && schedule.CreatorClientID == caller.ClientID)
+		isFullOperator := caller.Kind == "operator" && caller.Scope == nil && caller.GrantID == ""
+		isCreator := schedule.SourceKey == callerKey ||
+			(caller.GrantID == "" && caller.ClientID != "" && schedule.CreatorClientID == caller.ClientID)
 		if !isFullOperator && !isCreator {
 			return forbiddenError("only the schedule creator or an operator may cancel this schedule")
 		}
