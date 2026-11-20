@@ -47,29 +47,30 @@ type AgentMailbox struct {
 }
 
 type MailMessage struct {
-	ID              string   `json:"id"`
-	Sequence        int64    `json:"sequence"`
-	SourceKey       string   `json:"sourceKey"`
-	IdempotencyKey  string   `json:"idempotencyKey"`
-	Digest          string   `json:"digest"`
-	FromMailboxID   string   `json:"fromMailboxId,omitempty"`
-	FromAddress     string   `json:"from"`
-	PrincipalKind   string   `json:"principalKind,omitempty"`
-	PrincipalID     string   `json:"principalId,omitempty"`
-	VerifiedNode    string   `json:"verifiedNode,omitempty"`
-	ToMailboxID     string   `json:"toMailboxId"`
-	ToAddress       string   `json:"to"`
-	ReplyToID       string   `json:"replyToId,omitempty"`
-	Subject         string   `json:"subject,omitempty"`
-	Body            string   `json:"body"`
-	ArtifactIDs     []string `json:"artifactIds,omitempty"`
-	WakeRequested   bool     `json:"wakeRequested"`
-	WakeDispatched  bool     `json:"wakeDispatched,omitempty"`
-	WakeTaskID      string   `json:"wakeTaskId,omitempty"`
-	Read            bool     `json:"read"`
-	ReadAt          string   `json:"readAt,omitempty"`
-	DeliveredPushAt string   `json:"deliveredPushAt,omitempty"`
-	CreatedAt       string   `json:"createdAt"`
+	ID              string            `json:"id"`
+	Sequence        int64             `json:"sequence"`
+	SourceKey       string            `json:"sourceKey"`
+	IdempotencyKey  string            `json:"idempotencyKey"`
+	Digest          string            `json:"digest"`
+	FromMailboxID   string            `json:"fromMailboxId,omitempty"`
+	FromAddress     string            `json:"from"`
+	PrincipalKind   string            `json:"principalKind,omitempty"`
+	PrincipalID     string            `json:"principalId,omitempty"`
+	VerifiedNode    string            `json:"verifiedNode,omitempty"`
+	ToMailboxID     string            `json:"toMailboxId"`
+	ToAddress       string            `json:"to"`
+	ReplyToID       string            `json:"replyToId,omitempty"`
+	Subject         string            `json:"subject,omitempty"`
+	Body            string            `json:"body"`
+	Blocks          []StructuredBlock `json:"blocks,omitempty"`
+	ArtifactIDs     []string          `json:"artifactIds,omitempty"`
+	WakeRequested   bool              `json:"wakeRequested"`
+	WakeDispatched  bool              `json:"wakeDispatched,omitempty"`
+	WakeTaskID      string            `json:"wakeTaskId,omitempty"`
+	Read            bool              `json:"read"`
+	ReadAt          string            `json:"readAt,omitempty"`
+	DeliveredPushAt string            `json:"deliveredPushAt,omitempty"`
+	CreatedAt       string            `json:"createdAt"`
 }
 
 type MailReceipt struct {

@@ -331,6 +331,7 @@ func (service *Service) runSweepLoop(operationContext context.Context) {
 			return
 		case <-ticker.C:
 			service.expireTaskClaims()
+			service.processDueSchedules()
 			if service.mode == ServiceModeOrchestrator {
 				service.expireIdleInstances()
 				service.expirePendingApprovals()
@@ -376,6 +377,8 @@ func (service *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/tasks/", service.requireBearer(service.handleAPITaskSubroutes))
 	mux.HandleFunc("/api/tokens", service.requireBearer(service.handleAPITokens))
 	mux.HandleFunc("/api/tokens/", service.requireBearer(service.handleAPITokenSubroutes))
+	mux.HandleFunc("/api/schedules", service.requireBearer(service.handleAPISchedules))
+	mux.HandleFunc("/api/schedules/", service.requireBearer(service.handleAPIScheduleSubroutes))
 	if service.mode == ServiceModeOrchestrator {
 		mux.HandleFunc("/control-agent", service.handleControlAgentUpgrade)
 		mux.HandleFunc("/api/status", service.requireClusterAdmin(service.handleAPIStatus))
@@ -871,6 +874,59 @@ func (service *Service) handleAPITokenSubroutes(writer http.ResponseWriter, requ
 			return
 		}
 		writeJSONResponse(writer, http.StatusOK, map[string]any{"grant": revoked})
+		return
+	}
+	writer.WriteHeader(http.StatusNotFound)
+}
+
+func (service *Service) handleAPISchedules(writer http.ResponseWriter, request *http.Request) {
+	caller := operatorCallerFromRequest(request)
+	switch request.Method {
+	case http.MethodGet:
+		query := request.URL.Query()
+		schedules, err := service.ListSchedules(caller, ListSchedulesInput{
+			ThreadID:   strings.TrimSpace(query.Get("threadId")),
+			TargetKind: strings.TrimSpace(query.Get("targetKind")),
+			Status:     strings.TrimSpace(query.Get("status")),
+		})
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, map[string]any{"schedules": schedules})
+	case http.MethodPost:
+		var input ScheduleMessageInput
+		if err := json.NewDecoder(io.LimitReader(request.Body, 256*1024)).Decode(&input); err != nil {
+			writeOperationError(writer, invalidRequest("malformed JSON body"))
+			return
+		}
+		result, err := service.ScheduleMessage(caller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		statusCode := http.StatusCreated
+		if result.Replayed {
+			statusCode = http.StatusOK
+		}
+		writeJSONResponse(writer, statusCode, result)
+	default:
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (service *Service) handleAPIScheduleSubroutes(writer http.ResponseWriter, request *http.Request) {
+	remainder := strings.TrimPrefix(request.URL.Path, "/api/schedules/")
+	remainder = strings.TrimSuffix(remainder, "/")
+	scheduleID, action, hasAction := strings.Cut(remainder, "/")
+	caller := operatorCallerFromRequest(request)
+	if (!hasAction && request.Method == http.MethodDelete) || (hasAction && action == "cancel" && request.Method == http.MethodPost) {
+		cancelled, err := service.CancelSchedule(caller, CancelScheduleInput{ScheduleID: scheduleID})
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, map[string]any{"schedule": cancelled})
 		return
 	}
 	writer.WriteHeader(http.StatusNotFound)

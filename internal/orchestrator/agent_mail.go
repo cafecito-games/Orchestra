@@ -35,14 +35,15 @@ type ListMailboxesResult struct {
 }
 
 type SendMailInput struct {
-	IdempotencyKey string   `json:"idempotencyKey"`
-	From           string   `json:"from,omitempty"`
-	To             string   `json:"to,omitempty"`
-	ReplyToID      string   `json:"replyToId,omitempty"`
-	Subject        string   `json:"subject,omitempty"`
-	Body           string   `json:"body"`
-	ArtifactIDs    []string `json:"artifactIds,omitempty"`
-	Wake           *bool    `json:"wake,omitempty"`
+	IdempotencyKey string                     `json:"idempotencyKey"`
+	From           string                     `json:"from,omitempty"`
+	To             string                     `json:"to,omitempty"`
+	ReplyToID      string                     `json:"replyToId,omitempty"`
+	Subject        string                     `json:"subject,omitempty"`
+	Body           string                     `json:"body"`
+	Blocks         []protocol.StructuredBlock `json:"blocks,omitempty"`
+	ArtifactIDs    []string                   `json:"artifactIds,omitempty"`
+	Wake           *bool                      `json:"wake,omitempty"`
 }
 
 type SendMailResult struct {
@@ -427,6 +428,10 @@ func (service *Service) SendMail(
 		sequence := nextMailSequenceForMailbox(state, recipientMailbox.ID)
 		redactedSubject := service.redactor.Redact(subject)
 		redactedBody := service.redactor.Redact(body)
+		normalizedBlocks, blockErr := protocol.NormalizeStructuredBlocks(input.Blocks, service.redactor)
+		if blockErr != nil {
+			return invalidBlockError(blockErr)
+		}
 		replyToID := ""
 		if replyTarget != nil {
 			replyToID = replyTarget.ID
@@ -448,6 +453,7 @@ func (service *Service) SendMail(
 			ReplyToID:      replyToID,
 			Subject:        redactedSubject,
 			Body:           redactedBody,
+			Blocks:         normalizedBlocks,
 			ArtifactIDs:    slices.Clone(input.ArtifactIDs),
 			WakeRequested:  wakeRequested,
 			Read:           false,

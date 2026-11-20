@@ -35,22 +35,23 @@ type ReadRoomResult struct {
 }
 
 type PostRoomMessageInput struct {
-	ThreadID                string            `json:"threadId,omitempty"`
-	IdempotencyKey          string            `json:"idempotencyKey"`
-	Channel                 string            `json:"channel,omitempty"`
-	Kind                    string            `json:"kind"`
-	Topic                   string            `json:"topic,omitempty"`
-	Body                    string            `json:"body"`
-	Labels                  map[string]string `json:"labels,omitempty"`
-	ExpectedHeadSequence    *int64            `json:"expectedHeadSequence,omitempty"`
-	ExpectedChannelSequence *int64            `json:"expectedChannelSequence,omitempty"`
-	Mentions                []string          `json:"mentions,omitempty"`
-	Wake                    *bool             `json:"wake,omitempty"`
-	ReplyToSequence         *int64            `json:"replyToSequence,omitempty"`
-	SupersedesSequence      *int64            `json:"supersedesSequence,omitempty"`
-	ArtifactIDs             []string          `json:"artifactIds,omitempty"`
-	Nudge                   bool              `json:"nudge,omitempty"`
-	NudgeTaskIDs            []string          `json:"nudgeTaskIds,omitempty"`
+	ThreadID                string                     `json:"threadId,omitempty"`
+	IdempotencyKey          string                     `json:"idempotencyKey"`
+	Channel                 string                     `json:"channel,omitempty"`
+	Kind                    string                     `json:"kind"`
+	Topic                   string                     `json:"topic,omitempty"`
+	Body                    string                     `json:"body"`
+	Blocks                  []protocol.StructuredBlock `json:"blocks,omitempty"`
+	Labels                  map[string]string          `json:"labels,omitempty"`
+	ExpectedHeadSequence    *int64                     `json:"expectedHeadSequence,omitempty"`
+	ExpectedChannelSequence *int64                     `json:"expectedChannelSequence,omitempty"`
+	Mentions                []string                   `json:"mentions,omitempty"`
+	Wake                    *bool                      `json:"wake,omitempty"`
+	ReplyToSequence         *int64                     `json:"replyToSequence,omitempty"`
+	SupersedesSequence      *int64                     `json:"supersedesSequence,omitempty"`
+	ArtifactIDs             []string                   `json:"artifactIds,omitempty"`
+	Nudge                   bool                       `json:"nudge,omitempty"`
+	NudgeTaskIDs            []string                   `json:"nudgeTaskIds,omitempty"`
 }
 
 type PostRoomMessageResult struct {
@@ -378,6 +379,10 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 	if labelErr != nil {
 		return PostRoomMessageResult{}, labelValidationError(labelErr)
 	}
+	normalizedBlocks, blockErr := protocol.NormalizeStructuredBlocks(input.Blocks, service.redactor)
+	if blockErr != nil {
+		return PostRoomMessageResult{}, invalidBlockError(blockErr)
+	}
 	if input.ExpectedHeadSequence != nil && *input.ExpectedHeadSequence < 0 {
 		return PostRoomMessageResult{}, invalidRequest("expectedHeadSequence must be greater than or equal to 0")
 	}
@@ -409,6 +414,7 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 		Kind:                    kind,
 		Topic:                   topic,
 		Body:                    body,
+		Blocks:                  normalizedBlocks,
 		Labels:                  protocol.CloneLabels(normalizedLabels),
 		ExpectedHeadSequence:    input.ExpectedHeadSequence,
 		ExpectedChannelSequence: input.ExpectedChannelSequence,
@@ -560,6 +566,7 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 			Channel:            normalizedChannel,
 			Topic:              redactedTopic,
 			Body:               redactedBody,
+			Blocks:             normalizedBlocks,
 			Labels:             protocol.CloneLabels(normalizedLabels),
 			Mentions:           slices.Clone(parsedMentions.Tokens),
 			ReplyToSequence:    replyCopy,

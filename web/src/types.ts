@@ -298,6 +298,12 @@ export interface RoomAuthor {
   verifiedNode?: string;
 }
 
+export interface StructuredBlock {
+  schema: string;
+  version: number;
+  data: Record<string, unknown>;
+}
+
 export interface RoomMessage {
   seq: number;
   id: string;
@@ -308,6 +314,7 @@ export interface RoomMessage {
   channel?: string;
   topic?: string;
   body: string;
+  blocks?: StructuredBlock[];
   labels?: Record<string, string>;
   mentions?: string[];
   replyToSequence?: number;
