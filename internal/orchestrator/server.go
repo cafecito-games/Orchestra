@@ -369,26 +369,28 @@ func (service *Service) Handler() http.Handler {
 	mux.Handle("/mcp", service.requireBearerHandler(service.mcpHandler))
 	mux.HandleFunc("/api/mail/agents", service.requireBearer(service.handleAPIMailAgents))
 	mux.HandleFunc("/api/mail/messages", service.requireBearer(service.handleAPIMailMessages))
-	mux.HandleFunc("/api/mail/rename", service.requireBearer(service.handleAPIMailRename))
-	mux.HandleFunc("/api/mail/traffic", service.requireBearer(service.handleAPIMailTraffic))
+	mux.HandleFunc("/api/mail/rename", service.requireClusterAdmin(service.handleAPIMailRename))
+	mux.HandleFunc("/api/mail/traffic", service.requireClusterAdmin(service.handleAPIMailTraffic))
 	mux.HandleFunc("/api/threads", service.requireBearer(service.handleAPIThreads))
 	mux.HandleFunc("/api/threads/", service.requireBearer(service.handleAPIThreadSubroutes))
 	mux.HandleFunc("/api/tasks/", service.requireBearer(service.handleAPITaskSubroutes))
+	mux.HandleFunc("/api/tokens", service.requireBearer(service.handleAPITokens))
+	mux.HandleFunc("/api/tokens/", service.requireBearer(service.handleAPITokenSubroutes))
 	if service.mode == ServiceModeOrchestrator {
 		mux.HandleFunc("/control-agent", service.handleControlAgentUpgrade)
-		mux.HandleFunc("/api/status", service.requireBearer(service.handleAPIStatus))
-		mux.HandleFunc("/api/nodes", service.requireBearer(service.handleAPINodes))
-		mux.HandleFunc("/api/nodes/repositories/refresh", service.requireBearer(service.handleAPINodesRefresh))
-		mux.HandleFunc("/api/nodes/repositories/clone", service.requireBearer(service.handleAPINodesClone))
-		mux.HandleFunc("/api/nodes/update", service.requireBearer(service.handleAPINodesUpdate))
-		mux.HandleFunc("/api/updates/bundles/", service.requireBearer(service.handleAPIUpdateBundle))
-		mux.HandleFunc("/api/runs/", service.requireBearer(service.handleAPIRunSubroutes))
-		mux.HandleFunc("/api/cancel/", service.requireBearer(service.handleAPICancelTarget))
-		mux.HandleFunc("/api/approvals", service.requireBearer(service.handleAPIApprovals))
-		mux.HandleFunc("/api/approvals/", service.requireBearer(service.handleAPIApprovalSubroutes))
+		mux.HandleFunc("/api/status", service.requireClusterAdmin(service.handleAPIStatus))
+		mux.HandleFunc("/api/nodes", service.requireClusterAdmin(service.handleAPINodes))
+		mux.HandleFunc("/api/nodes/repositories/refresh", service.requireClusterAdmin(service.handleAPINodesRefresh))
+		mux.HandleFunc("/api/nodes/repositories/clone", service.requireClusterAdmin(service.handleAPINodesClone))
+		mux.HandleFunc("/api/nodes/update", service.requireClusterAdmin(service.handleAPINodesUpdate))
+		mux.HandleFunc("/api/updates/bundles/", service.requireClusterAdmin(service.handleAPIUpdateBundle))
+		mux.HandleFunc("/api/runs/", service.requireClusterAdmin(service.handleAPIRunSubroutes))
+		mux.HandleFunc("/api/cancel/", service.requireClusterAdmin(service.handleAPICancelTarget))
+		mux.HandleFunc("/api/approvals", service.requireClusterAdmin(service.handleAPIApprovals))
+		mux.HandleFunc("/api/approvals/", service.requireClusterAdmin(service.handleAPIApprovalSubroutes))
 		mux.HandleFunc("/api/artifacts/", service.handleAPIArtifactSubroutes)
-		mux.HandleFunc("/api/workspace-leases", service.requireBearer(service.handleAPIWorkspaceLeases))
-		mux.HandleFunc("/api/workspace-leases/", service.requireBearer(service.handleAPIWorkspaceLeaseSubroutes))
+		mux.HandleFunc("/api/workspace-leases", service.requireClusterAdmin(service.handleAPIWorkspaceLeases))
+		mux.HandleFunc("/api/workspace-leases/", service.requireClusterAdmin(service.handleAPIWorkspaceLeaseSubroutes))
 	}
 	// The operator console is a static shell with no cluster data; it falls back
 	// to "/" so it only serves paths not claimed by the API or WebSocket routes.
@@ -409,16 +411,53 @@ func (service *Service) matchesBearerToken(request *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(service.token)) == 1
 }
 
-func (service *Service) authorizeRequest(request *http.Request) (bool, string) {
+func (service *Service) authorizeRequest(request *http.Request) (AuthContext, bool, string) {
+	extractBearer := func(req *http.Request) string {
+		if req == nil {
+			return ""
+		}
+		provided, ok := strings.CutPrefix(req.Header.Get("Authorization"), "Bearer ")
+		if !ok {
+			return ""
+		}
+		return provided
+	}
+
+	finalize := func(auth AuthContext) (AuthContext, bool, string) {
+		narrowed, narrowErr := service.applyHeaderScopeNarrowing(request, auth)
+		if narrowErr != nil {
+			return AuthContext{}, false, narrowErr.Error()
+		}
+		return narrowed, true, ""
+	}
+
 	if service.tailscaleVerifier != nil {
 		if tailscaleauth.IsBrowserRequest(request) {
-			return false, "browser-origin requests are not permitted in tailscale auth mode"
+			return AuthContext{}, false, "browser-origin requests are not permitted in tailscale auth mode"
 		}
 		if tailscaleauth.IsProxiedOrFunnelRequest(request) {
-			return false, "proxied or Tailscale Funnel requests are not permitted in tailscale auth mode"
+			return AuthContext{}, false, "proxied or Tailscale Funnel requests are not permitted in tailscale auth mode"
 		}
 		if service.matchesBearerToken(request) {
-			return true, ""
+			return finalize(AuthContext{
+				PrincipalKind: protocol.PrincipalKindToken,
+				PrincipalID:   "master-token",
+				FullAuthority: true,
+			})
+		}
+		if provided := extractBearer(request); provided != "" {
+			if grant, found := service.lookupAccessGrantByToken(provided); found {
+				scopeCopy := grant.Scope
+				return finalize(AuthContext{
+					PrincipalKind: grant.PrincipalKind,
+					PrincipalID:   grant.PrincipalID,
+					VerifiedNode:  grant.VerifiedNode,
+					GrantID:       grant.ID,
+					Scope:         &scopeCopy,
+					FullAuthority: false,
+				})
+			}
+			return AuthContext{}, false, "invalid bearer or scoped grant token"
 		}
 		peer, err := service.tailscaleVerifier.AuthorizeHTTPRequest(request)
 		if err != nil {
@@ -429,7 +468,7 @@ func (service *Service) authorizeRequest(request *http.Request) (bool, string) {
 				activitylog.String("path", request.URL.Path),
 				activitylog.String("error", err.Error()),
 			)
-			return false, err.Error()
+			return AuthContext{}, false, err.Error()
 		}
 		service.logger.Debug(
 			"auth",
@@ -438,41 +477,75 @@ func (service *Service) authorizeRequest(request *http.Request) (bool, string) {
 			activitylog.String("user", peer.LoginName),
 			activitylog.String("remote", request.RemoteAddr),
 		)
-		return true, ""
+		return finalize(principalFromTailscalePeer(peer))
 	}
-	if service.token == "" {
-		return true, ""
-	}
-	if service.matchesBearerToken(request) {
-		return true, ""
-	}
-	return false, "missing or invalid bearer token"
-}
 
-func (service *Service) isBearerAuthorized(request *http.Request) bool {
-	authorized, _ := service.authorizeRequest(request)
-	return authorized
+	if provided := extractBearer(request); provided != "" {
+		if service.matchesBearerToken(request) {
+			return finalize(AuthContext{
+				PrincipalKind: protocol.PrincipalKindToken,
+				PrincipalID:   "master-token",
+				FullAuthority: true,
+			})
+		}
+		if grant, found := service.lookupAccessGrantByToken(provided); found {
+			scopeCopy := grant.Scope
+			return finalize(AuthContext{
+				PrincipalKind: grant.PrincipalKind,
+				PrincipalID:   grant.PrincipalID,
+				VerifiedNode:  grant.VerifiedNode,
+				GrantID:       grant.ID,
+				Scope:         &scopeCopy,
+				FullAuthority: false,
+			})
+		}
+		return AuthContext{}, false, "missing or invalid bearer token"
+	}
+
+	if service.token == "" {
+		return finalize(AuthContext{
+			PrincipalKind: protocol.PrincipalKindLocal,
+			PrincipalID:   "local",
+			FullAuthority: true,
+		})
+	}
+	return AuthContext{}, false, "missing or invalid bearer token"
 }
 
 func (service *Service) requireBearer(next http.HandlerFunc) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
-		authorized, reason := service.authorizeRequest(request)
+		auth, authorized, reason := service.authorizeRequest(request)
 		if !authorized {
 			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
 			return
 		}
-		next(writer, request)
+		next(writer, request.WithContext(withAuthContext(request.Context(), auth)))
+	}
+}
+
+func (service *Service) requireClusterAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		auth, authorized, reason := service.authorizeRequest(request)
+		if !authorized {
+			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
+			return
+		}
+		if !auth.FullAuthority {
+			writeJSONError(writer, http.StatusForbidden, "forbidden", "scoped access grant cannot access cluster administration endpoints")
+			return
+		}
+		next(writer, request.WithContext(withAuthContext(request.Context(), auth)))
 	}
 }
 
 func (service *Service) requireBearerHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		authorized, reason := service.authorizeRequest(request)
+		auth, authorized, reason := service.authorizeRequest(request)
 		if !authorized {
 			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
 			return
 		}
-		next.ServeHTTP(writer, request)
+		next.ServeHTTP(writer, request.WithContext(withAuthContext(request.Context(), auth)))
 	})
 }
 
@@ -497,8 +570,13 @@ func (service *Service) handleHealth(writer http.ResponseWriter, request *http.R
 }
 
 func (service *Service) handleControlAgentUpgrade(writer http.ResponseWriter, request *http.Request) {
-	if authorized, reason := service.authorizeRequest(request); !authorized {
+	auth, authorized, reason := service.authorizeRequest(request)
+	if !authorized {
 		writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
+		return
+	}
+	if !auth.FullAuthority {
+		writeJSONError(writer, http.StatusForbidden, "forbidden", "scoped access grants cannot enroll slave nodes")
 		return
 	}
 	connection, err := websocket.Accept(writer, request, nil)
@@ -507,11 +585,12 @@ func (service *Service) handleControlAgentUpgrade(writer http.ResponseWriter, re
 	}
 	service.backgroundGroup.Add(1)
 	defer service.backgroundGroup.Done()
-	service.serveSlaveConnection(request.Context(), connection)
+	service.serveSlaveConnection(withAuthContext(request.Context(), auth), connection)
 }
 
 func (service *Service) handleOrchestratorClientUpgrade(writer http.ResponseWriter, request *http.Request) {
-	if authorized, reason := service.authorizeRequest(request); !authorized {
+	auth, authorized, reason := service.authorizeRequest(request)
+	if !authorized {
 		writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
 		return
 	}
@@ -521,7 +600,7 @@ func (service *Service) handleOrchestratorClientUpgrade(writer http.ResponseWrit
 	}
 	service.backgroundGroup.Add(1)
 	defer service.backgroundGroup.Done()
-	service.serveOrchestratorClientConnection(request.Context(), connection)
+	service.serveOrchestratorClientConnection(withAuthContext(request.Context(), auth), connection)
 }
 
 func (service *Service) serveOrchestratorClientConnection(requestContext context.Context, connection *websocket.Conn) {
@@ -627,6 +706,9 @@ func (service *Service) serveOrchestratorClientConnection(requestContext context
 		ClientID:  clientID,
 		SessionID: sessionID,
 	}
+	if auth, ok := authContextFromContext(requestContext); ok {
+		caller = callerWithAuthContext(caller, auth)
+	}
 
 	for {
 		_, payload, readErr := connection.Read(sessionContext)
@@ -721,6 +803,10 @@ func (service *Service) handleAPIStatus(writer http.ResponseWriter, request *htt
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if err := requireClusterAdminAuthority(operatorCallerFromRequest(request), "status"); err != nil {
+		writeOperationError(writer, err)
+		return
+	}
 	status, err := service.GetStatus()
 	if err != nil {
 		writeOperationError(writer, err)
@@ -734,6 +820,10 @@ func (service *Service) handleAPINodes(writer http.ResponseWriter, request *http
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if err := requireClusterAdminAuthority(operatorCallerFromRequest(request), "nodes"); err != nil {
+		writeOperationError(writer, err)
+		return
+	}
 	nodes, err := service.ListNodeDetails()
 	if err != nil {
 		writeOperationError(writer, err)
@@ -742,9 +832,58 @@ func (service *Service) handleAPINodes(writer http.ResponseWriter, request *http
 	writeJSONResponse(writer, http.StatusOK, map[string]any{"nodes": nodes})
 }
 
-func (service *Service) handleAPIThreads(writer http.ResponseWriter, request *http.Request) {
+func (service *Service) handleAPITokens(writer http.ResponseWriter, request *http.Request) {
+	caller := operatorCallerFromRequest(request)
 	switch request.Method {
 	case http.MethodGet:
+		grants, err := service.ListAccessGrants(caller)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, map[string]any{"grants": grants})
+	case http.MethodPost:
+		var input CreateAccessGrantInput
+		if err := json.NewDecoder(io.LimitReader(request.Body, 64*1024)).Decode(&input); err != nil {
+			writeOperationError(writer, invalidRequest("malformed JSON body"))
+			return
+		}
+		result, err := service.CreateAccessGrant(caller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusCreated, result)
+	default:
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (service *Service) handleAPITokenSubroutes(writer http.ResponseWriter, request *http.Request) {
+	remainder := strings.TrimPrefix(request.URL.Path, "/api/tokens/")
+	remainder = strings.TrimSuffix(remainder, "/")
+	grantID, action, hasAction := strings.Cut(remainder, "/")
+	caller := operatorCallerFromRequest(request)
+	if (!hasAction && request.Method == http.MethodDelete) || (hasAction && action == "revoke" && request.Method == http.MethodPost) {
+		revoked, err := service.RevokeAccessGrant(caller, grantID)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, map[string]any{"grant": revoked})
+		return
+	}
+	writer.WriteHeader(http.StatusNotFound)
+}
+
+func (service *Service) handleAPIThreads(writer http.ResponseWriter, request *http.Request) {
+	operatorCaller := operatorCallerFromRequest(request)
+	switch request.Method {
+	case http.MethodGet:
+		if err := requireScopeOperation(operatorCaller, protocol.AccessOpRead); err != nil {
+			writeOperationError(writer, err)
+			return
+		}
 		statusFilter := request.URL.Query().Get("status")
 		limit := 100
 		if rawLimit := request.URL.Query().Get("limit"); rawLimit != "" {
@@ -758,6 +897,15 @@ func (service *Service) handleAPIThreads(writer http.ResponseWriter, request *ht
 			writeOperationError(writer, err)
 			return
 		}
+		if operatorCaller.Scope != nil && len(operatorCaller.Scope.ThreadIDs) > 0 {
+			filtered := make([]protocol.Thread, 0, len(threads))
+			for _, thread := range threads {
+				if protocol.ScopeAllowsThread(operatorCaller.Scope, thread.ID) {
+					filtered = append(filtered, thread)
+				}
+			}
+			threads = filtered
+		}
 		writeJSONResponse(writer, http.StatusOK, map[string]any{"threads": threads})
 	case http.MethodPost:
 		var input CreateThreadInput
@@ -765,7 +913,7 @@ func (service *Service) handleAPIThreads(writer http.ResponseWriter, request *ht
 			writeOperationError(writer, invalidRequest("malformed JSON body"))
 			return
 		}
-		thread, attachment, err := service.CreateThread(CallerIdentity{Kind: "operator", OperatorID: "cli"}, input)
+		thread, attachment, err := service.CreateThread(operatorCaller, input)
 		if err != nil {
 			writeOperationError(writer, err)
 			return
@@ -780,9 +928,18 @@ func (service *Service) handleAPIThreadSubroutes(writer http.ResponseWriter, req
 	remainder := strings.TrimPrefix(request.URL.Path, "/api/threads/")
 	remainder = strings.TrimSuffix(remainder, "/")
 	threadID, subroute, hasSubroute := strings.Cut(remainder, "/")
+	operatorCaller := operatorCallerFromRequest(request)
 	if !hasSubroute {
 		switch request.Method {
 		case http.MethodGet:
+			if err := requireScopeOperation(operatorCaller, protocol.AccessOpRead); err != nil {
+				writeOperationError(writer, err)
+				return
+			}
+			if err := requireScopeThread(operatorCaller, threadID); err != nil {
+				writeOperationError(writer, err)
+				return
+			}
 			detail, err := service.GetThreadDetail(threadID)
 			if err != nil {
 				writeOperationError(writer, err)
@@ -796,7 +953,7 @@ func (service *Service) handleAPIThreadSubroutes(writer http.ResponseWriter, req
 				return
 			}
 			input.ThreadID = threadID
-			updated, err := service.UpdateThread(CallerIdentity{Kind: "operator", OperatorID: "cli"}, input)
+			updated, err := service.UpdateThread(operatorCaller, input)
 			if err != nil {
 				writeOperationError(writer, err)
 				return
@@ -808,7 +965,6 @@ func (service *Service) handleAPIThreadSubroutes(writer http.ResponseWriter, req
 		return
 	}
 
-	operatorCaller := CallerIdentity{Kind: "operator", OperatorID: "cli"}
 	switch subroute {
 	case "room":
 		if request.Method != http.MethodGet {
@@ -1043,7 +1199,7 @@ func (service *Service) handleAPIRunSubroutes(writer http.ResponseWriter, reques
 func (service *Service) handleAPITaskSubroutes(writer http.ResponseWriter, request *http.Request) {
 	remainder := strings.TrimPrefix(request.URL.Path, "/api/tasks/")
 	remainder = strings.TrimSuffix(remainder, "/")
-	operatorCaller := CallerIdentity{Kind: "operator", OperatorID: "cli"}
+	operatorCaller := operatorCallerFromRequest(request)
 	if remainder == "claim" {
 		if request.Method != http.MethodPost {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
@@ -1160,6 +1316,27 @@ func (service *Service) handleAPITaskSubroutes(writer http.ResponseWriter, reque
 		if request.Method != http.MethodPost {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
+		}
+		if err := requireScopeOperation(operatorCaller, protocol.AccessOpDelegate); err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		if operatorCaller.Scope != nil {
+			var taskThreadID string
+			var foundTask bool
+			_ = service.store.Read(func(state *store.State) error {
+				if task, exists := state.Tasks[taskID]; exists {
+					taskThreadID = task.ThreadID
+					foundTask = true
+				}
+				return nil
+			})
+			if foundTask {
+				if err := requireScopeThread(operatorCaller, taskThreadID); err != nil {
+					writeOperationError(writer, err)
+					return
+				}
+			}
 		}
 		result, err := service.CancelTarget(taskID)
 		if err != nil {
@@ -1302,7 +1479,16 @@ func (service *Service) handleAPIArtifactSubroutes(writer http.ResponseWriter, r
 	}
 	switch request.Method {
 	case http.MethodPut:
-		bearerAuthorized := service.isBearerAuthorized(request)
+		auth, authorized, _ := service.authorizeRequest(request)
+		bearerAuthorized := authorized && auth.FullAuthority
+		if authorized && !auth.FullAuthority && protocol.ScopeAllowsOperation(auth.Scope, protocol.AccessOpPost) {
+			_ = service.store.Read(func(state *store.State) error {
+				if artifact, exists := state.Artifacts[artifactID]; exists && protocol.ScopeAllowsThread(auth.Scope, artifact.ThreadID) {
+					bearerAuthorized = true
+				}
+				return nil
+			})
+		}
 		uploadToken := request.URL.Query().Get("uploadToken")
 		if uploadToken == "" {
 			uploadToken = request.Header.Get("X-Orchestra-Upload-Token")
@@ -1314,9 +1500,29 @@ func (service *Service) handleAPIArtifactSubroutes(writer http.ResponseWriter, r
 		}
 		writeJSONResponse(writer, http.StatusOK, map[string]any{"artifact": updated})
 	case http.MethodGet:
-		if authorized, reason := service.authorizeRequest(request); !authorized {
+		auth, authorized, reason := service.authorizeRequest(request)
+		if !authorized {
 			writeJSONError(writer, http.StatusUnauthorized, "unauthorized", reason)
 			return
+		}
+		if !auth.FullAuthority {
+			if !protocol.ScopeAllowsOperation(auth.Scope, protocol.AccessOpRead) {
+				writeJSONError(writer, http.StatusForbidden, "forbidden", "access grant does not permit reading artifacts")
+				return
+			}
+			var allowed bool
+			var exists bool
+			_ = service.store.Read(func(state *store.State) error {
+				if artifact, ok := state.Artifacts[artifactID]; ok {
+					exists = true
+					allowed = protocol.ScopeAllowsThread(auth.Scope, artifact.ThreadID)
+				}
+				return nil
+			})
+			if exists && !allowed {
+				writeJSONError(writer, http.StatusForbidden, "forbidden", "access grant does not permit reading artifacts from this thread")
+				return
+			}
 		}
 		artifact, file, size, err := service.OpenUploadedArtifact(artifactID)
 		if err != nil {
@@ -1390,6 +1596,10 @@ func (service *Service) handleAPIMailAgents(writer http.ResponseWriter, request 
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	if err := requireScopeOperation(operatorCallerFromRequest(request), protocol.AccessOpRead); err != nil {
+		writeOperationError(writer, err)
+		return
+	}
 	query := request.URL.Query()
 	onlineOnly := query.Get("onlineOnly") == "1" || strings.EqualFold(query.Get("onlineOnly"), "true")
 	includeReleased := query.Get("includeReleased") == "1" || strings.EqualFold(query.Get("includeReleased"), "true")
@@ -1432,9 +1642,13 @@ func (service *Service) handleAPIMailTraffic(writer http.ResponseWriter, request
 }
 
 func (service *Service) handleAPIMailMessages(writer http.ResponseWriter, request *http.Request) {
-	operatorCaller := CallerIdentity{Kind: "operator", OperatorID: "cli"}
+	operatorCaller := operatorCallerFromRequest(request)
 	switch request.Method {
 	case http.MethodGet:
+		if err := requireScopeOperation(operatorCaller, protocol.AccessOpRead); err != nil {
+			writeOperationError(writer, err)
+			return
+		}
 		query := request.URL.Query()
 		unreadOnly := query.Get("unreadOnly") == "1" || strings.EqualFold(query.Get("unreadOnly"), "true")
 		var afterSequence int64
@@ -1477,6 +1691,10 @@ func (service *Service) handleAPIMailMessages(writer http.ResponseWriter, reques
 		}
 		writeJSONResponse(writer, http.StatusOK, result)
 	case http.MethodPost:
+		if err := requireScopeOperation(operatorCaller, protocol.AccessOpPost); err != nil {
+			writeOperationError(writer, err)
+			return
+		}
 		var input SendMailInput
 		if err := json.NewDecoder(io.LimitReader(request.Body, 256*1024)).Decode(&input); err != nil {
 			writeOperationError(writer, invalidRequest("malformed JSON body"))
@@ -2258,6 +2476,12 @@ func (service *Service) WaitRoom(
 	if !protocol.IsIdentifier(threadID) {
 		return WaitRoomResult{}, invalidRequest("threadId is required")
 	}
+	if err := requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+		return WaitRoomResult{}, err
+	}
+	if err := requireScopeThread(caller, threadID); err != nil {
+		return WaitRoomResult{}, err
+	}
 	readChannel, channelErr := protocol.NormalizeRoomReadChannel(input.Channel)
 	if channelErr != nil {
 		return WaitRoomResult{}, invalidRequest(channelErr.Error())
@@ -2347,6 +2571,10 @@ func (service *Service) WaitRoom(
 					continue
 				}
 				if !roomEntryMatchesReadChannel(entry, readChannel, caller.Kind, nil) {
+					throughSequence = entry.Sequence
+					continue
+				}
+				if !protocol.ScopeAllowsRoomChannel(caller.Scope, entry.Channel) {
 					throughSequence = entry.Sequence
 					continue
 				}

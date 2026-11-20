@@ -54,6 +54,9 @@ type MailMessage struct {
 	Digest          string   `json:"digest"`
 	FromMailboxID   string   `json:"fromMailboxId,omitempty"`
 	FromAddress     string   `json:"from"`
+	PrincipalKind   string   `json:"principalKind,omitempty"`
+	PrincipalID     string   `json:"principalId,omitempty"`
+	VerifiedNode    string   `json:"verifiedNode,omitempty"`
 	ToMailboxID     string   `json:"toMailboxId"`
 	ToAddress       string   `json:"to"`
 	ReplyToID       string   `json:"replyToId,omitempty"`

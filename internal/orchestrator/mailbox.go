@@ -59,6 +59,9 @@ func (service *Service) SendTaskMessage(
 	caller CallerIdentity,
 	input SendTaskMessageInput,
 ) (SendTaskMessageResult, error) {
+	if err := requireScopeOperation(caller, protocol.AccessOpPost); err != nil {
+		return SendTaskMessageResult{}, err
+	}
 	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
 	if idempotencyKey == "" || !protocol.IsBoundedString(idempotencyKey, 128) {
 		return SendTaskMessageResult{}, invalidRequest("idempotencyKey is required and must be at most 128 bytes")
@@ -109,6 +112,9 @@ func (service *Service) SendTaskMessage(
 
 		if !protocol.IsIdentifier(threadID) {
 			return invalidRequest("threadId is required")
+		}
+		if err := requireScopeThread(caller, threadID); err != nil {
+			return err
 		}
 		if _, exists := state.Threads[threadID]; !exists {
 			return notFound(fmt.Sprintf("thread %s does not exist", threadID))

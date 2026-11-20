@@ -91,9 +91,20 @@ func (service *Service) ReadRoom(caller CallerIdentity, input ReadRoomInput) (Re
 		return ReadRoomResult{}, invalidRequest("threadId is required")
 	}
 
+	if err := requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+		return ReadRoomResult{}, err
+	}
+	if err := requireScopeThread(caller, threadID); err != nil {
+		return ReadRoomResult{}, err
+	}
 	readChannel, channelErr := protocol.NormalizeRoomReadChannel(input.Channel)
 	if channelErr != nil {
 		return ReadRoomResult{}, invalidRequest(channelErr.Error())
+	}
+	if readChannel != "" && readChannel != protocol.AllRoomChannels {
+		if err := requireScopeRoomChannel(caller, readChannel); err != nil {
+			return ReadRoomResult{}, err
+		}
 	}
 	if input.AfterSequence < 0 {
 		return ReadRoomResult{}, invalidRequest("afterSequence must be greater than or equal to 0")
@@ -160,6 +171,10 @@ func (service *Service) ReadRoom(caller CallerIdentity, input ReadRoomInput) (Re
 				continue
 			}
 			if !roomEntryMatchesReadChannel(entry, readChannel, caller.Kind, callerSubscriptions) {
+				throughSequence = entry.Sequence
+				continue
+			}
+			if !protocol.ScopeAllowsRoomChannel(caller.Scope, entry.Channel) {
 				throughSequence = entry.Sequence
 				continue
 			}
@@ -324,6 +339,12 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 		return PostRoomMessageResult{}, invalidRequest("threadId is required")
 	}
 
+	if err := requireScopeOperation(caller, protocol.AccessOpPost); err != nil {
+		return PostRoomMessageResult{}, err
+	}
+	if err := requireScopeThread(caller, threadID); err != nil {
+		return PostRoomMessageResult{}, err
+	}
 	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
 	if idempotencyKey == "" || !protocol.IsBoundedString(idempotencyKey, 128) {
 		return PostRoomMessageResult{}, invalidRequest("idempotencyKey must be between 1 and 128 bytes")
@@ -331,6 +352,9 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 	normalizedChannel, channelErr := protocol.NormalizeRoomChannel(input.Channel)
 	if channelErr != nil {
 		return PostRoomMessageResult{}, invalidRequest(channelErr.Error())
+	}
+	if err := requireScopeRoomChannel(caller, normalizedChannel); err != nil {
+		return PostRoomMessageResult{}, err
 	}
 	if service.redactor.ContainsSecret(normalizedChannel) {
 		return PostRoomMessageResult{}, invalidRequest("room channel must not contain secret material")
@@ -828,12 +852,15 @@ func (service *Service) roomAuthorForCaller(state *store.State, caller CallerIde
 			}
 		}
 		return protocol.RoomAuthor{
-			Kind:       "task",
-			TaskID:     caller.TaskID,
-			RunID:      caller.RunID,
-			InstanceID: instanceID,
-			Handle:     handle,
-			Title:      title,
+			Kind:          "task",
+			TaskID:        caller.TaskID,
+			RunID:         caller.RunID,
+			InstanceID:    instanceID,
+			Handle:        handle,
+			Title:         title,
+			PrincipalKind: caller.PrincipalKind,
+			PrincipalID:   caller.PrincipalID,
+			VerifiedNode:  caller.VerifiedNode,
 		}
 	case "orchestrator-client":
 		handle := ""
@@ -848,9 +875,12 @@ func (service *Service) roomAuthorForCaller(state *store.State, caller CallerIde
 			}
 		}
 		return protocol.RoomAuthor{
-			Kind:     "orchestrator",
-			Handle:   handle,
-			ClientID: service.redactor.Redact(caller.ClientID),
+			Kind:          "orchestrator",
+			Handle:        handle,
+			ClientID:      service.redactor.Redact(caller.ClientID),
+			PrincipalKind: caller.PrincipalKind,
+			PrincipalID:   caller.PrincipalID,
+			VerifiedNode:  caller.VerifiedNode,
 		}
 	default:
 		operatorID := caller.OperatorID
@@ -858,8 +888,11 @@ func (service *Service) roomAuthorForCaller(state *store.State, caller CallerIde
 			operatorID = "cli"
 		}
 		return protocol.RoomAuthor{
-			Kind:       "operator",
-			OperatorID: service.redactor.Redact(operatorID),
+			Kind:          "operator",
+			OperatorID:    service.redactor.Redact(operatorID),
+			PrincipalKind: caller.PrincipalKind,
+			PrincipalID:   caller.PrincipalID,
+			VerifiedNode:  caller.VerifiedNode,
 		}
 	}
 }

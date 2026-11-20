@@ -863,23 +863,34 @@ func runRoomPath(
 }
 
 func formatRoomAuthor(author protocol.RoomAuthor) string {
+	var base string
 	switch author.Kind {
 	case "task":
-		if author.TaskID != "" {
-			return "task:" + author.TaskID
+		switch {
+		case author.Handle != "":
+			base = author.Handle
+		case author.TaskID != "":
+			base = "task:" + author.TaskID
+		default:
+			base = "task"
 		}
-		return "task"
 	case "orchestrator":
-		if author.ClientID != "" {
-			return "orchestrator:" + author.ClientID
+		switch {
+		case author.Handle != "":
+			base = author.Handle
+		case author.ClientID != "":
+			base = "orchestrator:" + author.ClientID
+		default:
+			base = "orchestrator"
 		}
-		return "orchestrator"
 	case "operator":
 		if author.OperatorID != "" {
-			return "operator:" + author.OperatorID
+			base = "operator:" + author.OperatorID
+		} else {
+			base = "operator"
 		}
-		return "operator"
 	default:
-		return author.Kind
+		base = author.Kind
 	}
+	return protocol.FormatAttributedAuthor(base, author.PrincipalID)
 }

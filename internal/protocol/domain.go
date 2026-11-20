@@ -246,12 +246,15 @@ type TaskAssignment struct {
 }
 
 type TaskOrigin struct {
-	Kind         string `json:"kind"`
-	SubmissionID string `json:"submissionId,omitempty"`
-	ClientID     string `json:"clientId,omitempty"`
-	RunID        string `json:"runId,omitempty"`
-	TaskID       string `json:"taskId,omitempty"`
-	InstanceID   string `json:"instanceId,omitempty"`
+	Kind          string `json:"kind"`
+	SubmissionID  string `json:"submissionId,omitempty"`
+	ClientID      string `json:"clientId,omitempty"`
+	RunID         string `json:"runId,omitempty"`
+	TaskID        string `json:"taskId,omitempty"`
+	InstanceID    string `json:"instanceId,omitempty"`
+	PrincipalKind string `json:"principalKind,omitempty"`
+	PrincipalID   string `json:"principalId,omitempty"`
+	VerifiedNode  string `json:"verifiedNode,omitempty"`
 }
 
 type TaskClaim struct {
@@ -338,11 +341,14 @@ type InstancePurpose struct {
 }
 
 type InstanceCreator struct {
-	Kind       string `json:"kind"`
-	OperatorID string `json:"operatorId,omitempty"`
-	RunID      string `json:"runId,omitempty"`
-	InstanceID string `json:"instanceId,omitempty"`
-	ClientID   string `json:"clientId,omitempty"`
+	Kind          string `json:"kind"`
+	OperatorID    string `json:"operatorId,omitempty"`
+	RunID         string `json:"runId,omitempty"`
+	InstanceID    string `json:"instanceId,omitempty"`
+	ClientID      string `json:"clientId,omitempty"`
+	PrincipalKind string `json:"principalKind,omitempty"`
+	PrincipalID   string `json:"principalId,omitempty"`
+	VerifiedNode  string `json:"verifiedNode,omitempty"`
 }
 
 func (creator InstanceCreator) SourceKey() string {
@@ -578,14 +584,17 @@ type TaskMessageAck struct {
 }
 
 type RoomAuthor struct {
-	Kind       string `json:"kind"`
-	TaskID     string `json:"taskId,omitempty"`
-	RunID      string `json:"runId,omitempty"`
-	InstanceID string `json:"instanceId,omitempty"`
-	Handle     string `json:"handle,omitempty"`
-	Title      string `json:"title,omitempty"`
-	ClientID   string `json:"clientId,omitempty"`
-	OperatorID string `json:"operatorId,omitempty"`
+	Kind          string `json:"kind"`
+	TaskID        string `json:"taskId,omitempty"`
+	RunID         string `json:"runId,omitempty"`
+	InstanceID    string `json:"instanceId,omitempty"`
+	Handle        string `json:"handle,omitempty"`
+	Title         string `json:"title,omitempty"`
+	ClientID      string `json:"clientId,omitempty"`
+	OperatorID    string `json:"operatorId,omitempty"`
+	PrincipalKind string `json:"principalKind,omitempty"`
+	PrincipalID   string `json:"principalId,omitempty"`
+	VerifiedNode  string `json:"verifiedNode,omitempty"`
 }
 
 type RoomMessage struct {

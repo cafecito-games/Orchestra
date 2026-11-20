@@ -168,6 +168,14 @@ func (service *Service) ClaimTask(
 	if threadID != "" && !protocol.IsIdentifier(threadID) {
 		return ClaimTaskResult{}, invalidRequest("threadId is malformed")
 	}
+	if err := requireScopeOperation(caller, protocol.AccessOpClaim); err != nil {
+		return ClaimTaskResult{}, err
+	}
+	if threadID != "" {
+		if err := requireScopeThread(caller, threadID); err != nil {
+			return ClaimTaskResult{}, err
+		}
+	}
 	if explicit := strings.TrimSpace(input.ClaimerID); explicit != "" && !protocol.IsBoundedString(explicit, 128) {
 		return ClaimTaskResult{}, invalidRequest("claimerId must be at most 128 bytes")
 	}
@@ -210,6 +218,9 @@ func (service *Service) ClaimTask(
 				if !exists || (threadID != "" && task.ThreadID != threadID) {
 					return notFound(fmt.Sprintf("task %s does not exist", taskID))
 				}
+				if err := requireScopeThread(caller, task.ThreadID); err != nil {
+					return err
+				}
 				if task.EffectiveExecutionMode() != protocol.TaskExecutionModeClaimable {
 					return conflictError("not_claimable", fmt.Sprintf("task %s has executionMode %q and cannot be claimed", task.ID, task.EffectiveExecutionMode()))
 				}
@@ -243,6 +254,9 @@ func (service *Service) ClaimTask(
 							continue
 						}
 					} else if thread, threadExists := state.Threads[task.ThreadID]; !threadExists || thread.Status != "open" {
+						continue
+					}
+					if !protocol.ScopeAllowsThread(caller.Scope, task.ThreadID) {
 						continue
 					}
 					if !claimMatchesTaskRequirements(input, task.Requirements) {

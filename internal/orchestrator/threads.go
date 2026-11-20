@@ -71,6 +71,14 @@ func (service *Service) CreateThread(
 	caller CallerIdentity,
 	input CreateThreadInput,
 ) (protocol.Thread, *protocol.ThreadAttachment, error) {
+	if caller.Scope != nil {
+		if err := requireScopeOperation(caller, protocol.AccessOpDelegate); err != nil {
+			return protocol.Thread{}, nil, err
+		}
+		if len(caller.Scope.ThreadIDs) > 0 {
+			return protocol.Thread{}, nil, forbiddenError("thread-scoped access grant cannot create new threads")
+		}
+	}
 	title := strings.TrimSpace(input.Title)
 	if title == "" || !protocol.IsBoundedString(title, 512) {
 		return protocol.Thread{}, nil, invalidRequest("thread title must be a non-empty string up to 512 bytes")
@@ -314,6 +322,12 @@ func (service *Service) UpdateThread(caller CallerIdentity, input UpdateThreadIn
 	}
 	if caller.Kind == "run" && caller.ThreadID != "" && caller.ThreadID != threadID {
 		return protocol.Thread{}, forbiddenError("worker run cannot update another thread")
+	}
+	if err := requireScopeOperation(caller, protocol.AccessOpPost); err != nil {
+		return protocol.Thread{}, err
+	}
+	if err := requireScopeThread(caller, threadID); err != nil {
+		return protocol.Thread{}, err
 	}
 
 	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
