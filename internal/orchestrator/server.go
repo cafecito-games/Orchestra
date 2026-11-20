@@ -826,9 +826,67 @@ func (service *Service) handleAPIThreadSubroutes(writer http.ResponseWriter, req
 		}
 		result, err := service.ReadRoom(operatorCaller, ReadRoomInput{
 			ThreadID:      threadID,
+			Channel:       strings.TrimSpace(request.URL.Query().Get("channel")),
 			AfterSequence: afterSequence,
 			Kinds:         kinds,
 			Limit:         limit,
+		})
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	case "room/wait":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		query := request.URL.Query()
+		var afterSequence *int64
+		if rawAfter := strings.TrimSpace(query.Get("after")); rawAfter != "" {
+			parsedAfter, parseErr := strconv.ParseInt(rawAfter, 10, 64)
+			if parseErr != nil {
+				writeOperationError(writer, invalidRequest("after must be an integer"))
+				return
+			}
+			afterSequence = &parsedAfter
+		}
+		var limit int
+		if rawLimit := strings.TrimSpace(query.Get("limit")); rawLimit != "" {
+			parsedLimit, parseErr := strconv.Atoi(rawLimit)
+			if parseErr != nil {
+				writeOperationError(writer, invalidRequest("limit must be an integer"))
+				return
+			}
+			limit = parsedLimit
+		}
+		timeoutMilliseconds := protocol.MaximumWaitMilliseconds
+		if rawTimeout := strings.TrimSpace(query.Get("timeoutMs")); rawTimeout != "" {
+			parsedTimeout, parseErr := strconv.Atoi(rawTimeout)
+			if parseErr != nil {
+				writeOperationError(writer, invalidRequest("timeoutMs must be an integer"))
+				return
+			}
+			timeoutMilliseconds = parsedTimeout
+		}
+		var kinds []string
+		for _, rawKind := range query["kind"] {
+			for part := range strings.SplitSeq(rawKind, ",") {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					kinds = append(kinds, trimmed)
+				}
+			}
+		}
+		result, err := service.WaitRoom(request.Context(), operatorCaller, WaitRoomInput{
+			ThreadID:            threadID,
+			Channel:             strings.TrimSpace(query.Get("channel")),
+			AfterSequence:       afterSequence,
+			EventCursor:         strings.TrimSpace(query.Get("cursor")),
+			Kinds:               kinds,
+			Mentions:            strings.TrimSpace(query.Get("mentions")),
+			TimeoutMilliseconds: timeoutMilliseconds,
+			Limit:               limit,
 		})
 		if err != nil {
 			writeOperationError(writer, err)
@@ -1846,4 +1904,341 @@ func firstMasterEnvironment(lookup func(string) (string, bool), names ...string)
 		}
 	}
 	return ""
+}
+
+type WaitRoomInput struct {
+	ThreadID            string   `json:"threadId"`
+	Channel             string   `json:"channel,omitempty"`
+	AfterSequence       *int64   `json:"afterSequence,omitempty"`
+	EventCursor         string   `json:"eventCursor,omitempty"`
+	Kinds               []string `json:"kinds,omitempty"`
+	Mentions            string   `json:"mentions,omitempty"`
+	TimeoutMilliseconds int      `json:"timeoutMilliseconds,omitempty"`
+	Limit               int      `json:"limit,omitempty"`
+}
+
+type WaitRoomResult struct {
+	ThreadID        string                    `json:"threadId"`
+	Channel         string                    `json:"channel,omitempty"`
+	Messages        []protocol.RoomMessage    `json:"messages"`
+	Events          []protocol.TaskEventEntry `json:"events"`
+	HeadSequence    int64                     `json:"headSequence"`
+	ThroughSequence int64                     `json:"throughSequence"`
+	EventCursor     string                    `json:"eventCursor,omitempty"`
+	CursorExpired   bool                      `json:"cursorExpired"`
+	TimedOut        bool                      `json:"timedOut"`
+}
+
+type roomMentionFilter struct {
+	active  bool
+	all     bool
+	channel string
+	handle  string
+}
+
+func parseRoomMentionFilter(raw string) (roomMentionFilter, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return roomMentionFilter{}, nil
+	}
+	withoutAt := strings.TrimPrefix(trimmed, "@")
+	if withoutAt == "" {
+		return roomMentionFilter{}, invalidRequest(fmt.Sprintf("invalid room mention filter %q", raw))
+	}
+	if rawChannel, isChannel := strings.CutPrefix(withoutAt, "#"); isChannel {
+		if strings.EqualFold(strings.TrimSpace(rawChannel), protocol.DefaultRoomChannel) {
+			return roomMentionFilter{}, invalidRequest(protocol.ErrRoomMainChannelMention.Error())
+		}
+		normalizedChannel, err := protocol.NormalizeRoomChannel(rawChannel)
+		if err != nil {
+			return roomMentionFilter{}, invalidRequest(err.Error())
+		}
+		return roomMentionFilter{active: true, channel: normalizedChannel}, nil
+	}
+	if strings.EqualFold(withoutAt, "all") {
+		return roomMentionFilter{active: true, all: true}, nil
+	}
+	if strings.Contains(withoutAt, "@") {
+		parsedHandle, _, _, ok := protocol.ParseMailAddress(withoutAt)
+		if !ok {
+			return roomMentionFilter{}, invalidRequest(fmt.Sprintf("invalid room mention filter %q", raw))
+		}
+		if parsedHandle == "all" {
+			return roomMentionFilter{active: true, all: true}, nil
+		}
+		return roomMentionFilter{active: true, handle: parsedHandle}, nil
+	}
+	normalizedHandle, ok := protocol.NormalizeMailHandle(withoutAt)
+	if !ok {
+		return roomMentionFilter{}, invalidRequest(fmt.Sprintf("invalid room mention filter %q", raw))
+	}
+	return roomMentionFilter{active: true, handle: normalizedHandle}, nil
+}
+
+func (filter roomMentionFilter) matches(entry protocol.RoomMessage) bool {
+	if !filter.active {
+		return true
+	}
+	parsed, err := protocol.ParseRoomMentions(entry.Body, entry.Mentions)
+	if err != nil {
+		return false
+	}
+	if filter.all {
+		return parsed.All
+	}
+	if filter.channel != "" {
+		return slices.Contains(parsed.Channels, filter.channel)
+	}
+	if parsed.All {
+		return true
+	}
+	for _, mentionedHandle := range parsed.Handles {
+		if protocol.MatchesHandleMention(filter.handle, mentionedHandle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (service *Service) redactEventDetail(detail map[string]any) map[string]any {
+	if len(detail) == 0 {
+		return nil
+	}
+	redacted := make(map[string]any, len(detail))
+	for key, value := range detail {
+		if text, isString := value.(string); isString {
+			redacted[key] = service.redactor.Redact(text)
+			continue
+		}
+		redacted[key] = value
+	}
+	return redacted
+}
+
+func (service *Service) WaitRoom(
+	operationContext context.Context,
+	caller CallerIdentity,
+	input WaitRoomInput,
+) (WaitRoomResult, error) {
+	threadID := strings.TrimSpace(input.ThreadID)
+	if !protocol.IsIdentifier(threadID) {
+		return WaitRoomResult{}, invalidRequest("threadId is required")
+	}
+	readChannel, channelErr := protocol.NormalizeRoomReadChannel(input.Channel)
+	if channelErr != nil {
+		return WaitRoomResult{}, invalidRequest(channelErr.Error())
+	}
+	if input.AfterSequence != nil && *input.AfterSequence < 0 {
+		return WaitRoomResult{}, invalidRequest("afterSequence must be greater than or equal to 0")
+	}
+	for _, kind := range input.Kinds {
+		if !slices.Contains(protocol.RoomMessageKinds, kind) {
+			return WaitRoomResult{}, invalidRequest(fmt.Sprintf("unknown room message kind %q", kind))
+		}
+	}
+	mentionFilter, mentionErr := parseRoomMentionFilter(input.Mentions)
+	if mentionErr != nil {
+		return WaitRoomResult{}, mentionErr
+	}
+	if input.Limit < 0 {
+		return WaitRoomResult{}, invalidRequest("limit must be positive")
+	}
+	limit := input.Limit
+	if limit == 0 {
+		limit = protocol.DefaultRoomReadLimit
+	}
+	if limit > protocol.MaximumRoomReadLimit {
+		limit = protocol.MaximumRoomReadLimit
+	}
+	waitMilliseconds := min(max(input.TimeoutMilliseconds, 0), protocol.MaximumWaitMilliseconds)
+
+	readerKey := caller.SourceKey()
+	if readerKey == "" {
+		readerKey = "operator:cli"
+	}
+	rawEventCursor := strings.TrimSpace(input.EventCursor)
+	includeThreadEvents := len(input.Kinds) == 0 && !mentionFilter.active
+
+	eventChannel, unsubscribeEvents := service.store.SubscribeEvents()
+	defer unsubscribeEvents()
+
+	var roomBaselineSequence int64
+	var eventBaselineSequence int64
+	if err := service.store.Read(func(state *store.State) error {
+		if _, exists := state.Threads[threadID]; !exists {
+			return notFound(fmt.Sprintf("thread %s does not exist", threadID))
+		}
+		if input.AfterSequence != nil {
+			roomBaselineSequence = *input.AfterSequence
+		} else {
+			roomBaselineSequence = state.RoomHeads[threadID].HeadSequence
+		}
+		if rawEventCursor != "" {
+			decodedSequence, decodeErr := protocol.DecodeEventCursor(rawEventCursor, threadID, readerKey)
+			if decodeErr != nil {
+				return invalidRequest(decodeErr.Error())
+			}
+			eventBaselineSequence = decodedSequence
+		} else {
+			eventBaselineSequence = state.EventStreams[threadID].Head
+		}
+		return nil
+	}); err != nil {
+		return WaitRoomResult{}, err
+	}
+
+	collectSnapshot := func() (WaitRoomResult, bool, error) {
+		snapshot := WaitRoomResult{
+			ThreadID: threadID,
+			Channel:  readChannel,
+			Messages: []protocol.RoomMessage{},
+			Events:   []protocol.TaskEventEntry{},
+		}
+		err := service.store.Read(func(state *store.State) error {
+			if _, exists := state.Threads[threadID]; !exists {
+				return notFound(fmt.Sprintf("thread %s does not exist", threadID))
+			}
+
+			roomHead := state.RoomHeads[threadID]
+			snapshot.HeadSequence = roomHead.HeadSequence
+			throughSequence := min(roomBaselineSequence, roomHead.HeadSequence)
+			hasMoreMessages := false
+
+			for _, entry := range state.RoomMessages[threadID] {
+				if entry.Sequence <= roomBaselineSequence {
+					continue
+				}
+				if !roomEntryMatchesReadChannel(entry, readChannel, caller.Kind, nil) {
+					throughSequence = entry.Sequence
+					continue
+				}
+				if len(input.Kinds) > 0 && !slices.Contains(input.Kinds, entry.Kind) {
+					throughSequence = entry.Sequence
+					continue
+				}
+				if !mentionFilter.matches(entry) {
+					throughSequence = entry.Sequence
+					continue
+				}
+				if len(snapshot.Messages) >= limit {
+					hasMoreMessages = true
+					break
+				}
+				throughSequence = entry.Sequence
+				entryCopy := entry
+				entryCopy.Topic = service.redactor.Redact(entry.Topic)
+				entryCopy.Body = service.redactor.Redact(entry.Body)
+				entryCopy.ArtifactIDs = slices.Clone(entry.ArtifactIDs)
+				entryCopy.Mentions = slices.Clone(entry.Mentions)
+				snapshot.Messages = append(snapshot.Messages, entryCopy)
+			}
+			if !hasMoreMessages && roomHead.HeadSequence > throughSequence && roomBaselineSequence <= roomHead.HeadSequence {
+				throughSequence = roomHead.HeadSequence
+			}
+			snapshot.ThroughSequence = throughSequence
+
+			stream := state.EventStreams[threadID]
+			if eventBaselineSequence < stream.Floor {
+				nextCursor, cursorErr := protocol.EncodeEventCursor(threadID, readerKey, stream.Floor)
+				if cursorErr != nil {
+					return cursorErr
+				}
+				snapshot.EventCursor = nextCursor
+				snapshot.CursorExpired = true
+				return nil
+			}
+
+			lastScanned := eventBaselineSequence
+			hasMoreEvents := false
+			for _, event := range state.ThreadEvents[threadID] {
+				if event.Sequence <= eventBaselineSequence {
+					continue
+				}
+				if event.Type == "room.message_posted" || !includeThreadEvents {
+					lastScanned = event.Sequence
+					continue
+				}
+				if len(snapshot.Events) >= limit {
+					hasMoreEvents = true
+					break
+				}
+				lastScanned = event.Sequence
+				eventCopy := event
+				eventCopy.Summary = service.redactor.Redact(event.Summary)
+				eventCopy.Detail = service.redactEventDetail(event.Detail)
+				snapshot.Events = append(snapshot.Events, eventCopy)
+			}
+			if !hasMoreEvents && stream.Head > lastScanned {
+				lastScanned = stream.Head
+			}
+			nextCursor, cursorErr := protocol.EncodeEventCursor(threadID, readerKey, lastScanned)
+			if cursorErr != nil {
+				return cursorErr
+			}
+			snapshot.EventCursor = nextCursor
+			return nil
+		})
+		if err != nil {
+			return WaitRoomResult{}, false, err
+		}
+		hasActivity := len(snapshot.Messages) > 0 || len(snapshot.Events) > 0 || snapshot.CursorExpired
+		return snapshot, hasActivity, nil
+	}
+
+	initialSnapshot, hasActivity, err := collectSnapshot()
+	if err != nil {
+		return WaitRoomResult{}, err
+	}
+	if hasActivity {
+		return initialSnapshot, nil
+	}
+	if waitMilliseconds == 0 {
+		initialSnapshot.TimedOut = true
+		return initialSnapshot, nil
+	}
+
+	waitTimer := time.NewTimer(time.Duration(waitMilliseconds) * time.Millisecond)
+	defer waitTimer.Stop()
+
+	for {
+		select {
+		case <-operationContext.Done():
+			polled, woke, pollErr := collectSnapshot()
+			if pollErr != nil {
+				return WaitRoomResult{}, pollErr
+			}
+			polled.TimedOut = !woke
+			return polled, nil
+		case <-waitTimer.C:
+			polled, woke, pollErr := collectSnapshot()
+			if pollErr != nil {
+				return WaitRoomResult{}, pollErr
+			}
+			polled.TimedOut = !woke
+			return polled, nil
+		case eventBatch, open := <-eventChannel:
+			if !open {
+				polled, woke, pollErr := collectSnapshot()
+				if pollErr != nil {
+					return WaitRoomResult{}, pollErr
+				}
+				polled.TimedOut = !woke
+				return polled, nil
+			}
+			relevantThread := false
+			for _, event := range eventBatch {
+				if event.ThreadID == threadID {
+					relevantThread = true
+					break
+				}
+			}
+			if !relevantThread {
+				continue
+			}
+			polled, woke, pollErr := collectSnapshot()
+			if pollErr != nil || woke {
+				return polled, pollErr
+			}
+		}
+	}
 }
