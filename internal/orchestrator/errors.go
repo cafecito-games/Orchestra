@@ -17,6 +17,7 @@ type OperationError struct {
 	Message    string
 	HTTPStatus int
 	Retryable  bool
+	Detail     map[string]any
 }
 
 func (err *OperationError) Error() string {
@@ -28,6 +29,7 @@ func (err *OperationError) HubError() *protocol.HubRPCError {
 		Code:      err.Code,
 		Message:   err.Message,
 		Retryable: err.Retryable,
+		Detail:    err.Detail,
 	}
 }
 
@@ -62,6 +64,22 @@ func forbiddenError(message string) *OperationError {
 
 func conflictError(code, message string) *OperationError {
 	return newError(code, http.StatusConflict, message)
+}
+
+func conflictErrorWithDetail(code, message string, detail map[string]any) *OperationError {
+	return &OperationError{
+		Code:       code,
+		Message:    message,
+		HTTPStatus: http.StatusConflict,
+		Detail:     detail,
+	}
+}
+
+func labelValidationError(err error) *OperationError {
+	if errors.Is(err, protocol.ErrReservedLabel) {
+		return newError("reserved_label", http.StatusBadRequest, err.Error())
+	}
+	return invalidRequest(err.Error())
 }
 
 func toHubRPCError(err error) *protocol.HubRPCError {

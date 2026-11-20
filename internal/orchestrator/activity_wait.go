@@ -17,6 +17,7 @@ type WaitForActivityInput struct {
 	Cursor              string   `json:"cursor,omitempty"`
 	EventTypes          []string `json:"eventTypes,omitempty"`
 	AfterRoomSequence   *int64   `json:"afterRoomSequence,omitempty"`
+	Labels              []string `json:"labels,omitempty"`
 	AfterMailSequence   int64    `json:"afterMailSequence,omitempty"`
 	UnreadMailOnly      *bool    `json:"unreadMailOnly,omitempty"`
 	MarkMailRead        *bool    `json:"markMailRead,omitempty"`
@@ -48,6 +49,10 @@ func (service *Service) WaitForActivity(
 	}
 	if input.AfterRoomSequence != nil && *input.AfterRoomSequence < 0 {
 		return WaitForActivityResult{}, invalidRequest("afterRoomSequence must be non-negative")
+	}
+	labelFilters, labelFilterErr := protocol.ParseLabelFilters(input.Labels)
+	if labelFilterErr != nil {
+		return WaitForActivityResult{}, invalidRequest(labelFilterErr.Error())
 	}
 
 	waitMilliseconds := input.TimeoutMilliseconds
@@ -200,11 +205,15 @@ func (service *Service) WaitForActivity(
 					if caller.Kind == "run" && !protocol.InstanceSubscribesToRoomChannel(callerRoomChannels, entry.Channel) {
 						continue
 					}
+					if !protocol.MatchesLabelFilters(entry.Labels, labelFilters) {
+						continue
+					}
 					visibleRoomMessageIDs[entry.ID] = true
 					if len(snapshot.RoomMessages) >= limit {
 						continue
 					}
 					entryCopy := entry
+					entryCopy.Labels = protocol.CloneLabels(entry.Labels)
 					entryCopy.ArtifactIDs = slices.Clone(entry.ArtifactIDs)
 					entryCopy.Mentions = slices.Clone(entry.Mentions)
 					snapshot.RoomMessages = append(snapshot.RoomMessages, entryCopy)
@@ -241,6 +250,10 @@ func (service *Service) WaitForActivity(
 				hasMoreEvents := false
 				for _, entry := range allEvents {
 					if entry.Sequence <= eventBaselineSequence {
+						continue
+					}
+					if len(labelFilters) > 0 && entry.Type == "room.message_posted" && entry.MessageID != "" && !visibleRoomMessageIDs[entry.MessageID] {
+						lastScanned = entry.Sequence
 						continue
 					}
 					if caller.Kind == "run" {

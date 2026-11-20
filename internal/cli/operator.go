@@ -704,6 +704,8 @@ func runThreads(
 	flagSet.SetOutput(standardError)
 	connection := registerOperatorFlags(flagSet, lookupEnvironment)
 	statusFilter := flagSet.String("status", "", "Filter threads by status (open or resolved)")
+	var labelFilters cliStringSliceFlag
+	flagSet.Var(&labelFilters, "label", "Filter threads by label expression (key, key=value, key=a|b; repeatable)")
 	limit := flagSet.Int("limit", 50, "Maximum number of threads to display")
 	if err := flagSet.Parse(normalizeFlagOrder(flagSet, arguments)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -719,6 +721,9 @@ func runThreads(
 	query := url.Values{}
 	if *statusFilter != "" {
 		query.Set("status", *statusFilter)
+	}
+	for _, expr := range labelFilters.values {
+		query.Add("label", expr)
 	}
 	if *limit > 0 {
 		query.Set("limit", strconv.Itoa(*limit))

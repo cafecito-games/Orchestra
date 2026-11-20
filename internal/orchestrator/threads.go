@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -14,23 +15,30 @@ import (
 )
 
 type CreateThreadInput struct {
-	Title                 string `json:"title"`
-	Summary               string `json:"summary,omitempty"`
-	Attach                bool   `json:"attach,omitempty"`
-	CoordinatorInstanceID string `json:"coordinatorInstanceId,omitempty"`
+	Title                 string            `json:"title"`
+	Summary               string            `json:"summary,omitempty"`
+	Attach                bool              `json:"attach,omitempty"`
+	CoordinatorInstanceID string            `json:"coordinatorInstanceId,omitempty"`
+	Labels                map[string]string `json:"labels,omitempty"`
 }
 
 type ListThreadsInput struct {
-	Status string `json:"status,omitempty"`
-	Limit  int    `json:"limit,omitempty"`
+	Status string   `json:"status,omitempty"`
+	Labels []string `json:"labels,omitempty"`
+	Limit  int      `json:"limit,omitempty"`
 }
 
 type UpdateThreadInput struct {
-	ThreadID              string         `json:"threadId"`
-	Title                 *string        `json:"title,omitempty"`
-	Summary               *string        `json:"summary,omitempty"`
-	Status                *string        `json:"status,omitempty"`
-	CoordinatorInstanceID NullableString `json:"coordinatorInstanceId"`
+	ThreadID              string            `json:"threadId"`
+	IdempotencyKey        string            `json:"idempotencyKey,omitempty"`
+	Title                 *string           `json:"title,omitempty"`
+	Summary               *string           `json:"summary,omitempty"`
+	Status                *string           `json:"status,omitempty"`
+	CoordinatorInstanceID NullableString    `json:"coordinatorInstanceId"`
+	SetLabels             map[string]string `json:"setLabels,omitempty"`
+	UnsetLabels           []string          `json:"unsetLabels,omitempty"`
+	IfLabels              map[string]string `json:"ifLabels,omitempty"`
+	IfUnsetLabels         []string          `json:"ifUnsetLabels,omitempty"`
 }
 
 type AttachThreadInput struct {
@@ -71,6 +79,10 @@ func (service *Service) CreateThread(
 	if !protocol.IsBoundedString(summary, 4096) {
 		return protocol.Thread{}, nil, invalidRequest("thread summary exceeds 4096 bytes")
 	}
+	normalizedLabels, labelErr := protocol.NormalizeLabels(input.Labels, service.redactor, false)
+	if labelErr != nil {
+		return protocol.Thread{}, nil, labelValidationError(labelErr)
+	}
 
 	var created protocol.Thread
 	var createdAttachment *protocol.ThreadAttachment
@@ -96,6 +108,7 @@ func (service *Service) CreateThread(
 			Title:        title,
 			Summary:      summary,
 			Status:       "open",
+			Labels:       protocol.CloneLabels(normalizedLabels),
 			Orchestrator: orchestratorIdentity,
 			CreatedAt:    nowText,
 			UpdatedAt:    nowText,
@@ -140,6 +153,10 @@ func (service *Service) ListThreads(input ListThreadsInput) ([]protocol.Thread, 
 	if input.Status != "" && !slices.Contains(protocol.ThreadStatuses, input.Status) {
 		return nil, invalidRequest("status must be open or resolved")
 	}
+	labelFilters, filterErr := protocol.ParseLabelFilters(input.Labels)
+	if filterErr != nil {
+		return nil, invalidRequest(filterErr.Error())
+	}
 	limit := input.Limit
 	if limit <= 0 || limit > 200 {
 		limit = 100
@@ -149,6 +166,9 @@ func (service *Service) ListThreads(input ListThreadsInput) ([]protocol.Thread, 
 	err := service.store.Read(func(state *store.State) error {
 		for _, thread := range state.Threads {
 			if input.Status != "" && thread.Status != input.Status {
+				continue
+			}
+			if !protocol.MatchesLabelFilters(thread.Labels, labelFilters) {
 				continue
 			}
 			threads = append(threads, thread)
@@ -296,12 +316,148 @@ func (service *Service) UpdateThread(caller CallerIdentity, input UpdateThreadIn
 		return protocol.Thread{}, forbiddenError("worker run cannot update another thread")
 	}
 
+	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
+	if idempotencyKey != "" && !protocol.IsBoundedString(idempotencyKey, 128) {
+		return protocol.Thread{}, invalidRequest("idempotencyKey must be at most 128 bytes")
+	}
+	normalizedSetLabels, setErr := protocol.NormalizeLabels(input.SetLabels, service.redactor, false)
+	if setErr != nil {
+		return protocol.Thread{}, labelValidationError(setErr)
+	}
+	normalizedUnsetLabels := make([]string, 0, len(input.UnsetLabels))
+	for _, rawKey := range input.UnsetLabels {
+		key, keyErr := protocol.ValidateLabelKey(rawKey, false)
+		if keyErr != nil {
+			return protocol.Thread{}, labelValidationError(keyErr)
+		}
+		if !slices.Contains(normalizedUnsetLabels, key) {
+			normalizedUnsetLabels = append(normalizedUnsetLabels, key)
+		}
+	}
+	slices.Sort(normalizedUnsetLabels)
+
+	normalizedIfLabels, ifErr := protocol.NormalizeLabels(input.IfLabels, service.redactor, true)
+	if ifErr != nil {
+		return protocol.Thread{}, invalidRequest(ifErr.Error())
+	}
+	normalizedIfUnsetLabels := make([]string, 0, len(input.IfUnsetLabels))
+	for _, rawKey := range input.IfUnsetLabels {
+		key, keyErr := protocol.ValidateLabelKey(rawKey, true)
+		if keyErr != nil {
+			return protocol.Thread{}, invalidRequest(keyErr.Error())
+		}
+		if !slices.Contains(normalizedIfUnsetLabels, key) {
+			normalizedIfUnsetLabels = append(normalizedIfUnsetLabels, key)
+		}
+	}
+	slices.Sort(normalizedIfUnsetLabels)
+
+	sourceKey := caller.SourceKey()
+	receiptKey := sourceKey + "\x00thread_update\x00" + threadID + "\x00" + idempotencyKey
+	digest := canonicalDigest(struct {
+		ThreadID              string            `json:"threadId"`
+		Title                 *string           `json:"title,omitempty"`
+		Summary               *string           `json:"summary,omitempty"`
+		Status                *string           `json:"status,omitempty"`
+		CoordinatorInstanceID NullableString    `json:"coordinatorInstanceId"`
+		SetLabels             map[string]string `json:"setLabels,omitempty"`
+		UnsetLabels           []string          `json:"unsetLabels,omitempty"`
+		IfLabels              map[string]string `json:"ifLabels,omitempty"`
+		IfUnsetLabels         []string          `json:"ifUnsetLabels,omitempty"`
+	}{
+		ThreadID:              threadID,
+		Title:                 input.Title,
+		Summary:               input.Summary,
+		Status:                input.Status,
+		CoordinatorInstanceID: input.CoordinatorInstanceID,
+		SetLabels:             normalizedSetLabels,
+		UnsetLabels:           normalizedUnsetLabels,
+		IfLabels:              normalizedIfLabels,
+		IfUnsetLabels:         normalizedIfUnsetLabels,
+	})
+
 	var updated protocol.Thread
 	_, err := service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
 		thread, exists := state.Threads[threadID]
 		if !exists {
 			return notFound(fmt.Sprintf("thread %s does not exist", threadID))
 		}
+		if idempotencyKey != "" {
+			if existingReceipt, found := state.TaskUpdates[receiptKey]; found {
+				if existingReceipt.Digest != digest {
+					return conflictError("idempotency_conflict", "idempotencyKey was already used for a different thread update")
+				}
+				updated = thread
+				return nil
+			}
+		}
+
+		var labelConflicts []map[string]any
+		if len(normalizedIfLabels) > 0 {
+			keys := make([]string, 0, len(normalizedIfLabels))
+			for key := range normalizedIfLabels {
+				keys = append(keys, key)
+			}
+			slices.Sort(keys)
+			for _, key := range keys {
+				expected := normalizedIfLabels[key]
+				actual, present := thread.Labels[key]
+				if !present || actual != expected {
+					entry := map[string]any{
+						"key":      key,
+						"expected": expected,
+						"present":  present,
+					}
+					if present {
+						entry["actual"] = actual
+					}
+					labelConflicts = append(labelConflicts, entry)
+				}
+			}
+		}
+		for _, key := range normalizedIfUnsetLabels {
+			if actual, present := thread.Labels[key]; present {
+				labelConflicts = append(labelConflicts, map[string]any{
+					"key":           key,
+					"expectedUnset": true,
+					"actual":        actual,
+				})
+			}
+		}
+		if len(labelConflicts) > 0 {
+			currentLabels := protocol.CloneLabels(thread.Labels)
+			if currentLabels == nil {
+				currentLabels = map[string]string{}
+			}
+			return conflictErrorWithDetail(
+				"label_conflict",
+				fmt.Sprintf("thread %s label precondition failed", threadID),
+				map[string]any{
+					"threadId":      threadID,
+					"currentLabels": currentLabels,
+					"conflicts":     labelConflicts,
+				},
+			)
+		}
+
+		nextLabels := protocol.CloneLabels(thread.Labels)
+		if len(normalizedSetLabels) > 0 || len(normalizedUnsetLabels) > 0 {
+			if nextLabels == nil {
+				nextLabels = map[string]string{}
+			}
+			for _, key := range normalizedUnsetLabels {
+				delete(nextLabels, key)
+			}
+			maps.Copy(nextLabels, normalizedSetLabels)
+			if len(nextLabels) > protocol.MaximumLabelsPerResource {
+				return invalidRequest(fmt.Sprintf("thread labels exceed maximum of %d entries", protocol.MaximumLabelsPerResource))
+			}
+			if len(nextLabels) == 0 {
+				nextLabels = nil
+			}
+			thread.Labels = nextLabels
+		}
+
 		if input.Title != nil {
 			trimmed := strings.TrimSpace(*input.Title)
 			if trimmed == "" || !protocol.IsBoundedString(trimmed, 512) {
@@ -334,6 +490,16 @@ func (service *Service) UpdateThread(caller CallerIdentity, input UpdateThreadIn
 			}
 			if bindErr := service.bindThreadCoordinatorInState(state, mutation, caller, &thread, targetInstanceID, nowText); bindErr != nil {
 				return bindErr
+			}
+		}
+		if idempotencyKey != "" {
+			state.TaskUpdates[receiptKey] = protocol.TaskUpdateReceipt{
+				ID:             protocol.NewIdentifier("upd"),
+				TaskID:         threadID,
+				SourceKey:      sourceKey,
+				IdempotencyKey: idempotencyKey,
+				Digest:         digest,
+				CreatedAt:      nowText,
 			}
 		}
 		thread.UpdatedAt = nowText
