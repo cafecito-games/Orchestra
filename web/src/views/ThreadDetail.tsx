@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
-import { api, download, fetchThreadRoom } from "../api";
+import { api, AuthError, download, DownloadAbortedError, fetchThreadRoom } from "../api";
 import { navigate, scrollToAnchor, useLive, usePolledFetch, useRoute } from "../hooks";
 import type {
   AgentInstance,
@@ -16,9 +16,10 @@ import {
   SectionHead,
 } from "../components/ui";
 import { BackIcon, XIcon } from "../components/Icons";
-import { fmtBytes, shortId, timeAgo } from "../format";
+import { shortId, timeAgo } from "../format";
 import { toast } from "../toast";
 import { ApprovalCard } from "../components/ApprovalCard";
+import { ArtifactList } from "../components/ArtifactList";
 import { BlackboardRoom } from "../components/BlackboardRoom";
 import {
   NeedsAttentionSection,
@@ -108,12 +109,12 @@ export function ThreadDetail({ id }: { id: string }) {
     try {
       await download(path, name);
     } catch (downloadError) {
-      toast(
-        downloadError instanceof Error
-          ? downloadError.message
-          : String(downloadError),
-        "err",
-      );
+      if (downloadError instanceof DownloadAbortedError || downloadError instanceof AuthError) {
+        return;
+      }
+      const message =
+        downloadError instanceof Error ? downloadError.message : String(downloadError);
+      toast(`Failed to download ${name}: ${message}`, "err");
     }
   }
 
@@ -359,43 +360,7 @@ export function ThreadDetail({ id }: { id: string }) {
         </div>
       ) : null}
 
-      {artifacts.length > 0 ? (
-        <div className="section">
-          <SectionHead title="Artifacts" count={artifacts.length} />
-          <Card>
-            <div className="list">
-              {artifacts.map((artifact) => (
-                <div
-                  key={artifact.id}
-                  style={{
-                    padding: "8px 4px",
-                    borderBottom: "1px solid var(--border)",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 10,
-                  }}
-                >
-                  <div style={{ minWidth: 0, flex: 1 }}>
-                    <span style={{ fontWeight: 500 }}>{artifact.name}</span>
-                    <div className="muted mono" style={{ fontSize: 11 }}>
-                      {shortId(artifact.id)} · {fmtBytes(artifact.sizeBytes)}
-                      {artifact.uploaded ? "" : " · pending upload"}
-                    </div>
-                  </div>
-                  {artifact.uploaded ? (
-                    <button
-                      className="btn"
-                      onClick={() => downloadArtifact(artifact.name, artifact.downloadPath)}
-                    >
-                      Download
-                    </button>
-                  ) : null}
-                </div>
-              ))}
-            </div>
-          </Card>
-        </div>
-      ) : null}
+      <ArtifactList artifacts={artifacts} />
 
       {messages.length > 0 ? (
         <div className="section">

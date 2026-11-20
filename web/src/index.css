@@ -1924,6 +1924,151 @@ a {
   background: var(--bg-elevated);
 }
 
+/* ---------- Artifacts ---------- */
+.artifact-summary-counts {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.artifact-pending-count {
+  color: var(--warn);
+}
+
+.artifact-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.artifact-row:last-child {
+  border-bottom: none;
+}
+
+.artifact-row.pending {
+  opacity: 0.82;
+  background: linear-gradient(90deg, rgba(232, 179, 75, 0.045), transparent 60%);
+  border-radius: var(--radius-xs);
+}
+
+.artifact-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.artifact-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.artifact-name {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.artifact-path {
+  font-size: 11px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-summary {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.artifact-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+
+.artifact-hash {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  font-family: var(--mono);
+  color: var(--text-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  padding: 2px 7px;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+
+.artifact-hash:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--surface-3);
+}
+
+.artifact-hash svg {
+  width: 12px;
+  height: 12px;
+  color: var(--text-3);
+}
+
+.artifact-hash-empty {
+  color: var(--text-4);
+}
+
+.artifact-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.artifact-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 320px;
+  margin-top: 2px;
+}
+
+.artifact-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.artifact-progress-bar {
+  width: 100%;
+}
+
+@media (max-width: 720px) {
+  .artifact-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .artifact-actions {
+    justify-content: flex-start;
+  }
+}
+
 @media (max-width: 720px) {
   .app {
     grid-template-columns: 1fr;

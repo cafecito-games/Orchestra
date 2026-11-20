@@ -226,9 +226,11 @@ export interface Artifact {
   taskId?: string;
   runId?: string;
   name: string;
+  relativePath?: string;
   kind?: string;
   mediaType: string;
   sizeBytes: number;
+  sha256?: string;
   summary?: string;
   uploaded: boolean;
   downloadPath: string;
