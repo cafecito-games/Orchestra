@@ -302,6 +302,16 @@ func (service *Service) scheduleReadyTasks() {
 			}
 
 			effectiveRequirements := mergeProjectProfileRequirements(state, task.Requirements)
+			effectiveOverride := task.PlacementOverride
+			if retainedLease, hasRetained := retainedWorkspaceLeaseForTask(state, task); hasRetained {
+				if effectiveOverride == nil {
+					effectiveOverride = &protocol.PlacementOverride{NodeID: retainedLease.NodeID}
+				} else if effectiveOverride.NodeID == "" {
+					overrideCopy := *effectiveOverride
+					overrideCopy.NodeID = retainedLease.NodeID
+					effectiveOverride = &overrideCopy
+				}
+			}
 
 			if resident, allocation, found := service.findReusableResident(state, task, effectiveRequirements); found {
 				dispatchMessage := service.assignTaskToResident(state, &task, &resident, &allocation, effectiveRequirements, nowText)
@@ -337,13 +347,13 @@ func (service *Service) scheduleReadyTasks() {
 				continue
 			}
 
-			if service.hasProvisioningCompatibleInstance(state, task.ThreadID, effectiveRequirements, task.PlacementOverride) {
+			if service.hasProvisioningCompatibleInstance(state, task.ThreadID, effectiveRequirements, effectiveOverride) {
 				continue
 			}
 
-			selection, diagnostic := service.selectOfferingForRequirements(state, effectiveRequirements, task.PlacementOverride, true)
+			selection, diagnostic := service.selectOfferingForRequirements(state, effectiveRequirements, effectiveOverride, true)
 			if selection == nil {
-				if drainedNodeID, drainedInstanceID, drainedAllocationID, didDrain := service.evictIdleAutoManagedInstance(state, effectiveRequirements, task.PlacementOverride, nowText); didDrain {
+				if drainedNodeID, drainedInstanceID, drainedAllocationID, didDrain := service.evictIdleAutoManagedInstance(state, effectiveRequirements, effectiveOverride, nowText); didDrain {
 					drains = append(drains, struct {
 						nodeID       string
 						instanceID   string
@@ -491,6 +501,8 @@ func (service *Service) findReusableResident(
 	activeCooldowns := service.activeOfferingCooldownsInState(state, "", service.now())
 	var candidates []candidate
 
+	retainedLease, hasRetainedLease := retainedWorkspaceLeaseForTask(state, task)
+
 	for _, instance := range state.Instances {
 		if instance.ThreadID != task.ThreadID {
 			continue
@@ -506,6 +518,9 @@ func (service *Service) findReusableResident(
 			continue
 		}
 		if task.PlacementOverride != nil && task.PlacementOverride.NodeID != "" && allocation.NodeID != task.PlacementOverride.NodeID {
+			continue
+		}
+		if hasRetainedLease && allocation.NodeID != retainedLease.NodeID {
 			continue
 		}
 
@@ -550,7 +565,16 @@ func (service *Service) findReusableResident(
 			candidateWorkspace = resolvedSourcePath
 		}
 		hasBinding := false
-		if requirements.Workspace == nil || (requirements.Workspace.Isolation == "" && requirements.Workspace.SourceLeaseID == "") {
+		if hasRetainedLease {
+			_, hasBinding = findIdleSessionBinding(
+				state,
+				instance.ID,
+				allocation.ID,
+				allocation.HarnessID,
+				allocation.Transport,
+				retainedLease.WorktreePath,
+			)
+		} else if requirements.Workspace == nil || (requirements.Workspace.Isolation == "" && requirements.Workspace.SourceLeaseID == "") {
 			_, hasBinding = findIdleSessionBinding(
 				state,
 				instance.ID,
@@ -660,7 +684,20 @@ func (service *Service) assignTaskToResident(
 
 	var leaseGrantPtr *protocol.WorkspaceLeaseGrant
 	var leaseIDPtr *string
-	if requirements.Workspace != nil && (requirements.Workspace.Isolation != "" || requirements.Workspace.SourceLeaseID != "") {
+	reusedLease := false
+	if retainedLease, hasRetained := retainedWorkspaceLeaseForTask(state, *task); hasRetained && retainedLease.NodeID == node.ID {
+		retainedLease.Status = "retained"
+		retainedLease.RunID = runID
+		retainedLease.UpdatedAt = nowText
+		state.WorkspaceLeases[retainedLease.ID] = retainedLease
+		leaseIDCopy := retainedLease.ID
+		leaseIDPtr = &leaseIDCopy
+		grant := retainedLease.Grant()
+		leaseGrantPtr = &grant
+		workspacePath = retainedLease.WorktreePath
+		task.RetainedLeaseID = ""
+		reusedLease = true
+	} else if requirements.Workspace != nil && (requirements.Workspace.Isolation != "" || requirements.Workspace.SourceLeaseID != "") {
 		lease := buildTaskWorkspaceLeaseInState(
 			state,
 			*task,
@@ -683,7 +720,7 @@ func (service *Service) assignTaskToResident(
 
 	var dispatchBindingPtr *protocol.DispatchSessionBinding
 	var bindingIDPtr *string
-	if leaseIDPtr == nil {
+	if leaseIDPtr == nil || reusedLease {
 		if foundBinding, exists := findIdleSessionBinding(
 			state,
 			instance.ID,
@@ -1470,16 +1507,48 @@ func composeTaskPrompt(state *store.State, task protocol.Task) string {
 			)
 		}
 	}
-	if task.LastRunOutput != "" && (hasUnreadNudge || task.NudgedAtRoomSequence > 0) {
+	if task.LastRunOutput != "" {
 		builder.WriteString("\nPrior Run Output:\n")
 		builder.WriteString(task.LastRunOutput)
 		if !strings.HasSuffix(task.LastRunOutput, "\n") {
 			builder.WriteByte('\n')
 		}
 	}
+	var taskReplies []protocol.TaskMessage
+	for _, message := range collectThreadMessages(state, task.ThreadID) {
+		if message.Recipient.Kind == "task" && message.Recipient.TaskID == task.ID {
+			taskReplies = append(taskReplies, message)
+		}
+	}
+	if len(taskReplies) > 0 {
+		if len(taskReplies) > 10 {
+			taskReplies = taskReplies[len(taskReplies)-10:]
+		}
+		builder.WriteString("\nTask Replies & Guidance:\n")
+		for _, message := range taskReplies {
+			fmt.Fprintf(&builder, "- [%s] %s\n", message.Kind, message.Body)
+		}
+	}
 	builder.WriteString("\nInstructions:\n")
 	builder.WriteString(task.Instructions)
 	return protocol.TruncateUTF8Head(builder.String(), protocol.PromptMaximumBytes)
+}
+
+func retainedWorkspaceLeaseForTask(state *store.State, task protocol.Task) (protocol.WorkspaceLease, bool) {
+	if task.RetainedLeaseID == "" {
+		return protocol.WorkspaceLease{}, false
+	}
+	lease, exists := state.WorkspaceLeases[task.RetainedLeaseID]
+	if !exists {
+		return protocol.WorkspaceLease{}, false
+	}
+	if lease.Policy != protocol.WorkspaceIsolationGitWorktree || lease.ReadOnly || lease.SourceLeaseID != "" {
+		return protocol.WorkspaceLease{}, false
+	}
+	if lease.Status != "retained" && lease.Status != "released" {
+		return protocol.WorkspaceLease{}, false
+	}
+	return lease, true
 }
 
 func countActiveRunsOnNode(state *store.State, nodeID string) int {

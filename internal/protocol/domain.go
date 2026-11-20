@@ -33,12 +33,17 @@ const (
 	InstanceCollectionEntries         = 1024
 	InstanceRequirementEntries        = 64
 	InstanceCountMaximum              = 65535
+	TaskBlockerKindNeedsInput         = "needs_input"
+	TaskBlockerKindAwaitingDecision   = "awaiting_decision"
+	TaskBlockerKindExternalDependency = "external_dependency"
+	TaskBlockerKindDependency         = "dependency"
 )
 
 var (
 	ThreadStatuses              = []string{"open", "resolved"}
 	TaskStatuses                = []string{"pending", "ready", "running", "blocked", "completed", "failed", "cancelled"}
 	TerminalTaskStatuses        = []string{"completed", "failed", "cancelled"}
+	TaskBlockerKinds            = []string{TaskBlockerKindNeedsInput, TaskBlockerKindAwaitingDecision, TaskBlockerKindExternalDependency, TaskBlockerKindDependency}
 	DependencyPolicies          = []string{"require-success", "allow-failure"}
 	RunStatuses                 = []string{"queued", "running", "completed", "failed", "cancelled"}
 	InstanceStatuses            = []string{"requested", "provisioning", "ready", "busy", "idle", "draining", "released", "failed"}
@@ -78,10 +83,10 @@ func IsTerminalRunStatus(status string) bool {
 var taskTransitions = map[string][]string{
 	"pending":   {"ready", "blocked", "cancelled"},
 	"ready":     {"running", "blocked", "cancelled"},
-	"running":   {"ready", "completed", "failed", "cancelled"},
-	"blocked":   {"cancelled"},
+	"running":   {"ready", "blocked", "completed", "failed", "cancelled"},
+	"blocked":   {"pending", "ready", "cancelled"},
 	"completed": {},
-	"failed":    {},
+	"failed":    {"pending", "ready"},
 	"cancelled": {},
 }
 
@@ -256,7 +261,9 @@ type Task struct {
 	Assignment           *TaskAssignment       `json:"assignment,omitempty"`
 	Summary              string                `json:"summary,omitempty"`
 	Progress             string                `json:"progress,omitempty"`
+	BlockerKind          string                `json:"blockerKind,omitempty"`
 	BlockerReason        string                `json:"blockerReason,omitempty"`
+	RetainedLeaseID      string                `json:"retainedLeaseId,omitempty"`
 	ArtifactIDs          []string              `json:"artifactIds,omitempty"`
 	LastRunOutput        string                `json:"lastRunOutput,omitempty"`
 	LastReadRoomSequence int64                 `json:"lastReadRoomSequence"`

@@ -172,7 +172,11 @@ export function ThreadDetail({ id }: { id: string }) {
         ) : null}
       </div>
 
-      <NeedsAttentionSection items={attentionItems} currentThreadId={thread.id} />
+      <NeedsAttentionSection
+        items={attentionItems}
+        currentThreadId={thread.id}
+        onReload={reloadAll}
+      />
 
       <ProgressReel artifacts={imageArtifacts} onDownload={downloadArtifact} />
 

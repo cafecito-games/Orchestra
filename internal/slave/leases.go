@@ -187,7 +187,7 @@ func (coordinator *leaseCoordinator) provisionForRun(
 	}
 
 	currentStatus := grant.Status
-	if currentStatus == "requested" {
+	if currentStatus == "requested" || currentStatus == "retained" {
 		_ = coordinator.sendTransition(
 			operationContext,
 			run.ID,
@@ -196,7 +196,9 @@ func (coordinator *leaseCoordinator) provisionForRun(
 			grant.ID,
 			false,
 		)
-		grant.Status = currentStatus
+		if grant.Status != "retained" {
+			grant.Status = currentStatus
+		}
 	}
 
 	taskID := ""
@@ -249,7 +251,7 @@ func (coordinator *leaseCoordinator) provisionForRun(
 	}, outcome.Path, nil
 }
 
-func (coordinator *leaseCoordinator) finishForRun(lease *activeRunLease) {
+func (coordinator *leaseCoordinator) finishForRun(lease *activeRunLease, retainForBlocked bool) {
 	if lease == nil {
 		return
 	}
@@ -257,6 +259,24 @@ func (coordinator *leaseCoordinator) finishForRun(lease *activeRunLease) {
 
 	cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	if retainForBlocked && lease.grant.Policy == protocol.WorkspaceIsolationGitWorktree && lease.grant.SourceLeaseID == "" {
+		outcome := workspace.Outcome{
+			Status:               "retained",
+			RetentionReason:      "task-blocked",
+			ResolvedBaseRevision: lease.grant.ResolvedBaseRevision,
+			Detail:               "retained workspace worktree while task is blocked",
+		}
+		coordinator.client.activityLogger.Info(
+			"lease",
+			outcome.Status,
+			activitylog.String("lease", lease.grant.ID),
+			activitylog.String("run", lease.runID),
+			activitylog.String("reason", outcome.RetentionReason),
+		)
+		_ = coordinator.sendTransition(cleanupContext, lease.runID, &lease.currentStatus, outcome, lease.grant.ID, false)
+		return
+	}
 
 	_ = coordinator.sendTransition(
 		cleanupContext,
@@ -268,7 +288,13 @@ func (coordinator *leaseCoordinator) finishForRun(lease *activeRunLease) {
 	)
 	lease.grant.Status = lease.currentStatus
 
-	outcome := coordinator.manager.Cleanup(cleanupContext, lease.grant, lease.runID, workspace.ModeRun, func() {
+	cleanupRunID := lease.runID
+	if lease.grant.SourceLeaseID == "" {
+		if branchRunID := runIDFromBranch(lease.grant.Branch); branchRunID != "" {
+			cleanupRunID = branchRunID
+		}
+	}
+	outcome := coordinator.manager.Cleanup(cleanupContext, lease.grant, cleanupRunID, workspace.ModeRun, func() {
 		_ = coordinator.sendTransition(
 			cleanupContext,
 			lease.runID,

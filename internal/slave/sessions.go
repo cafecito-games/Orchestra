@@ -38,6 +38,7 @@ type runSession struct {
 	resident  residentInstance
 	cancel    context.CancelFunc
 	cancelled atomic.Bool
+	yielded   atomic.Bool
 
 	sequence atomic.Int64
 
@@ -148,12 +149,15 @@ func (client *Client) handleDispatch(message protocol.MasterControlMessage) {
 	})
 }
 
-func (client *Client) cancelRun(runID string) {
+func (client *Client) cancelRun(runID string, mode string) {
 	client.mutex.Lock()
 	session, exists := client.sessions[runID]
 	client.mutex.Unlock()
 	if !exists {
 		return
+	}
+	if mode == "yield" {
+		session.yielded.Store(true)
 	}
 	session.cancelled.Store(true)
 	session.cancelAllApprovals()
@@ -205,7 +209,9 @@ func (session *runSession) execute(
 		}
 		activeLease = leaseHandle
 		workingDirectory = provisionedPath
-		defer session.client.leases.finishForRun(activeLease)
+		defer func() {
+			session.client.leases.finishForRun(activeLease, session.yielded.Load())
+		}()
 	} else {
 		canonicalWorkspace, err := VerifyWorkspaceWithinRoots(session.client.node.WorkspaceRoots, workingDirectory)
 		if err != nil {

@@ -224,7 +224,7 @@ func (client *Client) handleInstanceRelease(instanceID, allocationID, mode strin
 	client.mutex.Unlock()
 
 	if runIDToCancel != "" {
-		client.cancelRun(runIDToCancel)
+		client.cancelRun(runIDToCancel, "")
 	}
 	if shouldEmitReleased {
 		client.activityLogger.Info(

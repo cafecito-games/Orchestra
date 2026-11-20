@@ -87,7 +87,7 @@ func synthesizeThreadEvents(
 			})
 			continue
 		}
-		if beforeTask.Status != afterTask.Status || beforeTask.Summary != afterTask.Summary || beforeTask.BlockerReason != afterTask.BlockerReason || !reflect.DeepEqual(beforeTask.Assignment, afterTask.Assignment) {
+		if beforeTask.Status != afterTask.Status || beforeTask.Summary != afterTask.Summary || beforeTask.BlockerKind != afterTask.BlockerKind || beforeTask.BlockerReason != afterTask.BlockerReason || !reflect.DeepEqual(beforeTask.Assignment, afterTask.Assignment) {
 			summary := afterTask.Summary
 			if summary == "" {
 				if afterTask.BlockerReason != "" {

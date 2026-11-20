@@ -156,34 +156,35 @@ func (service *Service) handleRunCompleted(nodeID string, message protocol.Slave
 		service.releaseInstanceAfterRunInState(state, runRecord.InstanceID, nowText)
 
 		if runRecord.TaskID != nil {
-			if task, taskExists := state.Tasks[*runRecord.TaskID]; taskExists && !protocol.IsTerminalTaskStatus(task.Status) {
-				if task.Status != "blocked" {
-					if task.RequiredRoomSequence > task.LastReadRoomSequence && task.NudgedAtRoomSequence < task.RequiredRoomSequence {
-						currentAttempts := task.AttemptCount
-						if runRecord.Attempt != nil && *runRecord.Attempt > currentAttempts {
-							currentAttempts = *runRecord.Attempt
-						}
-						if currentAttempts < 1 {
-							currentAttempts = 1
-						}
-						task.NudgedAtRoomSequence = task.RequiredRoomSequence
-						task.Status = "ready"
-						task.Assignment = nil
-						task.PreferredInstanceID = runRecord.InstanceID
-						task.AttemptCount = currentAttempts
-						task.MaxAttempts = currentAttempts + 1
-						if runRecord.Output != "" {
-							task.LastRunOutput = protocol.TruncateUTF8Head(runRecord.Output, 4000)
-						} else if task.Summary != "" {
-							task.LastRunOutput = protocol.TruncateUTF8Head(service.redactor.Redact(task.Summary), 4000)
-						}
-					} else {
-						task.Status = "completed"
-						if task.Summary == "" && runRecord.Output != "" {
-							task.Summary = protocol.TruncateUTF8Head(runRecord.Output, 2000)
-						}
-						task.FinishedAt = nowText
+			if task, taskExists := state.Tasks[*runRecord.TaskID]; taskExists &&
+				!protocol.IsTerminalTaskStatus(task.Status) &&
+				task.Status != "blocked" &&
+				(task.Assignment == nil || task.Assignment.RunID == runRecord.ID) {
+				if task.RequiredRoomSequence > task.LastReadRoomSequence && task.NudgedAtRoomSequence < task.RequiredRoomSequence {
+					currentAttempts := task.AttemptCount
+					if runRecord.Attempt != nil && *runRecord.Attempt > currentAttempts {
+						currentAttempts = *runRecord.Attempt
 					}
+					if currentAttempts < 1 {
+						currentAttempts = 1
+					}
+					task.NudgedAtRoomSequence = task.RequiredRoomSequence
+					task.Status = "ready"
+					task.Assignment = nil
+					task.PreferredInstanceID = runRecord.InstanceID
+					task.AttemptCount = currentAttempts
+					task.MaxAttempts = currentAttempts + 1
+					if runRecord.Output != "" {
+						task.LastRunOutput = protocol.TruncateUTF8Head(runRecord.Output, 4000)
+					} else if task.Summary != "" {
+						task.LastRunOutput = protocol.TruncateUTF8Head(service.redactor.Redact(task.Summary), 4000)
+					}
+				} else {
+					task.Status = "completed"
+					if task.Summary == "" && runRecord.Output != "" {
+						task.Summary = protocol.TruncateUTF8Head(runRecord.Output, 2000)
+					}
+					task.FinishedAt = nowText
 				}
 				task.UpdatedAt = nowText
 				state.Tasks[task.ID] = task
@@ -254,7 +255,10 @@ func (service *Service) handleRunFailed(nodeID string, message protocol.SlaveCon
 
 		willRetry := false
 		if runRecord.TaskID != nil {
-			if task, taskExists := state.Tasks[*runRecord.TaskID]; taskExists && !protocol.IsTerminalTaskStatus(task.Status) {
+			if task, taskExists := state.Tasks[*runRecord.TaskID]; taskExists &&
+				!protocol.IsTerminalTaskStatus(task.Status) &&
+				task.Status != "blocked" &&
+				(task.Assignment == nil || task.Assignment.RunID == runRecord.ID) {
 				if retryEligible && task.AttemptCount < task.MaxAttempts {
 					willRetry = true
 					task.Status = "ready"
@@ -317,7 +321,10 @@ func (service *Service) handleRunCancelled(nodeID string, message protocol.Slave
 		service.releaseInstanceAfterRunInState(state, runRecord.InstanceID, nowText)
 
 		if runRecord.TaskID != nil {
-			if task, taskExists := state.Tasks[*runRecord.TaskID]; taskExists && !protocol.IsTerminalTaskStatus(task.Status) {
+			if task, taskExists := state.Tasks[*runRecord.TaskID]; taskExists &&
+				!protocol.IsTerminalTaskStatus(task.Status) &&
+				task.Status != "blocked" &&
+				(task.Assignment == nil || task.Assignment.RunID == runRecord.ID) {
 				task.Status = "cancelled"
 				task.UpdatedAt = nowText
 				task.FinishedAt = nowText

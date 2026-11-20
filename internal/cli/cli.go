@@ -69,6 +69,8 @@ func Run(
 		return runThreads(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "thread":
 		return runThreadDetail(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
+	case "task":
+		return runTask(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "room":
 		return runRoom(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "mail":
@@ -109,6 +111,7 @@ Operator Commands:
   nodes       List worker machines, refresh/clone repositories, or trigger self-updates (nodes refresh|clone|update)
   threads     List coordination threads on the orchestrator
   thread      Inspect a thread's task DAG, resident instances, runs, messages, and transcripts
+  task        Manage task lifecycle recovery (task unblock|reopen)
   room        Read, post, nudge, or locate a thread's shared blackboard room
   mail        List <handle>@<host> agent mailboxes, send or read agent mail, and rename handles
   approvals   List worker permission requests

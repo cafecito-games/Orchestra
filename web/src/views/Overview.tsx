@@ -53,7 +53,7 @@ function Metric({
 
 export function Overview() {
   const { pollMs, refreshNonce } = useLive();
-  const { data, error } = usePolledFetch<OverviewData>(
+  const { data, error, reload } = usePolledFetch<OverviewData>(
     async () => {
       const [status, nodes, recentThreads, openThreadsResponse, approvals] =
         await Promise.all([
@@ -157,7 +157,11 @@ export function Overview() {
         </div>
       </div>
 
-      <NeedsAttentionSection items={attentionItems} initialVisibleCount={8} />
+      <NeedsAttentionSection
+        items={attentionItems}
+        initialVisibleCount={8}
+        onReload={reload}
+      />
 
       <div className="section">
         <SectionHead
