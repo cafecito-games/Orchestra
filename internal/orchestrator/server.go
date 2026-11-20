@@ -979,20 +979,72 @@ func (service *Service) handleAPIRunSubroutes(writer http.ResponseWriter, reques
 func (service *Service) handleAPITaskSubroutes(writer http.ResponseWriter, request *http.Request) {
 	remainder := strings.TrimPrefix(request.URL.Path, "/api/tasks/")
 	taskID, action, hasAction := strings.Cut(remainder, "/")
-	if !hasAction || action != "cancel" {
+	if !hasAction {
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
-	if request.Method != http.MethodPost {
-		writer.WriteHeader(http.StatusMethodNotAllowed)
-		return
+	operatorCaller := CallerIdentity{Kind: "operator", OperatorID: "cli"}
+	switch action {
+	case "cancel":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		result, err := service.CancelTarget(taskID)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	case "unblock":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input UnblockTaskInput
+		if request.Body != nil {
+			if err := json.NewDecoder(io.LimitReader(request.Body, 64*1024)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+				writeOperationError(writer, invalidRequest("malformed JSON body"))
+				return
+			}
+		}
+		if strings.TrimSpace(input.TaskID) != "" && strings.TrimSpace(input.TaskID) != taskID {
+			writeOperationError(writer, invalidRequest("taskId in body does not match URL path"))
+			return
+		}
+		input.TaskID = taskID
+		result, err := service.UnblockTask(operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	case "reopen":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input ReopenTaskInput
+		if request.Body != nil {
+			if err := json.NewDecoder(io.LimitReader(request.Body, 64*1024)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+				writeOperationError(writer, invalidRequest("malformed JSON body"))
+				return
+			}
+		}
+		if strings.TrimSpace(input.TaskID) != "" && strings.TrimSpace(input.TaskID) != taskID {
+			writeOperationError(writer, invalidRequest("taskId in body does not match URL path"))
+			return
+		}
+		input.TaskID = taskID
+		result, err := service.ReopenTask(operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	default:
+		writer.WriteHeader(http.StatusNotFound)
 	}
-	result, err := service.CancelTarget(taskID)
-	if err != nil {
-		writeOperationError(writer, err)
-		return
-	}
-	writeJSONResponse(writer, http.StatusOK, result)
 }
 
 func (service *Service) handleAPICancelTarget(writer http.ResponseWriter, request *http.Request) {

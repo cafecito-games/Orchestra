@@ -364,14 +364,38 @@ var definitions = map[string]toolDefinition{
 	},
 	"update_task": {
 		title:       "Update task",
-		description: "As the task's current assignee, report progress, an advisory blocked reason (null clears it), or completion fields.",
+		description: "As the task's current assignee, report progress, yield as blocked with blockerKind/blockerReason, or report completion fields.",
 		input: object(schema{
 			"idempotencyKey": text(),
+			"status":         enum("blocked", "completed"),
 			"progress":       text(),
+			"blockerKind":    enum(protocol.TaskBlockerKinds...),
+			"blockerReason":  text(),
 			"blockedReason":  schema{"type": []string{"string", "null"}},
 			"completion":     object(schema{"summary": text(), "artifactIds": list(text())}, "summary"),
 		}, "idempotencyKey"),
 		output: resultSchema(schema{"created": boolean(), "updateId": text(), "task": anyObject()}, "created", "updateId", "task"),
+	},
+	"unblock_task": {
+		title:       "Unblock task",
+		description: "Idempotently unblock a blocked delegated child task back to ready (or pending if dependencies are unsatisfied), clearing blocker metadata and optionally recording a resolution note.",
+		input: object(schema{
+			"taskId":         text(),
+			"idempotencyKey": text(),
+			"note":           text(),
+		}, "taskId", "idempotencyKey"),
+		output: resultSchema(schema{"task": anyObject(), "replayed": boolean()}, "task", "replayed"),
+	},
+	"reopen_task": {
+		title:       "Reopen task",
+		description: "Idempotently reopen a failed delegated child task back to ready (or pending if dependencies are unsatisfied) with a fresh attempt budget.",
+		input: object(schema{
+			"taskId":             text(),
+			"idempotencyKey":     text(),
+			"note":               text(),
+			"additionalAttempts": schema{"type": "integer", "minimum": 1, "maximum": protocol.MaximumTaskAttempts},
+		}, "taskId", "idempotencyKey"),
+		output: resultSchema(schema{"task": anyObject(), "replayed": boolean()}, "task", "replayed"),
 	},
 	"get_mail_identity": {
 		title:       "Get mail identity",

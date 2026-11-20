@@ -30,7 +30,7 @@ var (
 	WorkspaceCleanupPolicies   = []string{WorkspaceCleanupRetain, WorkspaceCleanupWhenUnchanged}
 	WorkspaceCleanupModes      = []string{WorkspaceCleanupModeReconcile, WorkspaceCleanupModeOperator}
 	WorkspaceLeaseStatuses     = []string{"requested", "provisioning", "active", "released", "cleaning", "retained", "cleaned", "failed"}
-	WorkspaceRetentionReasons  = []string{"dirty", "untracked", "diverged", "locked", "unregistered", "identity-mismatch", "ambiguous", "operator-hold", "policy"}
+	WorkspaceRetentionReasons  = []string{"dirty", "untracked", "diverged", "locked", "unregistered", "identity-mismatch", "ambiguous", "operator-hold", "policy", "task-blocked"}
 
 	workspaceLeaseIdentityPattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,95}$`)
 	workspaceLeaseBaseBranchPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$`)
@@ -44,7 +44,7 @@ var WorkspaceLeaseTransitions = map[string][]string{
 	"active":       {"released", "retained"},
 	"released":     {"cleaning", "retained"},
 	"cleaning":     {"cleaned", "retained", "failed"},
-	"retained":     {"cleaning"},
+	"retained":     {"provisioning", "active", "cleaning"},
 	"cleaned":      {},
 	"failed":       {},
 }

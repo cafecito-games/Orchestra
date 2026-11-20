@@ -224,7 +224,7 @@ func (manager *Manager) Provision(operationContext context.Context, grant protoc
 	if problem := manager.checkGrant(grant, runID); problem != "" {
 		return failed(problem)
 	}
-	if !slices.Contains([]string{"requested", "provisioning", "active"}, grant.Status) {
+	if !slices.Contains([]string{"requested", "provisioning", "active", "retained"}, grant.Status) {
 		return failed("the workspace lease is not in a provisionable status")
 	}
 	if manager.tombstoned(grant) {
@@ -236,7 +236,12 @@ func (manager *Manager) Provision(operationContext context.Context, grant protoc
 	if grant.Policy == protocol.WorkspaceIsolationExclusiveExisting {
 		return manager.provisionExclusive(grant)
 	}
-	if !protocol.IsWorkspaceLeaseIdentity(taskID) || grant.Branch != protocol.WorkspaceLeaseBranch(taskID, runID) {
+	if grant.Status == "retained" {
+		branchTaskID, branchRunID, found := strings.Cut(strings.TrimPrefix(grant.Branch, protocol.WorkspaceLeaseBranchPrefix), "/")
+		if !found || !protocol.IsWorkspaceLeaseIdentity(taskID) || branchTaskID != taskID || !protocol.IsWorkspaceLeaseIdentity(branchRunID) {
+			return failed("workspace lease branch does not match its task")
+		}
+	} else if !protocol.IsWorkspaceLeaseIdentity(taskID) || grant.Branch != protocol.WorkspaceLeaseBranch(taskID, runID) {
 		return failed("workspace lease branch does not match its task and run")
 	}
 	if manager.git == nil {
@@ -561,7 +566,11 @@ func (manager *Manager) checkGrant(grant protocol.WorkspaceLeaseGrant, runID str
 		}
 		return ""
 	}
-	if !found || !protocol.IsWorkspaceLeaseIdentity(taskID) || runIdentifier != runID || !protocol.IsWorkspaceLeaseIdentity(runID) {
+	if grant.Status == "retained" {
+		if !found || !protocol.IsWorkspaceLeaseIdentity(taskID) || !protocol.IsWorkspaceLeaseIdentity(runIdentifier) || !protocol.IsWorkspaceLeaseIdentity(runID) {
+			return "workspace lease branch does not match its task and run"
+		}
+	} else if !found || !protocol.IsWorkspaceLeaseIdentity(taskID) || runIdentifier != runID || !protocol.IsWorkspaceLeaseIdentity(runID) {
 		return "workspace lease branch does not match its task and run"
 	}
 	if grant.WorktreePath != filepath.Join(grant.Root, filepath.FromSlash(protocol.WorkspaceLeaseManagedDirectory), grant.ID) {

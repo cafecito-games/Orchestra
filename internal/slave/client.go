@@ -468,7 +468,7 @@ func (client *Client) dispatchMasterMessage(message protocol.MasterControlMessag
 		client.handleDispatch(message)
 	case "cancel":
 		if message.RunID != "" {
-			client.cancelRun(message.RunID)
+			client.cancelRun(message.RunID, message.Mode)
 		}
 	case "approval.decision":
 		client.handleApprovalDecision(message.Decision)

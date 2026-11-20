@@ -17,10 +17,10 @@ func TestStateTransitions(t *testing.T) {
 		expectedTaskTransitions := map[string][]string{
 			"pending":   {"ready", "blocked", "cancelled"},
 			"ready":     {"running", "blocked", "cancelled"},
-			"running":   {"ready", "completed", "failed", "cancelled"},
-			"blocked":   {"cancelled"},
+			"running":   {"ready", "blocked", "completed", "failed", "cancelled"},
+			"blocked":   {"pending", "ready", "cancelled"},
 			"completed": {},
-			"failed":    {},
+			"failed":    {"pending", "ready"},
 			"cancelled": {},
 		}
 
@@ -34,11 +34,17 @@ func TestStateTransitions(t *testing.T) {
 
 		for _, terminalStatus := range protocol.TerminalTaskStatuses {
 			assert.True(t, protocol.IsTerminalTaskStatus(terminalStatus))
+		}
+		for _, immutableTerminal := range []string{"completed", "cancelled"} {
 			for _, activeStatus := range []string{"pending", "ready", "running", "blocked"} {
-				assert.False(t, protocol.CanTransitionTask(terminalStatus, activeStatus),
-					"terminal task %s should not transition to active %s", terminalStatus, activeStatus)
+				assert.False(t, protocol.CanTransitionTask(immutableTerminal, activeStatus),
+					"terminal task %s should not transition to active %s", immutableTerminal, activeStatus)
 			}
 		}
+		assert.True(t, protocol.CanTransitionTask("failed", "ready"))
+		assert.True(t, protocol.CanTransitionTask("failed", "pending"))
+		assert.False(t, protocol.CanTransitionTask("failed", "running"))
+		assert.False(t, protocol.CanTransitionTask("failed", "blocked"))
 
 		assert.False(t, protocol.CanTransitionTask("unknown", "ready"))
 		assert.False(t, protocol.CanTransitionTask("pending", "unknown"))
@@ -152,7 +158,7 @@ func TestStateTransitions(t *testing.T) {
 			"active":       {"released", "retained"},
 			"released":     {"cleaning", "retained"},
 			"cleaning":     {"cleaned", "retained", "failed"},
-			"retained":     {"cleaning"},
+			"retained":     {"provisioning", "active", "cleaning"},
 			"cleaned":      {},
 			"failed":       {},
 		}

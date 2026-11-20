@@ -90,10 +90,34 @@ type UpdateTaskInput struct {
 	Status         string               `json:"status,omitempty"`
 	Summary        *string              `json:"summary,omitempty"`
 	Progress       *string              `json:"progress,omitempty"`
+	BlockerKind    *string              `json:"blockerKind,omitempty"`
 	BlockerReason  *string              `json:"blockerReason,omitempty"`
 	BlockedReason  NullableString       `json:"blockedReason"`
 	ArtifactIDs    []string             `json:"artifactIds,omitempty"`
 	Completion     *TaskCompletionInput `json:"completion,omitempty"`
+}
+
+type UnblockTaskInput struct {
+	TaskID         string `json:"taskId"`
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
+	Note           string `json:"note,omitempty"`
+}
+
+type UnblockTaskResult struct {
+	Task     protocol.Task `json:"task"`
+	Replayed bool          `json:"replayed"`
+}
+
+type ReopenTaskInput struct {
+	TaskID             string `json:"taskId"`
+	IdempotencyKey     string `json:"idempotencyKey,omitempty"`
+	Note               string `json:"note,omitempty"`
+	AdditionalAttempts int    `json:"additionalAttempts,omitempty"`
+}
+
+type ReopenTaskResult struct {
+	Task     protocol.Task `json:"task"`
+	Replayed bool          `json:"replayed"`
 }
 
 type DependencyTaskSummary struct {
@@ -501,6 +525,12 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 				return invalidRequest("task progress exceeds 8192 bytes")
 			}
 		}
+		if input.BlockerKind != nil {
+			trimmed := strings.TrimSpace(*input.BlockerKind)
+			if trimmed != "" && !slices.Contains(protocol.TaskBlockerKinds, trimmed) {
+				return invalidRequest(fmt.Sprintf("unsupported blockerKind %q", *input.BlockerKind))
+			}
+		}
 		if input.BlockerReason != nil {
 			trimmed := strings.TrimSpace(*input.BlockerReason)
 			if !protocol.IsBoundedString(trimmed, 4096) {
@@ -558,12 +588,16 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 				}
 			}
 		}
+		if input.BlockerKind != nil {
+			task.BlockerKind = strings.TrimSpace(*input.BlockerKind)
+		}
 		if input.BlockerReason != nil {
 			task.BlockerReason = service.redactor.Redact(strings.TrimSpace(*input.BlockerReason))
 		}
 		if input.BlockedReason.Set {
 			if input.BlockedReason.Value == nil {
 				task.BlockerReason = ""
+				task.BlockerKind = ""
 			} else {
 				task.BlockerReason = service.redactor.Redact(strings.TrimSpace(*input.BlockedReason.Value))
 			}
@@ -580,10 +614,12 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 				service.cancelTaskInState(state, mutation, &task, nowText)
 			case protocol.IsTerminalTaskStatus(task.Status):
 				return conflictError("invalid_transition", fmt.Sprintf("task %s is already %s", task.ID, task.Status))
+			case task.Status == "blocked":
+				return conflictError("invalid_transition", fmt.Sprintf("task %s is blocked; use unblock_task to resume it", task.ID))
+			case task.Status == "running" && input.Status == "blocked":
+				service.yieldRunForBlockedTaskInState(state, mutation, &task, nowText)
 			default:
-				allowed := protocol.CanTransitionTask(task.Status, input.Status) ||
-					(task.Status == "running" && input.Status == "blocked")
-				if !allowed {
+				if !protocol.CanTransitionTask(task.Status, input.Status) {
 					return conflictError("invalid_transition", fmt.Sprintf("cannot transition task %s from %s to %s", task.ID, task.Status, input.Status))
 				}
 				task.Status = input.Status
@@ -629,6 +665,352 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 		activitylog.String("summary", statusOrProgress),
 	)
 	return updatedTask, nil
+}
+
+func (service *Service) UnblockTask(caller CallerIdentity, input UnblockTaskInput) (UnblockTaskResult, error) {
+	taskID := strings.TrimSpace(input.TaskID)
+	if !protocol.IsIdentifier(taskID) {
+		return UnblockTaskResult{}, invalidRequest("taskId is required")
+	}
+	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
+	if idempotencyKey != "" && !protocol.IsBoundedString(idempotencyKey, 128) {
+		return UnblockTaskResult{}, invalidRequest("idempotencyKey must be at most 128 bytes")
+	}
+	note := strings.TrimSpace(input.Note)
+	if note != "" && !protocol.IsBoundedString(note, 4096) {
+		return UnblockTaskResult{}, invalidRequest("note exceeds 4096 bytes")
+	}
+
+	sourceKey := caller.SourceKey()
+	receiptKey := sourceKey + "\x00unblock\x00" + taskID + "\x00" + idempotencyKey
+	digest := canonicalDigest(struct {
+		Action string `json:"action"`
+		TaskID string `json:"taskId"`
+		Note   string `json:"note,omitempty"`
+	}{
+		Action: "unblock",
+		TaskID: taskID,
+		Note:   note,
+	})
+
+	var result UnblockTaskResult
+	_, err := service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		task, exists := state.Tasks[taskID]
+		if !exists {
+			return notFound(fmt.Sprintf("task %s does not exist", taskID))
+		}
+		if authErr := authorizeTaskRecoveryCaller(caller, task, "unblock"); authErr != nil {
+			return authErr
+		}
+
+		if idempotencyKey != "" {
+			if existingReceipt, found := state.TaskUpdates[receiptKey]; found {
+				if existingReceipt.Digest != digest {
+					return conflictError("idempotency_conflict", "idempotencyKey was already used with a different unblock_task request")
+				}
+				result = UnblockTaskResult{Task: task, Replayed: true}
+				return nil
+			}
+		}
+
+		if task.Status != "blocked" {
+			return conflictError("invalid_transition", fmt.Sprintf("cannot unblock task %s in status %s (expected blocked)", task.ID, task.Status))
+		}
+		if depErr := checkTaskDependenciesRecoverable(state, task); depErr != nil {
+			return depErr
+		}
+
+		nowText := service.nowUTC()
+		if idempotencyKey != "" {
+			state.TaskUpdates[receiptKey] = protocol.TaskUpdateReceipt{
+				ID:             protocol.NewIdentifier("upd"),
+				TaskID:         taskID,
+				SourceKey:      sourceKey,
+				IdempotencyKey: idempotencyKey,
+				Digest:         digest,
+				CreatedAt:      nowText,
+			}
+		}
+
+		redactedNote := ""
+		if note != "" {
+			redactedNote = service.redactor.Redact(note)
+			recordRecoveryGuidanceMessage(state, caller, task, redactedNote, nowText)
+		}
+
+		task.Status = "pending"
+		task.BlockerKind = ""
+		task.BlockerReason = ""
+		task.PlacementDiagnostic = nil
+		task.Assignment = nil
+		if task.AttemptCount >= task.MaxAttempts {
+			task.MaxAttempts = task.AttemptCount + 1
+		}
+		task.UpdatedAt = nowText
+		state.Tasks[task.ID] = task
+
+		if thread, threadExists := state.Threads[task.ThreadID]; threadExists {
+			if thread.Status == "resolved" {
+				thread.Status = "open"
+			}
+			thread.UpdatedAt = nowText
+			state.Threads[thread.ID] = thread
+		}
+
+		recomputeThreadTaskReadiness(state, task.ThreadID, nowText)
+		updatedTask := state.Tasks[task.ID]
+
+		detail := map[string]any{
+			"action": "unblock",
+			"status": updatedTask.Status,
+		}
+		if redactedNote != "" {
+			detail["note"] = redactedNote
+		}
+		mutation.EmitEvent(protocol.TaskEventEntry{
+			ThreadID:   updatedTask.ThreadID,
+			Type:       "task.unblocked",
+			TaskID:     updatedTask.ID,
+			Status:     updatedTask.Status,
+			Summary:    fmt.Sprintf("Task %q unblocked (%s)", updatedTask.Title, updatedTask.Status),
+			Detail:     detail,
+			OccurredAt: nowText,
+		})
+
+		result = UnblockTaskResult{Task: updatedTask, Replayed: false}
+		mutation.OnCommit(func() {
+			service.TriggerSchedule()
+		})
+		return nil
+	})
+	if err == nil && !result.Replayed {
+		service.logger.Info(
+			"task",
+			"unblocked",
+			activitylog.String("task", result.Task.ID),
+			activitylog.String("thread", result.Task.ThreadID),
+			activitylog.String("status", result.Task.Status),
+		)
+	}
+	return result, err
+}
+
+func (service *Service) ReopenTask(caller CallerIdentity, input ReopenTaskInput) (ReopenTaskResult, error) {
+	taskID := strings.TrimSpace(input.TaskID)
+	if !protocol.IsIdentifier(taskID) {
+		return ReopenTaskResult{}, invalidRequest("taskId is required")
+	}
+	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
+	if idempotencyKey != "" && !protocol.IsBoundedString(idempotencyKey, 128) {
+		return ReopenTaskResult{}, invalidRequest("idempotencyKey must be at most 128 bytes")
+	}
+	note := strings.TrimSpace(input.Note)
+	if note != "" && !protocol.IsBoundedString(note, 4096) {
+		return ReopenTaskResult{}, invalidRequest("note exceeds 4096 bytes")
+	}
+	additionalAttempts := input.AdditionalAttempts
+	if additionalAttempts < 0 || additionalAttempts > protocol.MaximumTaskAttempts {
+		return ReopenTaskResult{}, invalidRequest(fmt.Sprintf("additionalAttempts must be between 1 and %d", protocol.MaximumTaskAttempts))
+	}
+	if additionalAttempts == 0 {
+		additionalAttempts = protocol.MaximumTaskAttempts
+	}
+
+	sourceKey := caller.SourceKey()
+	receiptKey := sourceKey + "\x00reopen\x00" + taskID + "\x00" + idempotencyKey
+	digest := canonicalDigest(struct {
+		Action             string `json:"action"`
+		TaskID             string `json:"taskId"`
+		Note               string `json:"note,omitempty"`
+		AdditionalAttempts int    `json:"additionalAttempts"`
+	}{
+		Action:             "reopen",
+		TaskID:             taskID,
+		Note:               note,
+		AdditionalAttempts: additionalAttempts,
+	})
+
+	var result ReopenTaskResult
+	_, err := service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		task, exists := state.Tasks[taskID]
+		if !exists {
+			return notFound(fmt.Sprintf("task %s does not exist", taskID))
+		}
+		if authErr := authorizeTaskRecoveryCaller(caller, task, "reopen"); authErr != nil {
+			return authErr
+		}
+
+		if idempotencyKey != "" {
+			if existingReceipt, found := state.TaskUpdates[receiptKey]; found {
+				if existingReceipt.Digest != digest {
+					return conflictError("idempotency_conflict", "idempotencyKey was already used with a different reopen_task request")
+				}
+				result = ReopenTaskResult{Task: task, Replayed: true}
+				return nil
+			}
+		}
+
+		if task.Status != "failed" {
+			return conflictError("invalid_transition", fmt.Sprintf("cannot reopen task %s in status %s (expected failed)", task.ID, task.Status))
+		}
+		if depErr := checkTaskDependenciesRecoverable(state, task); depErr != nil {
+			return depErr
+		}
+
+		nowText := service.nowUTC()
+		if idempotencyKey != "" {
+			state.TaskUpdates[receiptKey] = protocol.TaskUpdateReceipt{
+				ID:             protocol.NewIdentifier("upd"),
+				TaskID:         taskID,
+				SourceKey:      sourceKey,
+				IdempotencyKey: idempotencyKey,
+				Digest:         digest,
+				CreatedAt:      nowText,
+			}
+		}
+
+		redactedNote := ""
+		if note != "" {
+			redactedNote = service.redactor.Redact(note)
+			recordRecoveryGuidanceMessage(state, caller, task, redactedNote, nowText)
+		}
+
+		task.Status = "pending"
+		task.FinishedAt = ""
+		task.BlockerKind = ""
+		task.BlockerReason = ""
+		task.PlacementDiagnostic = nil
+		task.Assignment = nil
+		task.MaxAttempts = task.AttemptCount + additionalAttempts
+		task.UpdatedAt = nowText
+		state.Tasks[task.ID] = task
+
+		if thread, threadExists := state.Threads[task.ThreadID]; threadExists {
+			if thread.Status == "resolved" {
+				thread.Status = "open"
+			}
+			thread.UpdatedAt = nowText
+			state.Threads[thread.ID] = thread
+		}
+
+		recomputeThreadTaskReadiness(state, task.ThreadID, nowText)
+		updatedTask := state.Tasks[task.ID]
+
+		detail := map[string]any{
+			"action":             "reopen",
+			"status":             updatedTask.Status,
+			"additionalAttempts": additionalAttempts,
+			"maxAttempts":        updatedTask.MaxAttempts,
+		}
+		if redactedNote != "" {
+			detail["note"] = redactedNote
+		}
+		mutation.EmitEvent(protocol.TaskEventEntry{
+			ThreadID:   updatedTask.ThreadID,
+			Type:       "task.reopened",
+			TaskID:     updatedTask.ID,
+			Status:     updatedTask.Status,
+			Summary:    fmt.Sprintf("Task %q reopened (%s, maxAttempts=%d)", updatedTask.Title, updatedTask.Status, updatedTask.MaxAttempts),
+			Detail:     detail,
+			OccurredAt: nowText,
+		})
+
+		result = ReopenTaskResult{Task: updatedTask, Replayed: false}
+		mutation.OnCommit(func() {
+			service.TriggerSchedule()
+		})
+		return nil
+	})
+	if err == nil && !result.Replayed {
+		service.logger.Info(
+			"task",
+			"reopened",
+			activitylog.String("task", result.Task.ID),
+			activitylog.String("thread", result.Task.ThreadID),
+			activitylog.String("status", result.Task.Status),
+			activitylog.Int("maxAttempts", result.Task.MaxAttempts),
+		)
+	}
+	return result, err
+}
+
+func authorizeTaskRecoveryCaller(caller CallerIdentity, task protocol.Task, action string) error {
+	if caller.Kind != "run" {
+		return nil
+	}
+	if !caller.CanDelegate {
+		return forbiddenError(fmt.Sprintf("this worker instance is not authorized to %s tasks", action))
+	}
+	if caller.ThreadID != "" && task.ThreadID != caller.ThreadID {
+		return forbiddenError(fmt.Sprintf("worker run cannot %s a task in another thread", action))
+	}
+	ownsViaDelegation := (caller.TaskID != "" && task.ParentTaskID == caller.TaskID) ||
+		(caller.RunID != "" && task.CreatedByRunID == caller.RunID)
+	if !ownsViaDelegation {
+		return forbiddenError(fmt.Sprintf("worker run can only %s its delegated child tasks", action))
+	}
+	return nil
+}
+
+func checkTaskDependenciesRecoverable(state *store.State, task protocol.Task) error {
+	for _, dependency := range task.Dependencies {
+		dependencyTask, exists := state.Tasks[dependency.TaskID]
+		if !exists {
+			return conflictError("dependency_missing", fmt.Sprintf("task %s depends on missing task %s", task.ID, dependency.TaskID))
+		}
+		if dependency.Policy == "allow-failure" {
+			continue
+		}
+		if dependencyTask.Status == "failed" || dependencyTask.Status == "cancelled" {
+			return conflictError(
+				"dependency_failed",
+				fmt.Sprintf("task %s depends on %s (%s) which is %s", task.ID, dependencyTask.ID, dependencyTask.Title, dependencyTask.Status),
+			)
+		}
+	}
+	return nil
+}
+
+func recordRecoveryGuidanceMessage(
+	state *store.State,
+	caller CallerIdentity,
+	task protocol.Task,
+	redactedNote string,
+	nowText string,
+) {
+	sender := protocol.MessageEndpoint{
+		Kind:     "orchestrator",
+		ClientID: caller.ClientID,
+	}
+	switch caller.Kind {
+	case "run":
+		sender = protocol.MessageEndpoint{
+			Kind:   "task",
+			TaskID: caller.TaskID,
+			RunID:  caller.RunID,
+		}
+	case "operator":
+		sender = protocol.MessageEndpoint{
+			Kind:     "orchestrator",
+			ClientID: "operator:" + caller.OperatorID,
+		}
+	}
+	messageID := protocol.NewIdentifier("msg")
+	state.Messages[messageID] = protocol.TaskMessage{
+		ID:             messageID,
+		ThreadID:       task.ThreadID,
+		SourceKey:      caller.SourceKey(),
+		IdempotencyKey: messageID,
+		Digest:         canonicalDigest(redactedNote),
+		Sender:         sender,
+		Recipient: protocol.MessageEndpoint{
+			Kind:   "task",
+			TaskID: task.ID,
+		},
+		Kind:      "guidance",
+		Body:      redactedNote,
+		CreatedAt: nowText,
+	}
 }
 
 func (service *Service) GetTaskContext(caller CallerIdentity) (TaskContextResponse, error) {
@@ -783,6 +1165,63 @@ func (service *Service) CancelTarget(targetID string) (CancelResult, error) {
 	return result, err
 }
 
+func (service *Service) yieldRunForBlockedTaskInState(
+	state *store.State,
+	mutation *store.Mutation,
+	task *protocol.Task,
+	nowText string,
+) {
+	if task.Assignment != nil {
+		task.PreferredInstanceID = task.Assignment.InstanceID
+		if runRecord, exists := state.Runs[task.Assignment.RunID]; exists {
+			if runRecord.Output != "" {
+				task.LastRunOutput = protocol.TruncateUTF8Head(runRecord.Output, 4000)
+			}
+			if runRecord.WorkspaceLeaseID != nil {
+				if lease, leaseExists := state.WorkspaceLeases[*runRecord.WorkspaceLeaseID]; leaseExists &&
+					lease.Policy == protocol.WorkspaceIsolationGitWorktree &&
+					!lease.ReadOnly &&
+					lease.SourceLeaseID == "" &&
+					!protocol.IsTerminalWorkspaceLeaseStatus(lease.Status) {
+					task.RetainedLeaseID = lease.ID
+					if lease.Status == "active" || lease.Status == "released" {
+						lease.Status = "retained"
+						lease.RetentionReason = "task-blocked"
+						lease.Detail = "retained workspace worktree while task is blocked"
+						lease.UpdatedAt = nowText
+						state.WorkspaceLeases[lease.ID] = lease
+					}
+				}
+			}
+			if protocol.IsActiveRunStatus(runRecord.Status) {
+				wasQueued := runRecord.Status == "queued"
+				runRecord.Status = "cancelled"
+				runRecord.FinishedAt = &nowText
+				state.Runs[runRecord.ID] = runRecord
+
+				service.settleRunApprovalsInState(state, runRecord.ID, "cancelled", nowText)
+				service.releaseInstanceAfterRunInState(state, runRecord.InstanceID, nowText)
+
+				if !wasQueued {
+					nodeID := runRecord.NodeID
+					runID := runRecord.ID
+					mutation.OnCommit(func() {
+						_ = service.sendToSlave(nodeID, protocol.MasterControlMessage{
+							Type:  "cancel",
+							RunID: runID,
+							Mode:  "yield",
+							At:    service.nowUTC(),
+						})
+					})
+				}
+			}
+		}
+		task.Assignment = nil
+	}
+	task.Status = "blocked"
+	task.UpdatedAt = nowText
+}
+
 func (service *Service) cancelTaskInState(
 	state *store.State,
 	mutation *store.Mutation,
@@ -894,12 +1333,14 @@ func recomputeThreadTaskReadiness(state *store.State, threadID string, nowText s
 		changed = false
 		for _, taskID := range sortedTaskIDs(state, threadID) {
 			task := state.Tasks[taskID]
-			if task.Status != "pending" && task.Status != "ready" {
+			isAutoDependencyBlocked := task.Status == "blocked" && task.BlockerKind == protocol.TaskBlockerKindDependency
+			if task.Status != "pending" && task.Status != "ready" && !isAutoDependencyBlocked {
 				continue
 			}
 
 			allSatisfied := true
 			blockedReason := ""
+			var waitingBlockedDeps []protocol.Task
 
 			for _, dependency := range task.Dependencies {
 				dependencyTask, exists := state.Tasks[dependency.TaskID]
@@ -910,16 +1351,22 @@ func recomputeThreadTaskReadiness(state *store.State, threadID string, nowText s
 				}
 				switch dependency.Policy {
 				case "allow-failure":
-					if !protocol.IsTerminalTaskStatus(dependencyTask.Status) && dependencyTask.Status != "blocked" {
+					if !protocol.IsTerminalTaskStatus(dependencyTask.Status) {
 						allSatisfied = false
+						if dependencyTask.Status == "blocked" {
+							waitingBlockedDeps = append(waitingBlockedDeps, dependencyTask)
+						}
 					}
 				default:
 					if dependencyTask.Status == "completed" {
 						continue
 					}
 					allSatisfied = false
-					if dependencyTask.Status == "failed" || dependencyTask.Status == "cancelled" || dependencyTask.Status == "blocked" {
+					switch dependencyTask.Status {
+					case "failed", "cancelled":
 						blockedReason = fmt.Sprintf("dependency %s (%s) %s", dependencyTask.ID, dependencyTask.Title, dependencyTask.Status)
+					case "blocked":
+						waitingBlockedDeps = append(waitingBlockedDeps, dependencyTask)
 					}
 				}
 				if blockedReason != "" {
@@ -927,22 +1374,94 @@ func recomputeThreadTaskReadiness(state *store.State, threadID string, nowText s
 				}
 			}
 
-			if blockedReason != "" && task.Status != "blocked" {
-				task.Status = "blocked"
-				task.BlockerReason = blockedReason
+			if blockedReason != "" {
+				if task.Status != "blocked" || task.BlockerReason != blockedReason || task.BlockerKind != protocol.TaskBlockerKindDependency {
+					task.Status = "blocked"
+					task.BlockerKind = protocol.TaskBlockerKindDependency
+					task.BlockerReason = blockedReason
+					task.UpdatedAt = nowText
+					state.Tasks[taskID] = task
+					changed = true
+				}
+				continue
+			}
+
+			if isAutoDependencyBlocked {
+				task.Status = "pending"
+				task.BlockerKind = ""
+				task.BlockerReason = ""
+				task.UpdatedAt = nowText
+				state.Tasks[taskID] = task
+				changed = true
+			}
+
+			if allSatisfied && task.Status == "pending" {
+				task.Status = "ready"
+				task.PlacementDiagnostic = clearDependencyReadinessDiagnostics(task.PlacementDiagnostic)
 				task.UpdatedAt = nowText
 				state.Tasks[taskID] = task
 				changed = true
 				continue
 			}
-			if blockedReason == "" && allSatisfied && task.Status == "pending" {
-				task.Status = "ready"
-				task.UpdatedAt = nowText
-				state.Tasks[taskID] = task
-				changed = true
+
+			if task.Status == "pending" {
+				if len(waitingBlockedDeps) > 0 {
+					unsatisfied := make([]protocol.UnsatisfiedRequirement, 0, len(waitingBlockedDeps))
+					for _, depTask := range waitingBlockedDeps {
+						detail := fmt.Sprintf("waiting for blocked dependency %s (%s)", depTask.ID, depTask.Title)
+						if depTask.BlockerReason != "" {
+							detail = fmt.Sprintf("%s: %s", detail, depTask.BlockerReason)
+						}
+						unsatisfied = append(unsatisfied, protocol.UnsatisfiedRequirement{
+							Kind:        "dependency",
+							Requirement: "dependency=" + depTask.ID,
+							Detail:      detail,
+						})
+					}
+					nextDiagnostic := &protocol.PlacementDiagnostic{
+						EvaluatedAt:     nowText,
+						EligibleNodeIDs: []string{},
+						Unsatisfied:     unsatisfied,
+					}
+					if !placementDiagnosticsMatchUnsatisfied(task.PlacementDiagnostic, nextDiagnostic) {
+						task.PlacementDiagnostic = nextDiagnostic
+						task.UpdatedAt = nowText
+						state.Tasks[taskID] = task
+					}
+				} else if task.PlacementDiagnostic != nil && hasOnlyDependencyReadinessDiagnostics(task.PlacementDiagnostic) {
+					task.PlacementDiagnostic = nil
+					task.UpdatedAt = nowText
+					state.Tasks[taskID] = task
+				}
 			}
 		}
 	}
+}
+
+func hasOnlyDependencyReadinessDiagnostics(diagnostic *protocol.PlacementDiagnostic) bool {
+	if diagnostic == nil || len(diagnostic.Unsatisfied) == 0 {
+		return false
+	}
+	for _, entry := range diagnostic.Unsatisfied {
+		if entry.Kind != "dependency" {
+			return false
+		}
+	}
+	return true
+}
+
+func clearDependencyReadinessDiagnostics(diagnostic *protocol.PlacementDiagnostic) *protocol.PlacementDiagnostic {
+	if diagnostic == nil || hasOnlyDependencyReadinessDiagnostics(diagnostic) {
+		return nil
+	}
+	return diagnostic
+}
+
+func placementDiagnosticsMatchUnsatisfied(left, right *protocol.PlacementDiagnostic) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return slices.Equal(left.Unsatisfied, right.Unsatisfied)
 }
 
 func sortedTaskIDs(state *store.State, threadID string) []string {

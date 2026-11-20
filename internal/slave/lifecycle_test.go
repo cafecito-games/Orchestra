@@ -264,7 +264,7 @@ func TestLeaseCoordinator_CleanupHonorsDirtyRetainAndCleanDeletePolicies(t *test
 	assert.Equal(t, grantClean.WorktreePath, worktreeCleanPath)
 	assert.DirExists(t, grantClean.WorktreePath)
 
-	coordinator.finishForRun(activeLeaseClean)
+	coordinator.finishForRun(activeLeaseClean, false)
 
 	// Worktree was clean, so it should be deleted
 	_, statErr := os.Stat(grantClean.WorktreePath)
@@ -310,7 +310,7 @@ func TestLeaseCoordinator_CleanupHonorsDirtyRetainAndCleanDeletePolicies(t *test
 	// Introduce a dirty change in the worktree
 	require.NoError(t, os.WriteFile(filepath.Join(worktreeDirtyPath, "untracked.txt"), []byte("dirty content\n"), 0o644))
 
-	coordinator.finishForRun(activeLeaseDirty)
+	coordinator.finishForRun(activeLeaseDirty, false)
 
 	// Worktree was dirty, so it should be retained
 	assert.DirExists(t, grantDirty.WorktreePath)
@@ -353,13 +353,14 @@ func TestLeaseCoordinator_CleanupHonorsDirtyRetainAndCleanDeletePolicies(t *test
 	require.NotNil(t, activeLeaseRetain)
 	assert.DirExists(t, worktreeRetainPath)
 
-	coordinator.finishForRun(activeLeaseRetain)
+	coordinator.finishForRun(activeLeaseRetain, false)
 
 	// Policy is retain, so it should be retained even though clean
 	assert.DirExists(t, grantRetain.WorktreePath)
 
 	client.mutex.Lock()
 	messagesRetain := client.outbox
+	client.outbox = nil
 	client.mutex.Unlock()
 	require.NotEmpty(t, messagesRetain)
 	lastRetainMessage := messagesRetain[len(messagesRetain)-1]
@@ -367,6 +368,67 @@ func TestLeaseCoordinator_CleanupHonorsDirtyRetainAndCleanDeletePolicies(t *test
 	require.NotNil(t, lastRetainMessage.Lease)
 	assert.Equal(t, "retained", lastRetainMessage.Lease.Status)
 	assert.Equal(t, "policy", lastRetainMessage.Lease.RetentionReason)
+
+	// Case 4: Yield-on-block retains git-worktree (even with when-unchanged) and resumed run adopts it.
+	grantYield := protocol.WorkspaceLeaseGrant{
+		ID:           "lease-yield-reuse",
+		Status:       "requested",
+		Policy:       protocol.WorkspaceIsolationGitWorktree,
+		Cleanup:      protocol.WorkspaceCleanupWhenUnchanged,
+		Repository:   "https://github.com/cafecito-games/Orchestra",
+		Root:         rootPath,
+		SourcePath:   repositoryPath,
+		BaseRevision: protocol.WorkspaceLeaseBaseRef("main"),
+		Branch:       protocol.WorkspaceLeaseBranch("task-yield", "run-yield-1"),
+		WorktreePath: filepath.Join(rootPath, filepath.FromSlash(protocol.WorkspaceLeaseManagedDirectory), "lease-yield-reuse"),
+	}
+	taskYieldID := "task-yield"
+	runYield1 := protocol.Run{ID: "run-yield-1", TaskID: &taskYieldID}
+	confirmAsync("lease-yield-reuse", "active")
+
+	activeLeaseYield, worktreeYieldPath, err := coordinator.provisionForRun(t.Context(), runYield1, grantYield)
+	require.NoError(t, err)
+	require.NotNil(t, activeLeaseYield)
+	assert.DirExists(t, worktreeYieldPath)
+
+	// Write work-in-progress file before yielding.
+	wipFile := filepath.Join(worktreeYieldPath, "wip.txt")
+	require.NoError(t, os.WriteFile(wipFile, []byte("in progress\n"), 0o644))
+
+	coordinator.finishForRun(activeLeaseYield, true)
+	assert.DirExists(t, worktreeYieldPath)
+	assert.FileExists(t, wipFile)
+
+	client.mutex.Lock()
+	messagesYield := client.outbox
+	client.outbox = nil
+	client.mutex.Unlock()
+	require.NotEmpty(t, messagesYield)
+	lastYieldMessage := messagesYield[len(messagesYield)-1]
+	assert.Equal(t, "workspace.lease", lastYieldMessage.Type)
+	require.NotNil(t, lastYieldMessage.Lease)
+	assert.Equal(t, "retained", lastYieldMessage.Lease.Status)
+	assert.Equal(t, "task-blocked", lastYieldMessage.Lease.RetentionReason)
+
+	// Resume on a new run ID adopting the retained lease.
+	resumedGrant := activeLeaseYield.grant
+	resumedGrant.Status = "retained"
+	runYield2 := protocol.Run{ID: "run-yield-2", TaskID: &taskYieldID}
+	confirmAsync("lease-yield-reuse", "active")
+
+	resumedLease, resumedPath, err := coordinator.provisionForRun(t.Context(), runYield2, resumedGrant)
+	require.NoError(t, err)
+	require.NotNil(t, resumedLease)
+	assert.Equal(t, worktreeYieldPath, resumedPath)
+	wipBytes, readErr := os.ReadFile(wipFile)
+	require.NoError(t, readErr)
+	assert.Equal(t, "in progress\n", string(wipBytes))
+
+	// Remove wip file so normal cleanup on completion cleans up the worktree cleanly.
+	require.NoError(t, os.Remove(wipFile))
+	coordinator.finishForRun(resumedLease, false)
+	_, statYieldErr := os.Stat(worktreeYieldPath)
+	assert.True(t, os.IsNotExist(statYieldErr))
 }
 
 func TestClient_InstanceReconfigureInPlaceAndErrorKindReporting(t *testing.T) {

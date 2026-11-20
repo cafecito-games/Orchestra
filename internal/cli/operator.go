@@ -1052,6 +1052,142 @@ func runResolveApproval(
 	return 0
 }
 
+func runTask(
+	operationContext context.Context,
+	arguments []string,
+	standardOutput io.Writer,
+	standardError io.Writer,
+	lookupEnvironment func(string) (string, bool),
+) int {
+	if len(arguments) == 0 || hasHelpFlag(arguments[:1]) {
+		printTaskUsage(standardOutput)
+		return 0
+	}
+	switch arguments[0] {
+	case "unblock":
+		return runTaskUnblock(operationContext, arguments[1:], standardOutput, standardError, lookupEnvironment)
+	case "reopen":
+		return runTaskReopen(operationContext, arguments[1:], standardOutput, standardError, lookupEnvironment)
+	default:
+		fmt.Fprintf(standardError, "orchestra task: unknown subcommand %q\n\n", arguments[0])
+		printTaskUsage(standardError)
+		return 2
+	}
+}
+
+func printTaskUsage(output io.Writer) {
+	fmt.Fprintf(output, `Usage:
+  orchestra task unblock <task-id> [--note "..."] [--idempotency-key "..."] [flags]
+  orchestra task reopen <task-id> [--note "..."] [--attempts N] [--idempotency-key "..."] [flags]
+
+Subcommands:
+  unblock     Unblock a blocked task back to ready (or pending if dependencies remain)
+  reopen      Reopen a failed task with a fresh attempt budget
+
+Flags:
+  --note string             Optional resolution or recovery guidance note for the resumed run
+  --attempts int            Fresh attempt budget to grant when reopening a failed task (1-%d)
+  --idempotency-key string  Optional idempotency key for safe retries
+  --endpoint string         Orchestra master HTTP or WebSocket endpoint (env ORCHESTRA_ENDPOINT)
+  --token string            Bearer token matching ORCHESTRA_TOKEN (env ORCHESTRA_TOKEN)
+  --tls-ca string           CA certificate PEM path for https:// (env ORCHESTRA_TLS_CA)
+  --tls-insecure            Skip TLS certificate verification (env ORCHESTRA_TLS_INSECURE)
+  --json                    Format output as JSON
+`, protocol.MaximumTaskAttempts)
+}
+
+func runTaskUnblock(
+	operationContext context.Context,
+	arguments []string,
+	standardOutput io.Writer,
+	standardError io.Writer,
+	lookupEnvironment func(string) (string, bool),
+) int {
+	flagSet := flag.NewFlagSet("orchestra task unblock", flag.ContinueOnError)
+	flagSet.SetOutput(standardError)
+	connection := registerOperatorFlags(flagSet, lookupEnvironment)
+	note := flagSet.String("note", "", "Optional resolution note for the resumed run")
+	idempotencyKey := flagSet.String("idempotency-key", "", "Optional idempotency key for safe retries")
+	if err := flagSet.Parse(normalizeFlagOrder(flagSet, arguments)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if flagSet.NArg() != 1 {
+		fmt.Fprintln(standardError, "orchestra task unblock: expected exactly one <task-id> argument")
+		return 2
+	}
+	taskID := flagSet.Arg(0)
+
+	var result orchestrator.UnblockTaskResult
+	requestBody := orchestrator.UnblockTaskInput{
+		TaskID:         taskID,
+		IdempotencyKey: strings.TrimSpace(*idempotencyKey),
+		Note:           strings.TrimSpace(*note),
+	}
+	if err := connection.requestJSON(operationContext, http.MethodPost, "/api/tasks/"+url.PathEscape(taskID)+"/unblock", nil, requestBody, &result); err != nil {
+		fmt.Fprintf(standardError, "orchestra task unblock: %v\n", err)
+		return 1
+	}
+	if *connection.asJSON {
+		return writePrettyJSON(standardOutput, standardError, result)
+	}
+	fmt.Fprintf(standardOutput, "Unblocked task %s (status=%s, replayed=%t)\n", result.Task.ID, result.Task.Status, result.Replayed)
+	return 0
+}
+
+func runTaskReopen(
+	operationContext context.Context,
+	arguments []string,
+	standardOutput io.Writer,
+	standardError io.Writer,
+	lookupEnvironment func(string) (string, bool),
+) int {
+	flagSet := flag.NewFlagSet("orchestra task reopen", flag.ContinueOnError)
+	flagSet.SetOutput(standardError)
+	connection := registerOperatorFlags(flagSet, lookupEnvironment)
+	note := flagSet.String("note", "", "Optional recovery guidance note for the resumed run")
+	attempts := flagSet.Int("attempts", 0, "Fresh attempt budget to grant (defaults to maximum task attempts)")
+	idempotencyKey := flagSet.String("idempotency-key", "", "Optional idempotency key for safe retries")
+	if err := flagSet.Parse(normalizeFlagOrder(flagSet, arguments)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if flagSet.NArg() != 1 {
+		fmt.Fprintln(standardError, "orchestra task reopen: expected exactly one <task-id> argument")
+		return 2
+	}
+	taskID := flagSet.Arg(0)
+
+	var result orchestrator.ReopenTaskResult
+	requestBody := orchestrator.ReopenTaskInput{
+		TaskID:             taskID,
+		IdempotencyKey:     strings.TrimSpace(*idempotencyKey),
+		Note:               strings.TrimSpace(*note),
+		AdditionalAttempts: *attempts,
+	}
+	if err := connection.requestJSON(operationContext, http.MethodPost, "/api/tasks/"+url.PathEscape(taskID)+"/reopen", nil, requestBody, &result); err != nil {
+		fmt.Fprintf(standardError, "orchestra task reopen: %v\n", err)
+		return 1
+	}
+	if *connection.asJSON {
+		return writePrettyJSON(standardOutput, standardError, result)
+	}
+	fmt.Fprintf(
+		standardOutput,
+		"Reopened task %s (status=%s, attempts=%d/%d, replayed=%t)\n",
+		result.Task.ID,
+		result.Task.Status,
+		result.Task.AttemptCount,
+		result.Task.MaxAttempts,
+		result.Replayed,
+	)
+	return 0
+}
+
 func runCancel(
 	operationContext context.Context,
 	arguments []string,

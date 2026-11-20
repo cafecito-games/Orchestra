@@ -177,14 +177,34 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 		},
 		{
 			Name:        "update_task",
-			Description: "Update task status, summary, blockerReason, or attached artifactIds.",
+			Description: "Update task status, summary, blockerKind, blockerReason, or attached artifactIds. Active runs transitioning to blocked yield their execution slot cleanly.",
 			InputSchema: objectSchema(map[string]any{
 				"taskId":         map[string]any{"type": "string"},
 				"idempotencyKey": map[string]any{"type": "string"},
 				"status":         map[string]any{"type": "string"},
 				"summary":        map[string]any{"type": "string"},
+				"blockerKind":    map[string]any{"type": "string", "enum": protocol.TaskBlockerKinds},
 				"blockerReason":  map[string]any{"type": "string"},
 				"artifactIds":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			}, []string{"taskId"}),
+		},
+		{
+			Name:        "unblock_task",
+			Description: "Idempotently unblock a blocked task back to ready (or pending if dependencies are unsatisfied), clearing blocker metadata and optionally recording a resolution note for the resumed run.",
+			InputSchema: objectSchema(map[string]any{
+				"taskId":         map[string]any{"type": "string"},
+				"idempotencyKey": map[string]any{"type": "string"},
+				"note":           map[string]any{"type": "string"},
+			}, []string{"taskId"}),
+		},
+		{
+			Name:        "reopen_task",
+			Description: "Idempotently reopen a failed task back to ready (or pending if dependencies are unsatisfied) with a fresh attempt budget, keeping downstream dependents waiting.",
+			InputSchema: objectSchema(map[string]any{
+				"taskId":             map[string]any{"type": "string"},
+				"idempotencyKey":     map[string]any{"type": "string"},
+				"note":               map[string]any{"type": "string"},
+				"additionalAttempts": map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumTaskAttempts},
 			}, []string{"taskId"}),
 		},
 		{
@@ -684,6 +704,18 @@ func (service *Service) ExecuteOrchestratorTool(
 			return nil, updateErr
 		}
 		responseValue = map[string]any{"task": task}
+	case "unblock_task":
+		input, decodeErr := decodeToolArguments[UnblockTaskInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.UnblockTask(caller, input)
+	case "reopen_task":
+		input, decodeErr := decodeToolArguments[ReopenTaskInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.ReopenTask(caller, input)
 	case "send_task_message":
 		input, decodeErr := decodeToolArguments[SendTaskMessageInput](rawArguments)
 		if decodeErr != nil {
