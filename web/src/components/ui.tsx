@@ -33,6 +33,8 @@ const STATUS_TONE: Record<string, Tone> = {
   stalled: "err",
   quota_exhausted: "err",
   rate_limited: "warn",
+  uploaded: "ok",
+  pending_upload: "warn",
 };
 
 export function toneForStatus(status: string): Tone {

@@ -27,8 +27,14 @@ export function shortId(id?: string | null): string {
   return id.length > 12 ? `${id.slice(0, 5)}…${id.slice(-4)}` : id;
 }
 
+export function shortSha256(sha256?: string | null): string {
+  const trimmed = sha256?.trim() ?? "";
+  if (!trimmed) return "";
+  return trimmed.length > 12 ? `${trimmed.slice(0, 12)}…` : trimmed;
+}
+
 export function fmtBytes(bytes: number | null | undefined): string {
-  if (bytes == null) return "—";
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return "—";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;

@@ -86,14 +86,66 @@ export async function api<T>(path: string, options: ApiOptions = {}): Promise<T>
   return data as T;
 }
 
+export class DownloadAbortedError extends Error {
+  constructor() {
+    super("download cancelled");
+    this.name = "DownloadAbortedError";
+  }
+}
+
+export interface DownloadProgress {
+  loaded: number;
+  total: number | null;
+  percent: number | null;
+}
+
+export interface DownloadOptions {
+  signal?: AbortSignal;
+  expectedSizeBytes?: number;
+  onProgress?: (progress: DownloadProgress) => void;
+}
+
+const OBJECT_URL_REVOKE_DELAY_MS = 10_000;
+
+async function extractErrorMessage(response: Response): Promise<string> {
+  try {
+    const text = await response.text();
+    if (text) {
+      try {
+        const parsed = JSON.parse(text) as { error?: { message?: string } };
+        if (parsed?.error?.message) {
+          return parsed.error.message;
+        }
+      } catch {
+        const trimmed = text.trim();
+        if (trimmed && trimmed.length <= 200) {
+          return trimmed;
+        }
+      }
+    }
+  } catch {
+    // Fall back to HTTP status text below.
+  }
+  return `HTTP ${response.status}`;
+}
+
 // Fetches an authenticated binary artifact blob using the active bearer token.
-export async function fetchArtifactBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+// Streams chunks when an onProgress callback is supplied so large downloads
+// can surface live byte progress and support cancellation.
+export async function fetchArtifactBlob(
+  path: string,
+  signal?: AbortSignal,
+  options?: Omit<DownloadOptions, "signal">,
+): Promise<Blob> {
+  if (!path) {
+    throw new Error("Artifact download path is unavailable");
+  }
   let response: Response;
   try {
     response = await fetch(path, { headers: authHeaders(), signal });
-  } catch (fetchError) {
+  } catch {
     if (signal?.aborted) {
-      throw fetchError;
+      throw new DownloadAbortedError();
     }
     throw new Error("Network error — is Orchestra reachable?");
   }
@@ -102,15 +154,77 @@ export async function fetchArtifactBlob(path: string, signal?: AbortSignal): Pro
     throw new AuthError();
   }
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+    throw new Error(await extractErrorMessage(response));
   }
-  return response.blob();
+
+  const onProgress = options?.onProgress;
+  if (!onProgress || !response.body) {
+    try {
+      return await response.blob();
+    } catch {
+      if (signal?.aborted) {
+        throw new DownloadAbortedError();
+      }
+      throw new Error("Failed to read artifact response body");
+    }
+  }
+
+  const contentLengthHeader = response.headers.get("Content-Length");
+  const parsedLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
+  const totalBytes =
+    Number.isFinite(parsedLength) && parsedLength > 0
+      ? parsedLength
+      : options.expectedSizeBytes && options.expectedSizeBytes > 0
+        ? options.expectedSizeBytes
+        : null;
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array<ArrayBuffer>[] = [];
+  let loaded = 0;
+
+  onProgress({
+    loaded: 0,
+    total: totalBytes,
+    percent: totalBytes ? 0 : null,
+  });
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        chunks.push(new Uint8Array(value));
+        loaded += value.byteLength;
+        const percent = totalBytes ? Math.min(100, Math.round((loaded / totalBytes) * 100)) : null;
+        onProgress({ loaded, total: totalBytes, percent });
+      }
+    }
+  } catch {
+    if (signal?.aborted) {
+      throw new DownloadAbortedError();
+    }
+    throw new Error("Connection interrupted while downloading artifact");
+  } finally {
+    reader.releaseLock();
+  }
+
+  const contentType = response.headers.get("Content-Type") || undefined;
+  return new Blob(chunks, { type: contentType });
 }
 
 // Downloads an authenticated artifact as a client-side blob, which lets us send
 // the bearer token that a plain anchor link cannot.
-export async function download(path: string, filename: string): Promise<void> {
-  const blob = await fetchArtifactBlob(path);
+export async function download(
+  path: string,
+  filename: string,
+  options?: DownloadOptions,
+): Promise<void> {
+  const blob = await fetchArtifactBlob(path, options?.signal, {
+    expectedSizeBytes: options?.expectedSizeBytes,
+    onProgress: options?.onProgress,
+  });
   const objectUrl = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = objectUrl;
@@ -118,7 +232,7 @@ export async function download(path: string, filename: string): Promise<void> {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(objectUrl);
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), OBJECT_URL_REVOKE_DELAY_MS);
 }
 
 // Resolves a bearer-authenticated endpoint into a temporary object URL and
