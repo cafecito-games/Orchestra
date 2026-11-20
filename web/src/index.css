@@ -2058,7 +2058,131 @@ a {
   width: 100%;
 }
 
+/* ---------- Mail Composer ---------- */
+.mail-composer-card {
+  padding: 0;
+  overflow: visible;
+}
+
+.mail-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+}
+
+.mail-composer-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.mail-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.mail-field-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+}
+
+.mail-input {
+  width: 100%;
+}
+
+.mail-autocomplete {
+  position: relative;
+}
+
+.mail-suggestions {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 40;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mail-suggestion {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: none;
+  color: var(--text);
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 100ms ease;
+}
+
+.mail-suggestion:hover,
+.mail-suggestion.active {
+  background: var(--surface-2);
+}
+
+.mail-suggestion-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.mail-suggestion-addr {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mail-suggestion-sub {
+  font-size: 11px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mail-suggestion-empty {
+  padding: 10px;
+  font-size: 12px;
+  color: var(--text-4);
+  text-align: center;
+}
+
+.mail-msg-reply {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: 11.5px;
+}
+
 @media (max-width: 720px) {
+  .mail-composer-grid {
+    grid-template-columns: 1fr;
+  }
+
   .artifact-row {
     flex-direction: column;
     align-items: stretch;

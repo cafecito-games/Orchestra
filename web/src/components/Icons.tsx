@@ -215,3 +215,12 @@ export function FileIcon(props: IconProps) {
     </Icon>
   );
 }
+
+export function ReplyIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M6.5 4.2 2.7 8l3.8 3.8" />
+      <path d="M3 8h6.2a4.1 4.1 0 0 1 4.1 4.1v.9" />
+    </Icon>
+  );
+}

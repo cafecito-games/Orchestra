@@ -422,10 +422,26 @@ export interface MailMessage {
   sequence: number;
   from: string;
   to: string;
+  replyToId?: string;
   subject?: string;
   body: string;
   read: boolean;
   createdAt: string;
+}
+
+export interface SendMailRequest {
+  idempotencyKey: string;
+  to: string;
+  replyToId?: string;
+  subject?: string;
+  body: string;
+  wake?: boolean;
+}
+
+export interface SendMailResult {
+  message: MailMessage;
+  recipient: AgentMailbox;
+  replayed: boolean;
 }
 
 export interface ListMailboxesResult {
