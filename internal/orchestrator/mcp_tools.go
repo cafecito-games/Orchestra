@@ -525,7 +525,7 @@ func (service *Service) newMCPHTTPHandler() (http.Handler, func()) {
 			Description: definition.Description,
 			InputSchema: definition.InputSchema,
 		}, func(operationContext context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			caller := callerFromMCPRequest(request)
+			caller := callerFromMCPRequest(operationContext, request)
 			resultBytes, err := service.ExecuteOrchestratorTool(
 				operationContext,
 				caller,
@@ -551,7 +551,7 @@ func (service *Service) newMCPHTTPHandler() (http.Handler, func()) {
 	return handler, closeSessions
 }
 
-func callerFromMCPRequest(request *mcp.CallToolRequest) CallerIdentity {
+func callerFromMCPRequest(operationContext context.Context, request *mcp.CallToolRequest) CallerIdentity {
 	sessionID := "http-session"
 	if request.Session != nil && protocol.IsIdentifier(request.Session.ID()) {
 		sessionID = request.Session.ID()
@@ -563,7 +563,11 @@ func callerFromMCPRequest(request *mcp.CallToolRequest) CallerIdentity {
 	if !protocol.IsIdentifier(clientID) {
 		clientID = sessionID
 	}
-	return CallerIdentity{Kind: "orchestrator-client", ClientID: clientID, SessionID: sessionID}
+	caller := CallerIdentity{Kind: "orchestrator-client", ClientID: clientID, SessionID: sessionID}
+	if auth, ok := authContextFromContext(operationContext); ok {
+		caller = callerWithAuthContext(caller, auth)
+	}
+	return caller
 }
 
 func orchestratorMCPResult(resultBytes json.RawMessage, callErr error) *mcp.CallToolResult {
@@ -631,32 +635,49 @@ func (service *Service) ExecuteOrchestratorTool(
 
 	switch toolName {
 	case "get_execution_inventory":
-		responseValue, err = service.GetExecutionInventory()
+		if err = requireClusterAdminAuthority(caller, toolName); err == nil {
+			responseValue, err = service.GetExecutionInventory()
+		}
 	case "refresh_repositories":
+		if err = requireClusterAdminAuthority(caller, toolName); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[RefreshRepositoriesInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.RefreshRepositories(operationContext, caller, input)
 	case "clone_repository":
+		if err = requireClusterAdminAuthority(caller, toolName); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[CloneRepositoryInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.CloneRepository(operationContext, caller, input)
 	case "list_workspace_leases":
+		if err = requireClusterAdminAuthority(caller, toolName); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[ListWorkspaceLeasesInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.ListWorkspaceLeases(caller, input)
 	case "land_workspace_lease":
+		if err = requireClusterAdminAuthority(caller, toolName); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[LandWorkspaceLeaseInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.LandWorkspaceLease(operationContext, caller, input)
 	case "update_nodes":
+		if err = requireClusterAdminAuthority(caller, toolName); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[UpdateNodesInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
@@ -676,6 +697,9 @@ func (service *Service) ExecuteOrchestratorTool(
 			"attachment": attachment,
 		}
 	case "list_threads":
+		if err = requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[ListThreadsInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
@@ -684,11 +708,26 @@ func (service *Service) ExecuteOrchestratorTool(
 		if listErr != nil {
 			return nil, listErr
 		}
+		if caller.Scope != nil && len(caller.Scope.ThreadIDs) > 0 {
+			filtered := make([]protocol.Thread, 0, len(threads))
+			for _, thread := range threads {
+				if protocol.ScopeAllowsThread(caller.Scope, thread.ID) {
+					filtered = append(filtered, thread)
+				}
+			}
+			threads = filtered
+		}
 		responseValue = map[string]any{"threads": threads}
 	case "attach_thread":
 		input, decodeErr := decodeToolArguments[AttachThreadInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
+		}
+		if err = requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+			return nil, err
+		}
+		if err = requireScopeThread(caller, input.ThreadID); err != nil {
+			return nil, err
 		}
 		attachment, cursor, attachErr := service.AttachThread(caller, input)
 		if attachErr != nil {
@@ -703,6 +742,12 @@ func (service *Service) ExecuteOrchestratorTool(
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
+		if err = requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+			return nil, err
+		}
+		if err = requireScopeThread(caller, input.ThreadID); err != nil {
+			return nil, err
+		}
 		detached, detachErr := service.DetachThread(caller, input)
 		if detachErr != nil {
 			return nil, detachErr
@@ -716,11 +761,23 @@ func (service *Service) ExecuteOrchestratorTool(
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
+		if err = requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+			return nil, err
+		}
+		if err = requireScopeThread(caller, input.ThreadID); err != nil {
+			return nil, err
+		}
 		responseValue, err = service.GetThreadContext(input.ThreadID)
 	case "get_thread_events":
 		input, decodeErr := decodeToolArguments[GetThreadEventsInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
+		}
+		if err = requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+			return nil, err
+		}
+		if err = requireScopeThread(caller, input.ThreadID); err != nil {
+			return nil, err
 		}
 		responseValue, err = service.GetThreadEvents(caller, input)
 	case "read_room":
@@ -810,36 +867,57 @@ func (service *Service) ExecuteOrchestratorTool(
 		}
 		responseValue, err = service.PostArtifact(caller, input)
 	case "spawn_instance":
+		if err = requireScopeOperation(caller, protocol.AccessOpDelegate); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[SpawnInstanceInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
+		if err = requireScopeThread(caller, input.ThreadID); err != nil {
+			return nil, err
+		}
 		responseValue, err = service.SpawnInstance(caller, input)
 	case "get_instance":
+		if err = requireScopeOperation(caller, protocol.AccessOpRead); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[GetInstanceInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.GetInstance(caller, input)
 	case "reconfigure_instance":
+		if err = requireScopeOperation(caller, protocol.AccessOpDelegate); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[ReconfigureInstanceInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.ReconfigureInstance(caller, input)
 	case "renew_instance":
+		if err = requireScopeOperation(caller, protocol.AccessOpDelegate); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[RenewInstanceInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.RenewInstance(caller, input)
 	case "release_instance":
+		if err = requireScopeOperation(caller, protocol.AccessOpDelegate); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[ReleaseInstanceInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
 		}
 		responseValue, err = service.ReleaseInstance(caller, input)
 	case "list_approvals":
+		if err = requireClusterAdminAuthority(caller, toolName); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[ListApprovalsInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr
@@ -850,6 +928,9 @@ func (service *Service) ExecuteOrchestratorTool(
 		}
 		responseValue = map[string]any{"approvals": approvals}
 	case "resolve_approval":
+		if err = requireClusterAdminAuthority(caller, toolName); err != nil {
+			return nil, err
+		}
 		input, decodeErr := decodeToolArguments[ResolveApprovalInput](rawArguments)
 		if decodeErr != nil {
 			return nil, decodeErr

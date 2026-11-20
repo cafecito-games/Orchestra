@@ -293,6 +293,9 @@ export interface RoomAuthor {
   title?: string;
   clientId?: string;
   operatorId?: string;
+  principalKind?: string;
+  principalId?: string;
+  verifiedNode?: string;
 }
 
 export interface RoomMessage {

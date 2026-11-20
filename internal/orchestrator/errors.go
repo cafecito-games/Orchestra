@@ -105,15 +105,20 @@ func canonicalDigest(value any) string {
 }
 
 type CallerIdentity struct {
-	Kind        string
-	OperatorID  string
-	ClientID    string
-	SessionID   string
-	RunID       string
-	TaskID      string
-	ThreadID    string
-	InstanceID  string
-	CanDelegate bool
+	Kind          string
+	OperatorID    string
+	ClientID      string
+	SessionID     string
+	RunID         string
+	TaskID        string
+	ThreadID      string
+	InstanceID    string
+	CanDelegate   bool
+	PrincipalKind string
+	PrincipalID   string
+	VerifiedNode  string
+	GrantID       string
+	Scope         *protocol.AccessGrantScope
 }
 
 func (caller CallerIdentity) SourceKey() string {
@@ -139,14 +144,33 @@ func (caller CallerIdentity) InstanceCreator() protocol.InstanceCreator {
 		if operatorID == "" {
 			operatorID = "cli"
 		}
-		return protocol.InstanceCreator{Kind: "operator", OperatorID: operatorID}
+		return protocol.InstanceCreator{
+			Kind:          "operator",
+			OperatorID:    operatorID,
+			PrincipalKind: caller.PrincipalKind,
+			PrincipalID:   caller.PrincipalID,
+			VerifiedNode:  caller.VerifiedNode,
+		}
 	case "run":
-		return protocol.InstanceCreator{Kind: "run", RunID: caller.RunID, InstanceID: caller.InstanceID}
+		return protocol.InstanceCreator{
+			Kind:          "run",
+			RunID:         caller.RunID,
+			InstanceID:    caller.InstanceID,
+			PrincipalKind: caller.PrincipalKind,
+			PrincipalID:   caller.PrincipalID,
+			VerifiedNode:  caller.VerifiedNode,
+		}
 	default:
 		clientID := caller.ClientID
 		if clientID == "" {
 			clientID = "mcp-http"
 		}
-		return protocol.InstanceCreator{Kind: "orchestrator-client", ClientID: clientID}
+		return protocol.InstanceCreator{
+			Kind:          "orchestrator-client",
+			ClientID:      clientID,
+			PrincipalKind: caller.PrincipalKind,
+			PrincipalID:   caller.PrincipalID,
+			VerifiedNode:  caller.VerifiedNode,
+		}
 	}
 }

@@ -160,6 +160,12 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 		}
 	}
 
+	if err := requireScopeOperation(caller, protocol.AccessOpDelegate); err != nil {
+		return SubmitTasksResult{}, err
+	}
+	if err := requireScopeThread(caller, threadID); err != nil {
+		return SubmitTasksResult{}, err
+	}
 	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
 	if idempotencyKey == "" || !protocol.IsBoundedString(idempotencyKey, 128) {
 		return SubmitTasksResult{}, invalidRequest("idempotencyKey is required and must be at most 128 bytes")
@@ -247,12 +253,15 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 		}
 
 		origin := protocol.TaskOrigin{
-			Kind:         caller.Kind,
-			SubmissionID: submissionID,
-			ClientID:     caller.ClientID,
-			RunID:        caller.RunID,
-			TaskID:       parentTaskID,
-			InstanceID:   caller.InstanceID,
+			Kind:          caller.Kind,
+			SubmissionID:  submissionID,
+			ClientID:      caller.ClientID,
+			RunID:         caller.RunID,
+			TaskID:        parentTaskID,
+			InstanceID:    caller.InstanceID,
+			PrincipalKind: caller.PrincipalKind,
+			PrincipalID:   caller.PrincipalID,
+			VerifiedNode:  caller.VerifiedNode,
 		}
 		if origin.Kind == "" {
 			origin.Kind = "orchestrator-client"
@@ -509,6 +518,21 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 		if !exists {
 			return notFound(fmt.Sprintf("task %s does not exist", taskID))
 		}
+		if caller.Scope != nil {
+			if err := requireScopeThread(caller, task.ThreadID); err != nil {
+				return err
+			}
+			if !protocol.ScopeAllowsOperation(caller.Scope, protocol.AccessOpClaim) &&
+				!protocol.ScopeAllowsOperation(caller.Scope, protocol.AccessOpDelegate) {
+				return forbiddenError("access grant does not permit updating tasks")
+			}
+		}
+		if caller.Kind == "orchestrator-client" && caller.Scope != nil &&
+			task.Origin.ClientID != "" && caller.ClientID != "" && task.Origin.ClientID != caller.ClientID {
+			if input.ClaimEpoch == nil || !matchesClaimFencing(task.Claim, *input.ClaimEpoch, input.ClaimToken) {
+				return forbiddenError("scoped agent profile can only modify tasks it owns or actively holds a claim for")
+			}
+		}
 		if caller.Kind == "run" {
 			if caller.ThreadID != "" && task.ThreadID != caller.ThreadID {
 				return forbiddenError("worker run cannot update a task in another thread")
@@ -741,6 +765,9 @@ func (service *Service) UnblockTask(caller CallerIdentity, input UnblockTaskInpu
 	if !protocol.IsIdentifier(taskID) {
 		return UnblockTaskResult{}, invalidRequest("taskId is required")
 	}
+	if err := requireScopeOperation(caller, protocol.AccessOpDelegate); err != nil {
+		return UnblockTaskResult{}, err
+	}
 	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
 	if idempotencyKey != "" && !protocol.IsBoundedString(idempotencyKey, 128) {
 		return UnblockTaskResult{}, invalidRequest("idempotencyKey must be at most 128 bytes")
@@ -767,6 +794,9 @@ func (service *Service) UnblockTask(caller CallerIdentity, input UnblockTaskInpu
 		task, exists := state.Tasks[taskID]
 		if !exists {
 			return notFound(fmt.Sprintf("task %s does not exist", taskID))
+		}
+		if err := requireScopeThread(caller, task.ThreadID); err != nil {
+			return err
 		}
 		if authErr := authorizeTaskRecoveryCaller(caller, task, "unblock"); authErr != nil {
 			return authErr
@@ -869,6 +899,9 @@ func (service *Service) ReopenTask(caller CallerIdentity, input ReopenTaskInput)
 	if !protocol.IsIdentifier(taskID) {
 		return ReopenTaskResult{}, invalidRequest("taskId is required")
 	}
+	if err := requireScopeOperation(caller, protocol.AccessOpDelegate); err != nil {
+		return ReopenTaskResult{}, err
+	}
 	idempotencyKey := strings.TrimSpace(input.IdempotencyKey)
 	if idempotencyKey != "" && !protocol.IsBoundedString(idempotencyKey, 128) {
 		return ReopenTaskResult{}, invalidRequest("idempotencyKey must be at most 128 bytes")
@@ -904,6 +937,9 @@ func (service *Service) ReopenTask(caller CallerIdentity, input ReopenTaskInput)
 		task, exists := state.Tasks[taskID]
 		if !exists {
 			return notFound(fmt.Sprintf("task %s does not exist", taskID))
+		}
+		if err := requireScopeThread(caller, task.ThreadID); err != nil {
+			return err
 		}
 		if authErr := authorizeTaskRecoveryCaller(caller, task, "reopen"); authErr != nil {
 			return authErr
