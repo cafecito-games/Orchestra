@@ -203,9 +203,10 @@ type MasterControlMessage struct {
 }
 
 type HubRPCError struct {
-	Code      string `json:"code"`
-	Message   string `json:"message"`
-	Retryable bool   `json:"retryable,omitempty"`
+	Code      string         `json:"code"`
+	Message   string         `json:"message"`
+	Retryable bool           `json:"retryable,omitempty"`
+	Detail    map[string]any `json:"detail,omitempty"`
 }
 
 type HubRPCRequest struct {

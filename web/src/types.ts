@@ -123,6 +123,7 @@ export interface Thread {
   title: string;
   summary?: string;
   status: string;
+  labels?: Record<string, string>;
   orchestrator?: ThreadOrchestrator;
   createdAt: string;
   updatedAt: string;
@@ -304,6 +305,7 @@ export interface RoomMessage {
   channel?: string;
   topic?: string;
   body: string;
+  labels?: Record<string, string>;
   mentions?: string[];
   replyToSequence?: number;
   supersedesSequence?: number;

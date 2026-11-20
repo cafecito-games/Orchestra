@@ -163,6 +163,7 @@ var definitions = map[string]toolDefinition{
 			"afterSequence": schema{"type": "integer", "minimum": 0},
 			"channel":       text(),
 			"kinds":         list(enum(protocol.RoomMessageKinds...)),
+			"labels":        list(text()),
 			"limit":         schema{"type": "integer", "minimum": 1, "maximum": protocol.MaximumRoomReadLimit},
 		}),
 		output: resultSchema(schema{
@@ -199,9 +200,20 @@ var definitions = map[string]toolDefinition{
 	},
 	"update_thread": {
 		title:       "Update thread",
-		description: "Refine the current thread title, objective, or summary, or mark it active or completed.",
+		description: "Refine the current thread title, objective, summary, status, or compare-and-swap thread labels.",
 		input: func() schema {
-			input := object(schema{"title": text(), "objective": text(), "summary": text(), "status": enum("active", "completed")})
+			labelMap := schema{"type": "object", "additionalProperties": text()}
+			input := object(schema{
+				"idempotencyKey": text(),
+				"title":          text(),
+				"objective":      text(),
+				"summary":        text(),
+				"status":         enum("active", "completed"),
+				"setLabels":      labelMap,
+				"unsetLabels":    list(text()),
+				"ifLabels":       labelMap,
+				"ifUnsetLabels":  list(text()),
+			})
 			input["minProperties"] = 1
 			return input
 		}(),
@@ -469,6 +481,7 @@ var definitions = map[string]toolDefinition{
 			"cursor":              text(),
 			"eventTypes":          list(text()),
 			"afterRoomSequence":   schema{"type": "integer", "minimum": 0},
+			"labels":              list(text()),
 			"afterMailSequence":   schema{"type": "integer", "minimum": 0},
 			"unreadMailOnly":      boolean(),
 			"markMailRead":        boolean(),
@@ -487,17 +500,20 @@ var definitions = map[string]toolDefinition{
 
 func postRoomMessageInputSchema(canDelegate bool) schema {
 	properties := schema{
-		"idempotencyKey":     text(),
-		"kind":               enum(protocol.RoomMessageKinds...),
-		"channel":            text(),
-		"topic":              text(),
-		"body":               text(),
-		"mentions":           list(text()),
-		"wake":               boolean(),
-		"replyToSequence":    schema{"type": "integer", "minimum": 1},
-		"supersedesSequence": schema{"type": "integer", "minimum": 1},
-		"artifactIds":        list(text()),
-		"nudgeTaskIds":       list(text()),
+		"idempotencyKey":          text(),
+		"kind":                    enum(protocol.RoomMessageKinds...),
+		"channel":                 text(),
+		"topic":                   text(),
+		"body":                    text(),
+		"labels":                  schema{"type": "object", "additionalProperties": text()},
+		"expectedHeadSequence":    schema{"type": "integer", "minimum": 0},
+		"expectedChannelSequence": schema{"type": "integer", "minimum": 0},
+		"mentions":                list(text()),
+		"wake":                    boolean(),
+		"replyToSequence":         schema{"type": "integer", "minimum": 1},
+		"supersedesSequence":      schema{"type": "integer", "minimum": 1},
+		"artifactIds":             list(text()),
+		"nudgeTaskIds":            list(text()),
 	}
 	if canDelegate {
 		properties["nudge"] = boolean()

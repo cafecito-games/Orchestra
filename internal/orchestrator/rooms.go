@@ -16,6 +16,7 @@ type ReadRoomInput struct {
 	Channel       string   `json:"channel,omitempty"`
 	AfterSequence int64    `json:"afterSequence,omitempty"`
 	Kinds         []string `json:"kinds,omitempty"`
+	Labels        []string `json:"labels,omitempty"`
 	Limit         int      `json:"limit,omitempty"`
 }
 
@@ -34,19 +35,22 @@ type ReadRoomResult struct {
 }
 
 type PostRoomMessageInput struct {
-	ThreadID           string   `json:"threadId,omitempty"`
-	IdempotencyKey     string   `json:"idempotencyKey"`
-	Channel            string   `json:"channel,omitempty"`
-	Kind               string   `json:"kind"`
-	Topic              string   `json:"topic,omitempty"`
-	Body               string   `json:"body"`
-	Mentions           []string `json:"mentions,omitempty"`
-	Wake               *bool    `json:"wake,omitempty"`
-	ReplyToSequence    *int64   `json:"replyToSequence,omitempty"`
-	SupersedesSequence *int64   `json:"supersedesSequence,omitempty"`
-	ArtifactIDs        []string `json:"artifactIds,omitempty"`
-	Nudge              bool     `json:"nudge,omitempty"`
-	NudgeTaskIDs       []string `json:"nudgeTaskIds,omitempty"`
+	ThreadID                string            `json:"threadId,omitempty"`
+	IdempotencyKey          string            `json:"idempotencyKey"`
+	Channel                 string            `json:"channel,omitempty"`
+	Kind                    string            `json:"kind"`
+	Topic                   string            `json:"topic,omitempty"`
+	Body                    string            `json:"body"`
+	Labels                  map[string]string `json:"labels,omitempty"`
+	ExpectedHeadSequence    *int64            `json:"expectedHeadSequence,omitempty"`
+	ExpectedChannelSequence *int64            `json:"expectedChannelSequence,omitempty"`
+	Mentions                []string          `json:"mentions,omitempty"`
+	Wake                    *bool             `json:"wake,omitempty"`
+	ReplyToSequence         *int64            `json:"replyToSequence,omitempty"`
+	SupersedesSequence      *int64            `json:"supersedesSequence,omitempty"`
+	ArtifactIDs             []string          `json:"artifactIds,omitempty"`
+	Nudge                   bool              `json:"nudge,omitempty"`
+	NudgeTaskIDs            []string          `json:"nudgeTaskIds,omitempty"`
 }
 
 type PostRoomMessageResult struct {
@@ -98,6 +102,10 @@ func (service *Service) ReadRoom(caller CallerIdentity, input ReadRoomInput) (Re
 		if !slices.Contains(protocol.RoomMessageKinds, kind) {
 			return ReadRoomResult{}, invalidRequest(fmt.Sprintf("unknown room message kind %q", kind))
 		}
+	}
+	labelFilters, labelFilterErr := protocol.ParseLabelFilters(input.Labels)
+	if labelFilterErr != nil {
+		return ReadRoomResult{}, invalidRequest(labelFilterErr.Error())
 	}
 	if input.Limit < 0 {
 		return ReadRoomResult{}, invalidRequest("limit must be positive")
@@ -156,6 +164,10 @@ func (service *Service) ReadRoom(caller CallerIdentity, input ReadRoomInput) (Re
 				continue
 			}
 			if len(input.Kinds) > 0 && !slices.Contains(input.Kinds, entry.Kind) {
+				throughSequence = entry.Sequence
+				continue
+			}
+			if !protocol.MatchesLabelFilters(entry.Labels, labelFilters) {
 				throughSequence = entry.Sequence
 				continue
 			}
@@ -338,6 +350,16 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 	if slices.ContainsFunc(input.Mentions, service.redactor.ContainsSecret) {
 		return PostRoomMessageResult{}, invalidRequest("room mentions must not contain secret material")
 	}
+	normalizedLabels, labelErr := protocol.NormalizeLabels(input.Labels, service.redactor, false)
+	if labelErr != nil {
+		return PostRoomMessageResult{}, labelValidationError(labelErr)
+	}
+	if input.ExpectedHeadSequence != nil && *input.ExpectedHeadSequence < 0 {
+		return PostRoomMessageResult{}, invalidRequest("expectedHeadSequence must be greater than or equal to 0")
+	}
+	if input.ExpectedChannelSequence != nil && *input.ExpectedChannelSequence < 0 {
+		return PostRoomMessageResult{}, invalidRequest("expectedChannelSequence must be greater than or equal to 0")
+	}
 
 	redactedTopic := service.redactor.Redact(topic)
 	redactedBody := service.redactor.Redact(body)
@@ -357,19 +379,22 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 	}
 
 	normalizedInput := PostRoomMessageInput{
-		ThreadID:           threadID,
-		IdempotencyKey:     idempotencyKey,
-		Channel:            normalizedChannel,
-		Kind:               kind,
-		Topic:              topic,
-		Body:               body,
-		Mentions:           slices.Clone(parsedMentions.Tokens),
-		Wake:               normalizedWake,
-		ReplyToSequence:    input.ReplyToSequence,
-		SupersedesSequence: input.SupersedesSequence,
-		ArtifactIDs:        slices.Clone(input.ArtifactIDs),
-		Nudge:              input.Nudge,
-		NudgeTaskIDs:       slices.Clone(input.NudgeTaskIDs),
+		ThreadID:                threadID,
+		IdempotencyKey:          idempotencyKey,
+		Channel:                 normalizedChannel,
+		Kind:                    kind,
+		Topic:                   topic,
+		Body:                    body,
+		Labels:                  protocol.CloneLabels(normalizedLabels),
+		ExpectedHeadSequence:    input.ExpectedHeadSequence,
+		ExpectedChannelSequence: input.ExpectedChannelSequence,
+		Mentions:                slices.Clone(parsedMentions.Tokens),
+		Wake:                    normalizedWake,
+		ReplyToSequence:         input.ReplyToSequence,
+		SupersedesSequence:      input.SupersedesSequence,
+		ArtifactIDs:             slices.Clone(input.ArtifactIDs),
+		Nudge:                   input.Nudge,
+		NudgeTaskIDs:            slices.Clone(input.NudgeTaskIDs),
 	}
 	digest := canonicalDigest(normalizedInput)
 	sourceKey := caller.SourceKey()
@@ -413,6 +438,39 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 					}
 					return nil
 				}
+			}
+		}
+
+		if input.ExpectedHeadSequence != nil && head.HeadSequence != *input.ExpectedHeadSequence {
+			return conflictErrorWithDetail(
+				"newer_room_message",
+				fmt.Sprintf("room head sequence is %d (expected %d)", head.HeadSequence, *input.ExpectedHeadSequence),
+				map[string]any{
+					"threadId":             threadID,
+					"headSequence":         head.HeadSequence,
+					"expectedHeadSequence": *input.ExpectedHeadSequence,
+				},
+			)
+		}
+		if input.ExpectedChannelSequence != nil {
+			var channelHeadSequence int64
+			for _, existingEntry := range state.RoomMessages[threadID] {
+				if protocol.EffectiveRoomChannel(existingEntry.Channel) == normalizedChannel && existingEntry.Sequence > channelHeadSequence {
+					channelHeadSequence = existingEntry.Sequence
+				}
+			}
+			if channelHeadSequence != *input.ExpectedChannelSequence {
+				return conflictErrorWithDetail(
+					"newer_room_message",
+					fmt.Sprintf("room channel %q head sequence is %d (expected %d)", normalizedChannel, channelHeadSequence, *input.ExpectedChannelSequence),
+					map[string]any{
+						"threadId":                threadID,
+						"channel":                 normalizedChannel,
+						"channelSequence":         channelHeadSequence,
+						"expectedChannelSequence": *input.ExpectedChannelSequence,
+						"headSequence":            head.HeadSequence,
+					},
+				)
 			}
 		}
 
@@ -478,6 +536,7 @@ func (service *Service) PostRoomMessage(caller CallerIdentity, input PostRoomMes
 			Channel:            normalizedChannel,
 			Topic:              redactedTopic,
 			Body:               redactedBody,
+			Labels:             protocol.CloneLabels(normalizedLabels),
 			Mentions:           slices.Clone(parsedMentions.Tokens),
 			ReplyToSequence:    replyCopy,
 			SupersedesSequence: supersedesCopy,

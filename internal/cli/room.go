@@ -109,6 +109,10 @@ func runRoomPost(
 	topic := flagSet.String("topic", "", "Optional short topic summary")
 	var mentions cliStringSliceFlag
 	flagSet.Var(&mentions, "mention", "Optional @handle, @#channel, or @all mention target (repeatable)")
+	var rawLabels cliStringSliceFlag
+	flagSet.Var(&rawLabels, "label", "Optional key=value label to attach to the message (repeatable)")
+	expectedHead := flagSet.Int64("expected-head", -1, "Optional expected room head sequence guard")
+	expectedChannelSeq := flagSet.Int64("expected-channel-seq", -1, "Optional expected channel head sequence guard")
 	replyToSequence := flagSet.Int64("reply-to", 0, "Optional room message sequence number being replied to")
 	supersedesSequence := flagSet.Int64("supersedes", 0, "Optional room message sequence number being superseded")
 	noWake := flagSet.Bool("no-wake", false, "Post without waking mentioned resident instances")
@@ -143,15 +147,37 @@ func runRoomPost(
 		effectiveKey = protocol.NewIdentifier("cli")
 	}
 
+	var parsedLabels map[string]string
+	if len(rawLabels.values) > 0 {
+		parsedLabels = make(map[string]string, len(rawLabels.values))
+		for _, entry := range rawLabels.values {
+			key, value, hasEquals := strings.Cut(entry, "=")
+			if !hasEquals {
+				fmt.Fprintf(standardError, "orchestra room post: --label %q must be formatted as key=value\n", entry)
+				return 2
+			}
+			parsedLabels[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+	}
+
 	requestBody := orchestrator.PostRoomMessageInput{
 		IdempotencyKey: effectiveKey,
 		Channel:        strings.TrimSpace(*channel),
 		Kind:           *kind,
 		Topic:          *topic,
 		Body:           body,
+		Labels:         parsedLabels,
 		Mentions:       mentions.values,
 		Nudge:          *nudge && len(taskIDs.values) == 0,
 		NudgeTaskIDs:   taskIDs.values,
+	}
+	if *expectedHead >= 0 {
+		seq := *expectedHead
+		requestBody.ExpectedHeadSequence = &seq
+	}
+	if *expectedChannelSeq >= 0 {
+		seq := *expectedChannelSeq
+		requestBody.ExpectedChannelSequence = &seq
 	}
 	if *noWake {
 		disabled := false
@@ -272,6 +298,8 @@ func runRoomRead(
 	limit := flagSet.Int("limit", 0, "Maximum number of room entries to return")
 	var kinds cliStringSliceFlag
 	flagSet.Var(&kinds, "kind", "Filter by room message kind (repeatable)")
+	var labelFilters cliStringSliceFlag
+	flagSet.Var(&labelFilters, "label", "Filter by label expression (key, key=value, key=a|b; repeatable)")
 
 	if err := flagSet.Parse(normalizeFlagOrder(flagSet, arguments)); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -306,6 +334,9 @@ func runRoomRead(
 	}
 	for _, kind := range kinds.values {
 		query.Add("kind", kind)
+	}
+	for _, labelExpr := range labelFilters.values {
+		query.Add("label", labelExpr)
 	}
 
 	var result orchestrator.ReadRoomResult
@@ -375,6 +406,8 @@ func runRoomWait(
 	channel := flagSet.String("channel", "", "Filter room entries by sub-channel name or '*' for all channels")
 	var kinds cliStringSliceFlag
 	flagSet.Var(&kinds, "kind", "Filter room entries by kind (repeatable)")
+	var labelFilters cliStringSliceFlag
+	flagSet.Var(&labelFilters, "label", "Filter room entries by label expression (key, key=value, key=a|b; repeatable)")
 	mentions := flagSet.String("mentions", "", "Filter room entries mentioning a handle, @#channel, or @all")
 	timeout := flagSet.Duration("timeout", defaultRoomWaitTimeout, "Maximum duration to wait before timing out")
 	limit := flagSet.Int("limit", 0, "Maximum number of matching entries to return")
@@ -434,6 +467,7 @@ func runRoomWait(
 			currentCursor,
 			trimmedChannel,
 			kinds.values,
+			labelFilters.values,
 			trimmedMentions,
 			*limit,
 			sliceMilliseconds,
@@ -508,6 +542,8 @@ func runRoomTail(
 	channel := flagSet.String("channel", "", "Filter room entries by sub-channel name or '*' for all channels")
 	var kinds cliStringSliceFlag
 	flagSet.Var(&kinds, "kind", "Filter room entries by kind (repeatable)")
+	var labelFilters cliStringSliceFlag
+	flagSet.Var(&labelFilters, "label", "Filter room entries by label expression (key, key=value, key=a|b; repeatable)")
 	mentions := flagSet.String("mentions", "", "Filter room entries mentioning a handle, @#channel, or @all")
 
 	if err := flagSet.Parse(normalizeFlagOrder(flagSet, arguments)); err != nil {
@@ -553,6 +589,7 @@ func runRoomTail(
 			currentCursor,
 			trimmedChannel,
 			kinds.values,
+			labelFilters.values,
 			trimmedMentions,
 			0,
 			protocol.MaximumWaitMilliseconds,
@@ -643,6 +680,7 @@ func fetchRoomWaitSlice(
 	eventCursor string,
 	channel string,
 	kinds []string,
+	labels []string,
 	mentions string,
 	limit int,
 	timeoutMilliseconds int,
@@ -659,6 +697,9 @@ func fetchRoomWaitSlice(
 	}
 	for _, kind := range kinds {
 		query.Add("kind", kind)
+	}
+	for _, labelExpr := range labels {
+		query.Add("label", labelExpr)
 	}
 	if mentions != "" {
 		query.Set("mentions", mentions)

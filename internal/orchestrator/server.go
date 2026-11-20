@@ -752,7 +752,8 @@ func (service *Service) handleAPIThreads(writer http.ResponseWriter, request *ht
 				limit = parsed
 			}
 		}
-		threads, err := service.ListThreads(ListThreadsInput{Status: statusFilter, Limit: limit})
+		labels := request.URL.Query()["label"]
+		threads, err := service.ListThreads(ListThreadsInput{Status: statusFilter, Labels: labels, Limit: limit})
 		if err != nil {
 			writeOperationError(writer, err)
 			return
@@ -780,16 +781,30 @@ func (service *Service) handleAPIThreadSubroutes(writer http.ResponseWriter, req
 	remainder = strings.TrimSuffix(remainder, "/")
 	threadID, subroute, hasSubroute := strings.Cut(remainder, "/")
 	if !hasSubroute {
-		if request.Method != http.MethodGet {
+		switch request.Method {
+		case http.MethodGet:
+			detail, err := service.GetThreadDetail(threadID)
+			if err != nil {
+				writeOperationError(writer, err)
+				return
+			}
+			writeJSONResponse(writer, http.StatusOK, detail)
+		case http.MethodPatch:
+			var input UpdateThreadInput
+			if err := json.NewDecoder(io.LimitReader(request.Body, 64*1024)).Decode(&input); err != nil {
+				writeOperationError(writer, invalidRequest("malformed JSON body"))
+				return
+			}
+			input.ThreadID = threadID
+			updated, err := service.UpdateThread(CallerIdentity{Kind: "operator", OperatorID: "cli"}, input)
+			if err != nil {
+				writeOperationError(writer, err)
+				return
+			}
+			writeJSONResponse(writer, http.StatusOK, map[string]any{"thread": updated})
+		default:
 			writer.WriteHeader(http.StatusMethodNotAllowed)
-			return
 		}
-		detail, err := service.GetThreadDetail(threadID)
-		if err != nil {
-			writeOperationError(writer, err)
-			return
-		}
-		writeJSONResponse(writer, http.StatusOK, detail)
 		return
 	}
 
@@ -832,6 +847,7 @@ func (service *Service) handleAPIThreadSubroutes(writer http.ResponseWriter, req
 			Channel:       strings.TrimSpace(request.URL.Query().Get("channel")),
 			AfterSequence: afterSequence,
 			Kinds:         kinds,
+			Labels:        request.URL.Query()["label"],
 			Limit:         limit,
 		})
 		if err != nil {
@@ -887,6 +903,7 @@ func (service *Service) handleAPIThreadSubroutes(writer http.ResponseWriter, req
 			AfterSequence:       afterSequence,
 			EventCursor:         strings.TrimSpace(query.Get("cursor")),
 			Kinds:               kinds,
+			Labels:              query["label"],
 			Mentions:            strings.TrimSpace(query.Get("mentions")),
 			TimeoutMilliseconds: timeoutMilliseconds,
 			Limit:               limit,
@@ -1535,6 +1552,16 @@ func writeOperationError(writer http.ResponseWriter, err error) {
 		if statusCode <= 0 {
 			statusCode = http.StatusBadRequest
 		}
+		if len(operationError.Detail) > 0 {
+			writeJSONResponse(writer, statusCode, map[string]any{
+				"error": map[string]any{
+					"code":    operationError.Code,
+					"message": operationError.Message,
+					"detail":  operationError.Detail,
+				},
+			})
+			return
+		}
 		writeJSONError(writer, statusCode, operationError.Code, operationError.Message)
 		return
 	}
@@ -2118,6 +2145,7 @@ type WaitRoomInput struct {
 	AfterSequence       *int64   `json:"afterSequence,omitempty"`
 	EventCursor         string   `json:"eventCursor,omitempty"`
 	Kinds               []string `json:"kinds,omitempty"`
+	Labels              []string `json:"labels,omitempty"`
 	Mentions            string   `json:"mentions,omitempty"`
 	TimeoutMilliseconds int      `json:"timeoutMilliseconds,omitempty"`
 	Limit               int      `json:"limit,omitempty"`
@@ -2242,6 +2270,10 @@ func (service *Service) WaitRoom(
 			return WaitRoomResult{}, invalidRequest(fmt.Sprintf("unknown room message kind %q", kind))
 		}
 	}
+	labelFilters, labelFilterErr := protocol.ParseLabelFilters(input.Labels)
+	if labelFilterErr != nil {
+		return WaitRoomResult{}, invalidRequest(labelFilterErr.Error())
+	}
 	mentionFilter, mentionErr := parseRoomMentionFilter(input.Mentions)
 	if mentionErr != nil {
 		return WaitRoomResult{}, mentionErr
@@ -2326,6 +2358,10 @@ func (service *Service) WaitRoom(
 					throughSequence = entry.Sequence
 					continue
 				}
+				if !protocol.MatchesLabelFilters(entry.Labels, labelFilters) {
+					throughSequence = entry.Sequence
+					continue
+				}
 				if len(snapshot.Messages) >= limit {
 					hasMoreMessages = true
 					break
@@ -2334,6 +2370,7 @@ func (service *Service) WaitRoom(
 				entryCopy := entry
 				entryCopy.Topic = service.redactor.Redact(entry.Topic)
 				entryCopy.Body = service.redactor.Redact(entry.Body)
+				entryCopy.Labels = protocol.CloneLabels(entry.Labels)
 				entryCopy.ArtifactIDs = slices.Clone(entry.ArtifactIDs)
 				entryCopy.Mentions = slices.Clone(entry.Mentions)
 				snapshot.Messages = append(snapshot.Messages, entryCopy)

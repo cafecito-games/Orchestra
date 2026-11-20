@@ -158,6 +158,7 @@ type Thread struct {
 	Title        string              `json:"title"`
 	Summary      string              `json:"summary,omitempty"`
 	Status       string              `json:"status"`
+	Labels       map[string]string   `json:"labels,omitempty"`
 	Orchestrator *ThreadOrchestrator `json:"orchestrator,omitempty"`
 	CreatedAt    string              `json:"createdAt"`
 	UpdatedAt    string              `json:"updatedAt"`
@@ -588,19 +589,20 @@ type RoomAuthor struct {
 }
 
 type RoomMessage struct {
-	Sequence           int64      `json:"seq"`
-	ID                 string     `json:"id"`
-	ThreadID           string     `json:"threadId"`
-	CreatedAt          string     `json:"createdAt"`
-	Author             RoomAuthor `json:"author"`
-	Kind               string     `json:"kind"`
-	Channel            string     `json:"channel,omitempty"`
-	Topic              string     `json:"topic,omitempty"`
-	Body               string     `json:"body"`
-	Mentions           []string   `json:"mentions,omitempty"`
-	ReplyToSequence    *int64     `json:"replyToSequence,omitempty"`
-	SupersedesSequence *int64     `json:"supersedesSequence,omitempty"`
-	ArtifactIDs        []string   `json:"artifactIds,omitempty"`
+	Sequence           int64             `json:"seq"`
+	ID                 string            `json:"id"`
+	ThreadID           string            `json:"threadId"`
+	CreatedAt          string            `json:"createdAt"`
+	Author             RoomAuthor        `json:"author"`
+	Kind               string            `json:"kind"`
+	Channel            string            `json:"channel,omitempty"`
+	Topic              string            `json:"topic,omitempty"`
+	Body               string            `json:"body"`
+	Labels             map[string]string `json:"labels,omitempty"`
+	Mentions           []string          `json:"mentions,omitempty"`
+	ReplyToSequence    *int64            `json:"replyToSequence,omitempty"`
+	SupersedesSequence *int64            `json:"supersedesSequence,omitempty"`
+	ArtifactIDs        []string          `json:"artifactIds,omitempty"`
 }
 
 type ThreadRoomHead struct {
