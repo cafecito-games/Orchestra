@@ -180,6 +180,10 @@ func (service *Service) SendTaskMessage(
 			CreatedAt:      nowText,
 		}
 		state.Messages[message.ID] = message
+		if recipient.Kind == "orchestrator" {
+			summary := fmt.Sprintf("Task message (%s) from %s: %s", message.Kind, message.Sender.TaskID, message.Body)
+			service.scheduleCoordinatorWakeInState(state, mutation, threadID, "message.posted", summary, caller.InstanceID, 0, nowText)
+		}
 		result = SendTaskMessageResult{Message: message, Replayed: false}
 		return nil
 	})

@@ -274,6 +274,7 @@ var definitions = map[string]toolDefinition{
 			"purpose":            purposeSchema(true),
 			"idleTimeoutSeconds": schema{"type": "integer", "minimum": protocol.MinimumInstanceIdleTimeoutSeconds, "maximum": protocol.MaximumInstanceIdleTimeoutSeconds},
 			"initialTask":        object(schema{"title": text(), "instructions": text()}, "title", "instructions"),
+			"coordinator":        boolean(),
 		}, "idempotencyKey"),
 		output: instanceToolResultSchema(true),
 	},

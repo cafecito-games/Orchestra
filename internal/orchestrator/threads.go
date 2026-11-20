@@ -14,9 +14,10 @@ import (
 )
 
 type CreateThreadInput struct {
-	Title   string `json:"title"`
-	Summary string `json:"summary,omitempty"`
-	Attach  bool   `json:"attach,omitempty"`
+	Title                 string `json:"title"`
+	Summary               string `json:"summary,omitempty"`
+	Attach                bool   `json:"attach,omitempty"`
+	CoordinatorInstanceID string `json:"coordinatorInstanceId,omitempty"`
 }
 
 type ListThreadsInput struct {
@@ -25,10 +26,11 @@ type ListThreadsInput struct {
 }
 
 type UpdateThreadInput struct {
-	ThreadID string  `json:"threadId"`
-	Title    *string `json:"title,omitempty"`
-	Summary  *string `json:"summary,omitempty"`
-	Status   *string `json:"status,omitempty"`
+	ThreadID              string         `json:"threadId"`
+	Title                 *string        `json:"title,omitempty"`
+	Summary               *string        `json:"summary,omitempty"`
+	Status                *string        `json:"status,omitempty"`
+	CoordinatorInstanceID NullableString `json:"coordinatorInstanceId"`
 }
 
 type AttachThreadInput struct {
@@ -82,7 +84,7 @@ func (service *Service) CreateThread(
 				Kind:     "orchestrator-client",
 				ClientID: caller.ClientID,
 			}
-		} else if caller.Kind == "run" && caller.InstanceID != "" {
+		} else if caller.Kind == "run" && caller.InstanceID != "" && caller.CanDelegate {
 			orchestratorIdentity = &protocol.ThreadOrchestrator{
 				Kind:       "instance",
 				InstanceID: caller.InstanceID,
@@ -97,6 +99,11 @@ func (service *Service) CreateThread(
 			Orchestrator: orchestratorIdentity,
 			CreatedAt:    nowText,
 			UpdatedAt:    nowText,
+		}
+		if strings.TrimSpace(input.CoordinatorInstanceID) != "" {
+			if bindErr := service.bindThreadCoordinatorInState(state, mutation, caller, &created, input.CoordinatorInstanceID, nowText); bindErr != nil {
+				return bindErr
+			}
 		}
 		state.Threads[threadID] = created
 
@@ -319,7 +326,17 @@ func (service *Service) UpdateThread(caller CallerIdentity, input UpdateThreadIn
 			}
 			thread.Status = normalizedStatus
 		}
-		thread.UpdatedAt = service.nowUTC()
+		nowText := service.nowUTC()
+		if input.CoordinatorInstanceID.Set {
+			targetInstanceID := ""
+			if input.CoordinatorInstanceID.Value != nil {
+				targetInstanceID = *input.CoordinatorInstanceID.Value
+			}
+			if bindErr := service.bindThreadCoordinatorInState(state, mutation, caller, &thread, targetInstanceID, nowText); bindErr != nil {
+				return bindErr
+			}
+		}
+		thread.UpdatedAt = nowText
 		state.Threads[threadID] = thread
 		updated = thread
 		return nil

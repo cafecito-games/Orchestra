@@ -164,6 +164,18 @@ export function ThreadDetail({ id }: { id: string }) {
               <b>attached</b> {detailState.data.attachment.clientId}
             </span>
           ) : null}
+          {thread.orchestrator?.kind === "instance" && thread.orchestrator.instanceId ? (
+            <span className="kv">
+              <b>coordinator</b> {shortId(thread.orchestrator.instanceId)} · handled #
+              {thread.orchestrator.lastHandledEventSequence ?? 0}
+              {thread.orchestrator.pendingWakeTaskId
+                ? ` · wake ${shortId(thread.orchestrator.pendingWakeTaskId)}`
+                : (thread.orchestrator.pendingWakeEventSequence ?? 0) >
+                    (thread.orchestrator.lastHandledEventSequence ?? 0)
+                  ? ` · wake pending #${thread.orchestrator.pendingWakeEventSequence}`
+                  : ""}
+            </span>
+          ) : null}
         </div>
         {thread.summary ? (
           <div className="muted" style={{ marginTop: 8, fontSize: 13 }}>

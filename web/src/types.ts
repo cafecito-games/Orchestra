@@ -107,11 +107,23 @@ export interface Health {
   authMode: string;
 }
 
+export interface ThreadOrchestrator {
+  kind: string;
+  clientId?: string;
+  instanceId?: string;
+  lastHandledEventSequence?: number;
+  pendingWakeEventSequence?: number;
+  pendingWakeTaskId?: string;
+  lastWakeSummary?: string;
+  lastWakeAt?: string;
+}
+
 export interface Thread {
   id: string;
   title: string;
   summary?: string;
   status: string;
+  orchestrator?: ThreadOrchestrator;
   createdAt: string;
   updatedAt: string;
 }

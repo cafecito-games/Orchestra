@@ -135,9 +135,14 @@ func IsOccupyingAllocationStatus(status string) bool {
 }
 
 type ThreadOrchestrator struct {
-	Kind       string `json:"kind"`
-	ClientID   string `json:"clientId,omitempty"`
-	InstanceID string `json:"instanceId,omitempty"`
+	Kind                     string `json:"kind"`
+	ClientID                 string `json:"clientId,omitempty"`
+	InstanceID               string `json:"instanceId,omitempty"`
+	LastHandledEventSequence int64  `json:"lastHandledEventSequence,omitempty"`
+	PendingWakeEventSequence int64  `json:"pendingWakeEventSequence,omitempty"`
+	PendingWakeTaskID        string `json:"pendingWakeTaskId,omitempty"`
+	LastWakeSummary          string `json:"lastWakeSummary,omitempty"`
+	LastWakeAt               string `json:"lastWakeAt,omitempty"`
 }
 
 type Thread struct {

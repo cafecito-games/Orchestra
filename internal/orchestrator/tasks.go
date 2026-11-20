@@ -608,6 +608,7 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 			}
 		}
 
+		previousStatus := task.Status
 		if input.Status != "" && input.Status != task.Status {
 			switch {
 			case input.Status == "cancelled":
@@ -633,6 +634,28 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 		state.Tasks[task.ID] = task
 		recomputeThreadTaskReadiness(state, task.ThreadID, nowText)
 		updatedTask = state.Tasks[task.ID]
+
+		if updatedTask.Status != previousStatus &&
+			(updatedTask.Status == "completed" || updatedTask.Status == "failed" || updatedTask.Status == "blocked") {
+			if thread, hasThread := state.Threads[updatedTask.ThreadID]; hasThread && !isCoordinatorOwnedTask(thread, updatedTask) {
+				summary := fmt.Sprintf("Task %q (%s) became %s", updatedTask.Title, updatedTask.ID, updatedTask.Status)
+				if updatedTask.Status == "blocked" && updatedTask.BlockerReason != "" {
+					summary = fmt.Sprintf("%s: %s", summary, updatedTask.BlockerReason)
+				} else if updatedTask.Summary != "" {
+					summary = fmt.Sprintf("%s: %s", summary, updatedTask.Summary)
+				}
+				service.scheduleCoordinatorWakeInState(
+					state,
+					mutation,
+					updatedTask.ThreadID,
+					"task."+updatedTask.Status,
+					summary,
+					caller.InstanceID,
+					0,
+					nowText,
+				)
+			}
+		}
 
 		mutation.OnCommit(func() {
 			service.TriggerSchedule()

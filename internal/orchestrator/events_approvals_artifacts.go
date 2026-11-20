@@ -189,6 +189,15 @@ func (service *Service) handleRunCompleted(nodeID string, message protocol.Slave
 				task.UpdatedAt = nowText
 				state.Tasks[task.ID] = task
 				recomputeThreadTaskReadiness(state, task.ThreadID, nowText)
+				if task.Status == "completed" {
+					if thread, hasThread := state.Threads[task.ThreadID]; hasThread && !isCoordinatorOwnedTask(thread, task) {
+						summary := fmt.Sprintf("Task %q (%s) completed", task.Title, task.ID)
+						if task.Summary != "" {
+							summary = fmt.Sprintf("%s: %s", summary, task.Summary)
+						}
+						service.scheduleCoordinatorWakeInState(state, mutation, task.ThreadID, "task.completed", summary, runRecord.InstanceID, 0, nowText)
+					}
+				}
 			}
 		}
 
@@ -273,6 +282,12 @@ func (service *Service) handleRunFailed(nodeID string, message protocol.SlaveCon
 				}
 				state.Tasks[task.ID] = task
 				recomputeThreadTaskReadiness(state, task.ThreadID, nowText)
+				if task.Status == "failed" {
+					if thread, hasThread := state.Threads[task.ThreadID]; hasThread && !isCoordinatorOwnedTask(thread, task) {
+						summary := fmt.Sprintf("Task %q (%s) failed: %s", task.Title, task.ID, errorMessage)
+						service.scheduleCoordinatorWakeInState(state, mutation, task.ThreadID, "task.failed", summary, runRecord.InstanceID, 0, nowText)
+					}
+				}
 			}
 		}
 
@@ -388,6 +403,7 @@ func (service *Service) releaseInstanceAfterRunInState(
 	}
 	service.syncInstanceMailboxInState(state, instanceID, nowText)
 	service.enqueuePendingInstanceMailWakeInState(state, instanceID, nowText)
+	service.enqueuePendingCoordinatorWakeInState(state, instanceID, nowText)
 }
 
 func (service *Service) handleHarnessEvent(nodeID string, message protocol.SlaveControlMessage) {
@@ -1088,6 +1104,10 @@ func (service *Service) ResolveApproval(
 
 		state.Approvals[approval.ID] = approval
 		resolved = approval
+		if approval.ThreadID != "" {
+			approvalSummary := fmt.Sprintf("Approval %s (%s) %s", approval.ID, approval.Title, approval.Status)
+			service.scheduleCoordinatorWakeInState(state, mutation, approval.ThreadID, "approval.resolved", approvalSummary, caller.InstanceID, 0, nowText)
+		}
 		approvalSnapshot := approval
 		mutation.OnCommit(func() {
 			service.logger.Info(
