@@ -286,13 +286,13 @@ func NewService(options ServiceOptions) (*Service, error) {
 		service.backgroundGroup.Go(func() {
 			service.runSchedulerLoop(backgroundContext)
 		})
-		service.backgroundGroup.Go(func() {
-			service.runDoorbellLoop(backgroundContext)
-		})
-		service.backgroundGroup.Go(func() {
-			service.runSweepLoop(backgroundContext)
-		})
 	}
+	service.backgroundGroup.Go(func() {
+		service.runDoorbellLoop(backgroundContext)
+	})
+	service.backgroundGroup.Go(func() {
+		service.runSweepLoop(backgroundContext)
+	})
 
 	return service, nil
 }
@@ -330,9 +330,12 @@ func (service *Service) runSweepLoop(operationContext context.Context) {
 		case <-operationContext.Done():
 			return
 		case <-ticker.C:
-			service.expireIdleInstances()
-			service.expirePendingApprovals()
-			service.expireStaleNodeUpdates()
+			service.expireTaskClaims()
+			if service.mode == ServiceModeOrchestrator {
+				service.expireIdleInstances()
+				service.expirePendingApprovals()
+				service.expireStaleNodeUpdates()
+			}
 		}
 	}
 }
@@ -368,6 +371,9 @@ func (service *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/mail/messages", service.requireBearer(service.handleAPIMailMessages))
 	mux.HandleFunc("/api/mail/rename", service.requireBearer(service.handleAPIMailRename))
 	mux.HandleFunc("/api/mail/traffic", service.requireBearer(service.handleAPIMailTraffic))
+	mux.HandleFunc("/api/threads", service.requireBearer(service.handleAPIThreads))
+	mux.HandleFunc("/api/threads/", service.requireBearer(service.handleAPIThreadSubroutes))
+	mux.HandleFunc("/api/tasks/", service.requireBearer(service.handleAPITaskSubroutes))
 	if service.mode == ServiceModeOrchestrator {
 		mux.HandleFunc("/control-agent", service.handleControlAgentUpgrade)
 		mux.HandleFunc("/api/status", service.requireBearer(service.handleAPIStatus))
@@ -376,10 +382,7 @@ func (service *Service) Handler() http.Handler {
 		mux.HandleFunc("/api/nodes/repositories/clone", service.requireBearer(service.handleAPINodesClone))
 		mux.HandleFunc("/api/nodes/update", service.requireBearer(service.handleAPINodesUpdate))
 		mux.HandleFunc("/api/updates/bundles/", service.requireBearer(service.handleAPIUpdateBundle))
-		mux.HandleFunc("/api/threads", service.requireBearer(service.handleAPIThreads))
-		mux.HandleFunc("/api/threads/", service.requireBearer(service.handleAPIThreadSubroutes))
 		mux.HandleFunc("/api/runs/", service.requireBearer(service.handleAPIRunSubroutes))
-		mux.HandleFunc("/api/tasks/", service.requireBearer(service.handleAPITaskSubroutes))
 		mux.HandleFunc("/api/cancel/", service.requireBearer(service.handleAPICancelTarget))
 		mux.HandleFunc("/api/approvals", service.requireBearer(service.handleAPIApprovals))
 		mux.HandleFunc("/api/approvals/", service.requireBearer(service.handleAPIApprovalSubroutes))
@@ -915,6 +918,10 @@ func (service *Service) handleAPIThreadSubroutes(writer http.ResponseWriter, req
 		}
 		writeJSONResponse(writer, statusCode, result)
 	case "room/nudge":
+		if service.mode == ServiceModeRelay {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if request.Method != http.MethodPost {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -926,6 +933,46 @@ func (service *Service) handleAPIThreadSubroutes(writer http.ResponseWriter, req
 		}
 		input.ThreadID = threadID
 		result, err := service.NudgeRoom(operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	case "tasks":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input SubmitTasksInput
+		if err := json.NewDecoder(io.LimitReader(request.Body, 512*1024)).Decode(&input); err != nil {
+			writeOperationError(writer, invalidRequest("malformed JSON body"))
+			return
+		}
+		input.ThreadID = threadID
+		result, err := service.SubmitTasks(operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		statusCode := http.StatusCreated
+		if result.Replayed {
+			statusCode = http.StatusOK
+		}
+		writeJSONResponse(writer, statusCode, result)
+	case "tasks/claim":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input ClaimTaskInput
+		if request.Body != nil {
+			if err := json.NewDecoder(io.LimitReader(request.Body, 64*1024)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+				writeOperationError(writer, invalidRequest("malformed JSON body"))
+				return
+			}
+		}
+		input.ThreadID = threadID
+		result, err := service.ClaimTask(request.Context(), operatorCaller, input)
 		if err != nil {
 			writeOperationError(writer, err)
 			return
@@ -978,13 +1025,120 @@ func (service *Service) handleAPIRunSubroutes(writer http.ResponseWriter, reques
 
 func (service *Service) handleAPITaskSubroutes(writer http.ResponseWriter, request *http.Request) {
 	remainder := strings.TrimPrefix(request.URL.Path, "/api/tasks/")
+	remainder = strings.TrimSuffix(remainder, "/")
+	operatorCaller := CallerIdentity{Kind: "operator", OperatorID: "cli"}
+	if remainder == "claim" {
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input ClaimTaskInput
+		if request.Body != nil {
+			if err := json.NewDecoder(io.LimitReader(request.Body, 64*1024)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+				writeOperationError(writer, invalidRequest("malformed JSON body"))
+				return
+			}
+		}
+		result, err := service.ClaimTask(request.Context(), operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+		return
+	}
 	taskID, action, hasAction := strings.Cut(remainder, "/")
 	if !hasAction {
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
-	operatorCaller := CallerIdentity{Kind: "operator", OperatorID: "cli"}
 	switch action {
+	case "claim":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input ClaimTaskInput
+		if request.Body != nil {
+			if err := json.NewDecoder(io.LimitReader(request.Body, 64*1024)).Decode(&input); err != nil && !errors.Is(err, io.EOF) {
+				writeOperationError(writer, invalidRequest("malformed JSON body"))
+				return
+			}
+		}
+		if strings.TrimSpace(input.TaskID) != "" && strings.TrimSpace(input.TaskID) != taskID {
+			writeOperationError(writer, invalidRequest("taskId in body does not match URL path"))
+			return
+		}
+		input.TaskID = taskID
+		result, err := service.ClaimTask(request.Context(), operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	case "claim/renew":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input RenewTaskClaimInput
+		if err := json.NewDecoder(io.LimitReader(request.Body, 64*1024)).Decode(&input); err != nil {
+			writeOperationError(writer, invalidRequest("malformed JSON body"))
+			return
+		}
+		if strings.TrimSpace(input.TaskID) != "" && strings.TrimSpace(input.TaskID) != taskID {
+			writeOperationError(writer, invalidRequest("taskId in body does not match URL path"))
+			return
+		}
+		input.TaskID = taskID
+		result, err := service.RenewTaskClaim(operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	case "claim/release":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input ReleaseTaskClaimInput
+		if err := json.NewDecoder(io.LimitReader(request.Body, 64*1024)).Decode(&input); err != nil {
+			writeOperationError(writer, invalidRequest("malformed JSON body"))
+			return
+		}
+		if strings.TrimSpace(input.TaskID) != "" && strings.TrimSpace(input.TaskID) != taskID {
+			writeOperationError(writer, invalidRequest("taskId in body does not match URL path"))
+			return
+		}
+		input.TaskID = taskID
+		result, err := service.ReleaseTaskClaim(operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, result)
+	case "update":
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var input UpdateTaskInput
+		if err := json.NewDecoder(io.LimitReader(request.Body, 128*1024)).Decode(&input); err != nil {
+			writeOperationError(writer, invalidRequest("malformed JSON body"))
+			return
+		}
+		if strings.TrimSpace(input.TaskID) != "" && strings.TrimSpace(input.TaskID) != taskID {
+			writeOperationError(writer, invalidRequest("taskId in body does not match URL path"))
+			return
+		}
+		input.TaskID = taskID
+		updated, err := service.UpdateTask(operatorCaller, input)
+		if err != nil {
+			writeOperationError(writer, err)
+			return
+		}
+		writeJSONResponse(writer, http.StatusOK, map[string]any{"task": updated})
 	case "cancel":
 		if request.Method != http.MethodPost {
 			writer.WriteHeader(http.StatusMethodNotAllowed)

@@ -70,6 +70,9 @@ var OrchestratorToolNames = []string{
 	"post_room_message",
 	"nudge_room",
 	"submit_tasks",
+	"claim_task",
+	"renew_task_claim",
+	"release_task_claim",
 	"update_task",
 	"unblock_task",
 	"reopen_task",
@@ -92,15 +95,33 @@ var OrchestratorToolNames = []string{
 	"wait_for_activity",
 }
 
-// RelayToolNames are the communication-only tools exposed by an Orchestra relay.
-// Relays do not schedule work or manage agent process lifecycles.
+// RelayToolNames are the communication and pull-mode coordination tools exposed by an Orchestra relay.
+// Relays do not push-dispatch work to slave nodes, mutate workspaces, or manage remote agent process lifecycles.
 var RelayToolNames = []string{
+	"create_thread",
+	"list_threads",
+	"attach_thread",
+	"detach_thread",
+	"get_thread_context",
+	"get_thread_events",
+	"read_room",
+	"post_room_message",
+	"submit_tasks",
+	"claim_task",
+	"renew_task_claim",
+	"release_task_claim",
+	"update_task",
+	"unblock_task",
+	"reopen_task",
+	"send_task_message",
+	"update_thread",
 	"get_mail_identity",
 	"set_mail_identity",
 	"list_mailboxes",
 	"send_mail",
 	"read_mail",
 	"wait_for_mail",
+	"wait_for_activity",
 }
 
 func IsHubToolName(name string) bool {

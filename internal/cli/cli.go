@@ -101,7 +101,7 @@ func printTopLevelUsage(output io.Writer) {
 
 Runtime Modes:
   master      Start the Orchestra control-plane server (HTTP, WebSocket, SQLite, Streamable HTTP MCP)
-  relay       Start a communication-only server for durable Agent Mail between independently run agents
+  relay       Start a communication-only server for Agent Mail, shared rooms, and pull-mode task claiming
   slave       Start an Orchestra remote worker daemon connecting to a master
   mcp         Run the stdio MCP bridge or configure local harnesses (install, uninstall, status)
   acp-bridge  Run a built-in stdio Agent Client Protocol bridge (antigravity)
@@ -111,7 +111,7 @@ Operator Commands:
   nodes       List worker machines, refresh/clone repositories, or trigger self-updates (nodes refresh|clone|update)
   threads     List coordination threads on the orchestrator
   thread      Inspect a thread's task DAG, resident instances, runs, messages, and transcripts
-  task        Manage task lifecycle recovery (task unblock|reopen)
+  task        Run leased pull-mode tasks or manage lifecycle recovery (task run|unblock|reopen)
   room        Read, post, nudge, or locate a thread's shared blackboard room
   mail        List <handle>@<host> agent mailboxes, send or read agent mail, and rename handles
   approvals   List worker permission requests

@@ -165,7 +165,7 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 		},
 		{
 			Name:        "submit_tasks",
-			Description: "Atomically and idempotently submit a task or DAG of tasks into a thread for capability-matched scheduling across slave nodes.",
+			Description: "Atomically and idempotently submit a task or DAG of tasks into a thread (executionMode: \"dispatched\" for slave scheduling or \"claimable\" for pull-based leased claiming; defaults to \"claimable\" in relay mode).",
 			InputSchema: objectSchema(map[string]any{
 				"threadId":       map[string]any{"type": "string"},
 				"idempotencyKey": map[string]any{"type": "string"},
@@ -177,11 +177,49 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 			}, []string{"threadId", "idempotencyKey", "tasks"}),
 		},
 		{
+			Name:        "claim_task",
+			Description: "Atomically claim a specific claimable task by taskId or the oldest ready claimable task matching capability/label filters, issuing a bounded TTL lease and fencing epoch/token.",
+			InputSchema: objectSchema(map[string]any{
+				"threadId":            map[string]any{"type": "string"},
+				"taskId":              map[string]any{"type": "string"},
+				"labels":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"harnessIds":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"models":              map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"operatingSystems":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"architectures":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"ttlSeconds":          map[string]any{"type": "integer", "minimum": protocol.MinimumTaskClaimTTLSeconds, "maximum": protocol.MaximumTaskClaimTTLSeconds},
+				"timeoutMilliseconds": map[string]any{"type": "integer", "minimum": 0, "maximum": protocol.MaximumWaitMilliseconds},
+				"claimerId":           map[string]any{"type": "string"},
+			}, nil),
+		},
+		{
+			Name:        "renew_task_claim",
+			Description: "Extend an active pull-mode task claim lease using its fencing claimEpoch and claimToken; returns 409 claim_lost if superseded or expired.",
+			InputSchema: objectSchema(map[string]any{
+				"taskId":     map[string]any{"type": "string"},
+				"claimEpoch": map[string]any{"type": "integer", "minimum": 1},
+				"claimToken": map[string]any{"type": "string"},
+				"ttlSeconds": map[string]any{"type": "integer", "minimum": protocol.MinimumTaskClaimTTLSeconds, "maximum": protocol.MaximumTaskClaimTTLSeconds},
+			}, []string{"taskId", "claimEpoch", "claimToken"}),
+		},
+		{
+			Name:        "release_task_claim",
+			Description: "Cleanly release an active pull-mode task claim back to ready using its fencing claimEpoch and claimToken.",
+			InputSchema: objectSchema(map[string]any{
+				"taskId":     map[string]any{"type": "string"},
+				"claimEpoch": map[string]any{"type": "integer", "minimum": 1},
+				"claimToken": map[string]any{"type": "string"},
+				"reason":     map[string]any{"type": "string"},
+			}, []string{"taskId", "claimEpoch", "claimToken"}),
+		},
+		{
 			Name:        "update_task",
-			Description: "Update task status, summary, blockerKind, blockerReason, or attached artifactIds. Active runs transitioning to blocked yield their execution slot cleanly.",
+			Description: "Update task status, summary, blockerKind, blockerReason, or attached artifactIds. Claimed pull-mode tasks require matching claimEpoch and claimToken.",
 			InputSchema: objectSchema(map[string]any{
 				"taskId":         map[string]any{"type": "string"},
 				"idempotencyKey": map[string]any{"type": "string"},
+				"claimEpoch":     map[string]any{"type": "integer", "minimum": 1},
+				"claimToken":     map[string]any{"type": "string"},
 				"status":         map[string]any{"type": "string"},
 				"summary":        map[string]any{"type": "string"},
 				"blockerKind":    map[string]any{"type": "string", "enum": protocol.TaskBlockerKinds},
@@ -697,6 +735,24 @@ func (service *Service) ExecuteOrchestratorTool(
 			return nil, decodeErr
 		}
 		responseValue, err = service.SubmitTasks(caller, input)
+	case "claim_task":
+		input, decodeErr := decodeToolArguments[ClaimTaskInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.ClaimTask(operationContext, caller, input)
+	case "renew_task_claim":
+		input, decodeErr := decodeToolArguments[RenewTaskClaimInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.RenewTaskClaim(caller, input)
+	case "release_task_claim":
+		input, decodeErr := decodeToolArguments[ReleaseTaskClaimInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.ReleaseTaskClaim(caller, input)
 	case "update_task":
 		input, decodeErr := decodeToolArguments[UpdateTaskInput](rawArguments)
 		if decodeErr != nil {

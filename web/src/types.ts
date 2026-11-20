@@ -142,16 +142,31 @@ export interface TaskAssignment {
   assignedAt: string;
 }
 
+export interface TaskClaim {
+  epoch: number;
+  token: string;
+  claimerKind: string;
+  claimerId: string;
+  claimerSessionId?: string;
+  ttlSeconds: number;
+  claimedAt: string;
+  renewedAt: string;
+  expiresAt: string;
+}
+
 export interface Task {
   id: string;
   threadId: string;
   title: string;
   instructions: string;
+  executionMode?: "dispatched" | "claimable";
   status: string;
   attemptCount: number;
   maxAttempts: number;
   dependencies: TaskDependency[];
   assignment?: TaskAssignment;
+  claimEpoch?: number;
+  claim?: TaskClaim;
   summary?: string;
   blockerKind?: string;
   blockerReason?: string;

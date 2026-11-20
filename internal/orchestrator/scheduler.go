@@ -278,7 +278,7 @@ func (service *Service) scheduleReadyTasks() {
 	_, _ = service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
 		readyTasks := make([]protocol.Task, 0)
 		for _, task := range state.Tasks {
-			if task.Status == "ready" {
+			if task.Status == "ready" && task.EffectiveExecutionMode() == protocol.TaskExecutionModeDispatched {
 				readyTasks = append(readyTasks, task)
 			}
 		}
