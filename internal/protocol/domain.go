@@ -37,12 +37,20 @@ const (
 	TaskBlockerKindAwaitingDecision   = "awaiting_decision"
 	TaskBlockerKindExternalDependency = "external_dependency"
 	TaskBlockerKindDependency         = "dependency"
+
+	TaskExecutionModeDispatched = "dispatched"
+	TaskExecutionModeClaimable  = "claimable"
+
+	MinimumTaskClaimTTLSeconds = 1
+	DefaultTaskClaimTTLSeconds = 60
+	MaximumTaskClaimTTLSeconds = 300
 )
 
 var (
 	ThreadStatuses              = []string{"open", "resolved"}
 	TaskStatuses                = []string{"pending", "ready", "running", "blocked", "completed", "failed", "cancelled"}
 	TerminalTaskStatuses        = []string{"completed", "failed", "cancelled"}
+	TaskExecutionModes          = []string{TaskExecutionModeDispatched, TaskExecutionModeClaimable}
 	TaskBlockerKinds            = []string{TaskBlockerKindNeedsInput, TaskBlockerKindAwaitingDecision, TaskBlockerKindExternalDependency, TaskBlockerKindDependency}
 	DependencyPolicies          = []string{"require-success", "allow-failure"}
 	RunStatuses                 = []string{"queued", "running", "completed", "failed", "cancelled"}
@@ -245,6 +253,18 @@ type TaskOrigin struct {
 	InstanceID   string `json:"instanceId,omitempty"`
 }
 
+type TaskClaim struct {
+	Epoch            int64  `json:"epoch"`
+	Token            string `json:"token"`
+	ClaimerKind      string `json:"claimerKind"`
+	ClaimerID        string `json:"claimerId"`
+	ClaimerSessionID string `json:"claimerSessionId,omitempty"`
+	TTLSeconds       int    `json:"ttlSeconds"`
+	ClaimedAt        string `json:"claimedAt"`
+	RenewedAt        string `json:"renewedAt"`
+	ExpiresAt        string `json:"expiresAt"`
+}
+
 type Task struct {
 	ID                   string                `json:"id"`
 	ThreadID             string                `json:"threadId"`
@@ -254,6 +274,7 @@ type Task struct {
 	Origin               TaskOrigin            `json:"origin"`
 	Title                string                `json:"title"`
 	Instructions         string                `json:"instructions"`
+	ExecutionMode        string                `json:"executionMode,omitempty"`
 	Status               string                `json:"status"`
 	AttemptCount         int                   `json:"attemptCount"`
 	MaxAttempts          int                   `json:"maxAttempts"`
@@ -264,6 +285,8 @@ type Task struct {
 	PreferredInstanceID  string                `json:"preferredInstanceId,omitempty"`
 	PlacementDiagnostic  *PlacementDiagnostic  `json:"placementDiagnostic,omitempty"`
 	Assignment           *TaskAssignment       `json:"assignment,omitempty"`
+	ClaimEpoch           int64                 `json:"claimEpoch,omitempty"`
+	Claim                *TaskClaim            `json:"claim,omitempty"`
 	Summary              string                `json:"summary,omitempty"`
 	Progress             string                `json:"progress,omitempty"`
 	BlockerKind          string                `json:"blockerKind,omitempty"`
@@ -277,6 +300,13 @@ type Task struct {
 	CreatedAt            string                `json:"createdAt"`
 	UpdatedAt            string                `json:"updatedAt"`
 	FinishedAt           string                `json:"finishedAt,omitempty"`
+}
+
+func (task Task) EffectiveExecutionMode() string {
+	if task.ExecutionMode == TaskExecutionModeClaimable {
+		return TaskExecutionModeClaimable
+	}
+	return TaskExecutionModeDispatched
 }
 
 type TaskSubmissionReceipt struct {

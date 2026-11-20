@@ -1079,6 +1079,8 @@ func runTask(
 		return 0
 	}
 	switch arguments[0] {
+	case "run":
+		return runTaskRun(operationContext, arguments[1:], standardOutput, standardError, lookupEnvironment)
 	case "unblock":
 		return runTaskUnblock(operationContext, arguments[1:], standardOutput, standardError, lookupEnvironment)
 	case "reopen":
@@ -1092,14 +1094,21 @@ func runTask(
 
 func printTaskUsage(output io.Writer) {
 	fmt.Fprintf(output, `Usage:
+  orchestra task run [--thread <thread-id>] [--task <task-id>] [--label <label>] [--ttl 60s] [--wait 0s] [flags] -- <command> [args...]
   orchestra task unblock <task-id> [--note "..."] [--idempotency-key "..."] [flags]
   orchestra task reopen <task-id> [--note "..."] [--attempts N] [--idempotency-key "..."] [flags]
 
 Subcommands:
+  run         Claim a pull-mode task, run a local command while renewing the lease, and settle its status
   unblock     Unblock a blocked task back to ready (or pending if dependencies remain)
   reopen      Reopen a failed task with a fresh attempt budget
 
 Flags:
+  --thread string           Thread ID to claim a ready task from (task run)
+  --task string             Specific claimable task ID to claim (task run)
+  --label string            Capability label filter (repeatable or comma-separated, task run)
+  --ttl duration            Claim lease TTL between 1s and 5m (default 60s, task run)
+  --wait duration           Optional maximum wait duration for a ready task (task run)
   --note string             Optional resolution or recovery guidance note for the resumed run
   --attempts int            Fresh attempt budget to grant when reopening a failed task (1-%d)
   --idempotency-key string  Optional idempotency key for safe retries

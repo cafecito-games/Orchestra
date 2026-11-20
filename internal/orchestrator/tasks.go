@@ -21,6 +21,7 @@ type SubmittedTaskSpec struct {
 	ClientTaskID      string                         `json:"clientTaskId,omitempty"`
 	Title             string                         `json:"title"`
 	Instructions      string                         `json:"instructions"`
+	ExecutionMode     string                         `json:"executionMode,omitempty"`
 	MaxAttempts       int                            `json:"maxAttempts,omitempty"`
 	Dependencies      []SubmittedDependency          `json:"dependencies,omitempty"`
 	Requirements      protocol.ExecutionRequirements `json:"requirements"`
@@ -87,6 +88,8 @@ func (nullable NullableString) MarshalJSON() ([]byte, error) {
 type UpdateTaskInput struct {
 	TaskID         string               `json:"taskId,omitempty"`
 	IdempotencyKey string               `json:"idempotencyKey,omitempty"`
+	ClaimEpoch     *int64               `json:"claimEpoch,omitempty"`
+	ClaimToken     string               `json:"claimToken,omitempty"`
 	Status         string               `json:"status,omitempty"`
 	Summary        *string              `json:"summary,omitempty"`
 	Progress       *string              `json:"progress,omitempty"`
@@ -310,9 +313,32 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 				maxAttempts = protocol.MaximumTaskAttempts
 			}
 
+			executionMode := strings.TrimSpace(taskSpecification.ExecutionMode)
+			if executionMode == "" {
+				if service.mode == ServiceModeRelay {
+					executionMode = protocol.TaskExecutionModeClaimable
+				} else {
+					executionMode = protocol.TaskExecutionModeDispatched
+				}
+			}
+			if !slices.Contains(protocol.TaskExecutionModes, executionMode) {
+				return invalidRequest(fmt.Sprintf("task[%d] executionMode %q is invalid", index, executionMode))
+			}
+			if service.mode == ServiceModeRelay {
+				if executionMode != protocol.TaskExecutionModeClaimable {
+					return invalidRequest(fmt.Sprintf("task[%d] relay mode only supports executionMode %q", index, protocol.TaskExecutionModeClaimable))
+				}
+				if taskSpecification.InstanceID != "" || taskSpecification.PlacementOverride != nil || taskSpecification.Requirements.Workspace != nil {
+					return forbiddenError(fmt.Sprintf("task[%d] remote execution placement and workspace mutations are unavailable in relay mode", index))
+				}
+			}
+
 			placementInstanceID := taskSpecification.InstanceID
 			if placementInstanceID == "" && taskSpecification.PlacementOverride != nil && taskSpecification.PlacementOverride.InstanceID != "" {
 				placementInstanceID = taskSpecification.PlacementOverride.InstanceID
+			}
+			if executionMode == protocol.TaskExecutionModeClaimable && (placementInstanceID != "" || taskSpecification.PlacementOverride != nil) {
+				return invalidRequest(fmt.Sprintf("task[%d] claimable tasks cannot specify instanceId or placementOverride", index))
 			}
 			if placementInstanceID != "" {
 				pinnedInstance, instanceExists := state.Instances[placementInstanceID]
@@ -352,6 +378,7 @@ func (service *Service) SubmitTasks(caller CallerIdentity, input SubmitTasksInpu
 				Origin:              origin,
 				Title:               strings.TrimSpace(taskSpecification.Title),
 				Instructions:        strings.TrimSpace(taskSpecification.Instructions),
+				ExecutionMode:       executionMode,
 				Status:              "pending",
 				AttemptCount:        0,
 				MaxAttempts:         maxAttempts,
@@ -476,6 +503,8 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 	var unreadLastReadSequence int64
 
 	_, err := service.store.Mutate(func(state *store.State, mutation *store.Mutation) error {
+		service.expireTaskClaimsInState(state, mutation, service.now())
+
 		task, exists := state.Tasks[taskID]
 		if !exists {
 			return notFound(fmt.Sprintf("task %s does not exist", taskID))
@@ -487,6 +516,19 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 			if caller.TaskID != "" && task.ID != caller.TaskID && task.ParentTaskID != caller.TaskID {
 				return forbiddenError("worker run can only update its assigned task or its delegated child tasks")
 			}
+		}
+
+		hasFencingInput := input.ClaimEpoch != nil || strings.TrimSpace(input.ClaimToken) != ""
+		if hasFencingInput {
+			epoch := int64(0)
+			if input.ClaimEpoch != nil {
+				epoch = *input.ClaimEpoch
+			}
+			if task.Status != "running" || !matchesClaimFencing(task.Claim, epoch, input.ClaimToken) {
+				return conflictError("claim_lost", fmt.Sprintf("task %s claim epoch %d is no longer active", task.ID, epoch))
+			}
+		} else if task.EffectiveExecutionMode() == protocol.TaskExecutionModeClaimable && task.Claim != nil && input.Status != "cancelled" {
+			return conflictError("claim_lost", fmt.Sprintf("task %s has an active claim (epoch %d); matching claimEpoch and claimToken are required", task.ID, task.Claim.Epoch))
 		}
 
 		receiptKey := sourceKey + "\x00" + taskID + "\x00" + idempotencyKey
@@ -626,8 +668,12 @@ func (service *Service) UpdateTask(caller CallerIdentity, input UpdateTaskInput)
 				task.Status = input.Status
 				if protocol.IsTerminalTaskStatus(task.Status) {
 					task.FinishedAt = nowText
+					task.Claim = nil
 				}
 			}
+		}
+		if task.Status == "blocked" || protocol.IsTerminalTaskStatus(task.Status) {
+			task.Claim = nil
 		}
 
 		task.UpdatedAt = nowText
@@ -1260,6 +1306,7 @@ func (service *Service) cancelTaskInState(
 			state.Runs[runRecord.ID] = runRecord
 		}
 	}
+	task.Claim = nil
 	task.Status = "cancelled"
 	task.UpdatedAt = nowText
 	task.FinishedAt = nowText

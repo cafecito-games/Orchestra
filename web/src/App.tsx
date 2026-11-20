@@ -95,12 +95,15 @@ function Shell({ route, health }: { route: ReturnType<typeof useRoute>; health: 
   ).data;
   const pendingCount = pending?.approvals.length ?? 0;
 
-  const effectiveRoute = isRelay && route.name !== "mailbox" ? { name: "mail" } : route;
-  const [title, subtitle] = isRelay
-    ? (effectiveRoute.name === "mailbox" ? ["Mail", "Agent mailbox"] : ["Mail", "Live traffic between connected agents"])
+  const relayAllowed = route.name === "mail" || route.name === "mailbox" || route.name === "threads" || route.name === "thread";
+  const effectiveRoute = isRelay && !relayAllowed ? { name: "mail" } : route;
+  const [title, subtitle] = isRelay && effectiveRoute.name === "mail"
+    ? ["Mail", "Live traffic between connected agents"]
     : (TITLES[effectiveRoute.name] ?? TITLES.overview!);
   const connected = health?.authMode === "token";
-  const navigation = isRelay ? NAV.filter((item) => item.name === "mail") : NAV;
+  const navigation = isRelay
+    ? NAV.filter((item) => item.name === "threads" || item.name === "mail")
+    : NAV;
 
   return (
     <div className="app">
