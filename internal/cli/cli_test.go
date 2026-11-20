@@ -1455,3 +1455,369 @@ func TestOperatorCLI_NodesRepositoriesCloneAndRefresh(t *testing.T) {
 	assert.Contains(t, output, "Repositories:")
 	assert.Contains(t, output, "cli-cloned-repo")
 }
+
+func TestCLIRoomFlagValidation(t *testing.T) {
+	noEnvironment := func(string) (string, bool) { return "", false }
+
+	testCases := []struct {
+		name           string
+		arguments      []string
+		expectedCode   int
+		expectedStderr string
+		expectedStdout string
+	}{
+		{
+			name:           "room help lists wait and tail",
+			arguments:      []string{"room", "--help"},
+			expectedCode:   0,
+			expectedStdout: "wait   <thread-id>",
+		},
+		{
+			name:           "room post negative reply-to",
+			arguments:      []string{"room", "post", "thr-1", "hello", "--reply-to", "-1"},
+			expectedCode:   2,
+			expectedStderr: "--reply-to",
+		},
+		{
+			name:           "room post negative supersedes",
+			arguments:      []string{"room", "post", "thr-1", "hello", "--supersedes", "-3"},
+			expectedCode:   2,
+			expectedStderr: "--supersedes",
+		},
+		{
+			name:           "room read negative after",
+			arguments:      []string{"room", "read", "thr-1", "--after", "-2"},
+			expectedCode:   2,
+			expectedStderr: "--after",
+		},
+		{
+			name:           "room wait missing thread id",
+			arguments:      []string{"room", "wait"},
+			expectedCode:   2,
+			expectedStderr: "expected exactly one <thread-id>",
+		},
+		{
+			name:           "room wait negative timeout",
+			arguments:      []string{"room", "wait", "thr-1", "--timeout", "-1s"},
+			expectedCode:   2,
+			expectedStderr: "--timeout",
+		},
+		{
+			name:           "room wait negative after",
+			arguments:      []string{"room", "wait", "thr-1", "--after", "-1"},
+			expectedCode:   2,
+			expectedStderr: "--after",
+		},
+		{
+			name:           "room tail missing thread id",
+			arguments:      []string{"room", "tail"},
+			expectedCode:   2,
+			expectedStderr: "expected exactly one <thread-id>",
+		},
+		{
+			name:           "room tail negative after",
+			arguments:      []string{"room", "tail", "thr-1", "--after", "-5"},
+			expectedCode:   2,
+			expectedStderr: "--after",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := cli.Run(t.Context(), testCase.arguments, nil, &stdout, &stderr, noEnvironment)
+			assert.Equal(t, testCase.expectedCode, code)
+			if testCase.expectedStdout != "" {
+				assert.Contains(t, stdout.String(), testCase.expectedStdout)
+			}
+			if testCase.expectedStderr != "" {
+				assert.Contains(t, stderr.String(), testCase.expectedStderr)
+			}
+		})
+	}
+}
+
+func TestCLIRoomSubChannelsWaitAndTail(t *testing.T) {
+	dataDirectory := t.TempDir()
+	openedStore, err := store.Open(dataDirectory)
+	require.NoError(t, err)
+	defer openedStore.Close()
+
+	bearerToken := "cli-room-stream-secret-token"
+	service, err := orchestrator.NewService(orchestrator.ServiceOptions{
+		Store: openedStore,
+		Token: bearerToken,
+	})
+	require.NoError(t, err)
+	defer service.Close()
+
+	server := httptest.NewServer(service.Handler())
+	defer server.Close()
+
+	createdThread, _, err := service.CreateThread(orchestrator.CallerIdentity{Kind: "operator", OperatorID: "test"}, orchestrator.CreateThreadInput{
+		Title: "CLI room streaming thread",
+	})
+	require.NoError(t, err)
+
+	environment := map[string]string{
+		"ORCHESTRA_ENDPOINT": server.URL,
+		"ORCHESTRA_TOKEN":    bearerToken,
+	}
+	lookupEnvironment := func(name string) (string, bool) {
+		value, exists := environment[name]
+		return value, exists
+	}
+	runCLI := func(ctx context.Context, arguments ...string) (int, string, string) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		exitCode := cli.Run(ctx, arguments, nil, &stdout, &stderr, lookupEnvironment)
+		return exitCode, stdout.String(), stderr.String()
+	}
+
+	// 1. Post to main channel with explicit mention and --no-wake.
+	code, stdout, stderr := runCLI(
+		t.Context(),
+		"room", "post", createdThread.ID, "Initial contract for staging",
+		"--kind", "contract",
+		"--topic", "api-v1",
+		"--mention", "alice",
+		"--no-wake",
+		"--idempotency-key", "room-cli-post-1",
+		"--json",
+	)
+	require.Equal(t, 0, code, stderr)
+	var firstPost orchestrator.PostRoomMessageResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &firstPost))
+	assert.Equal(t, int64(1), firstPost.Message.Sequence)
+	assert.Equal(t, "main", firstPost.Message.Channel)
+	assert.Equal(t, []string{"@alice"}, firstPost.Message.Mentions)
+
+	// 2. Post to sub-channel with --reply-to, --supersedes, repeatable --mention, and a secret to verify redaction.
+	code, stdout, stderr = runCLI(
+		t.Context(),
+		"room", "post", createdThread.ID, "Review pass with token "+bearerToken,
+		"--channel", "review",
+		"--kind", "finding",
+		"--topic", "review-pass",
+		"--mention", "verifier",
+		"--mention", "@#qa",
+		"--reply-to", "1",
+		"--supersedes", "1",
+		"--no-wake",
+		"--idempotency-key", "room-cli-post-2",
+		"--json",
+	)
+	require.Equal(t, 0, code, stderr)
+	var secondPost orchestrator.PostRoomMessageResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &secondPost))
+	assert.Equal(t, int64(2), secondPost.Message.Sequence)
+	assert.Equal(t, "review", secondPost.Message.Channel)
+	require.NotNil(t, secondPost.Message.ReplyToSequence)
+	assert.Equal(t, int64(1), *secondPost.Message.ReplyToSequence)
+	require.NotNil(t, secondPost.Message.SupersedesSequence)
+	assert.Equal(t, int64(1), *secondPost.Message.SupersedesSequence)
+	assert.Contains(t, secondPost.Message.Mentions, "@verifier")
+	assert.Contains(t, secondPost.Message.Mentions, "@#qa")
+	assert.NotContains(t, secondPost.Message.Body, bearerToken)
+
+	// 3. Read filtered by --channel review: tabular output includes CHANNEL, MENTIONS, and copy-pastable --after hint.
+	code, stdout, stderr = runCLI(t.Context(), "room", "read", createdThread.ID, "--channel", "review")
+	require.Equal(t, 0, code, stderr)
+	assert.Contains(t, stdout, "CHANNEL")
+	assert.Contains(t, stdout, "MENTIONS")
+	assert.Contains(t, stdout, "review")
+	assert.Contains(t, stdout, "@verifier")
+	assert.NotContains(t, stdout, "Initial contract for staging")
+	assert.Contains(t, stdout, "Next: orchestra room read "+createdThread.ID+" --after 2 --channel review")
+
+	// 4. Read wildcard --channel * in JSON and verify sequential --after continuation.
+	code, stdout, stderr = runCLI(t.Context(), "room", "read", createdThread.ID, "--channel", "*", "--json")
+	require.Equal(t, 0, code, stderr)
+	var wildcardRead orchestrator.ReadRoomResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &wildcardRead))
+	assert.Len(t, wildcardRead.Messages, 2)
+	assert.Equal(t, int64(2), wildcardRead.ThroughSequence)
+
+	code, stdout, stderr = runCLI(
+		t.Context(),
+		"room", "read", createdThread.ID,
+		"--channel", "*",
+		"--after", strconv.FormatInt(wildcardRead.ThroughSequence, 10),
+		"--json",
+	)
+	require.Equal(t, 0, code, stderr)
+	var continuedRead orchestrator.ReadRoomResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &continuedRead))
+	assert.Empty(t, continuedRead.Messages)
+	assert.Equal(t, int64(2), continuedRead.ThroughSequence)
+
+	// 5. `room wait` timeout returns exit code 124 and structured JSON timedOut: true.
+	code, stdout, stderr = runCLI(
+		t.Context(),
+		"room", "wait", createdThread.ID,
+		"--after", "2",
+		"--timeout", "120ms",
+		"--json",
+	)
+	assert.Equal(t, 124, code, stderr)
+	var timedOutResult orchestrator.WaitRoomResult
+	require.NoError(t, json.Unmarshal([]byte(stdout), &timedOutResult))
+	assert.True(t, timedOutResult.TimedOut)
+	assert.Equal(t, int64(2), timedOutResult.ThroughSequence)
+	assert.NotEmpty(t, timedOutResult.EventCursor)
+
+	// 6. `room wait` blocks on --channel + --mentions, ignores non-matching post, wakes on matching post.
+	type waitOutcome struct {
+		code   int
+		stdout string
+		stderr string
+	}
+	waitCh := make(chan waitOutcome, 1)
+	go func() {
+		waitCode, waitOut, waitErr := runCLI(
+			t.Context(),
+			"room", "wait", createdThread.ID,
+			"--after", "2",
+			"--channel", "review",
+			"--mentions", "verifier",
+			"--timeout", "5s",
+			"--json",
+		)
+		waitCh <- waitOutcome{code: waitCode, stdout: waitOut, stderr: waitErr}
+	}()
+
+	time.Sleep(80 * time.Millisecond)
+	// Non-matching post on main channel for @bob should NOT wake the waiter.
+	_, err = service.PostRoomMessage(orchestrator.CallerIdentity{Kind: "operator", OperatorID: "test"}, orchestrator.PostRoomMessageInput{
+		ThreadID:       createdThread.ID,
+		IdempotencyKey: "room-cli-post-3",
+		Channel:        "main",
+		Kind:           "guidance",
+		Body:           "@bob unrelated update",
+	})
+	require.NoError(t, err)
+
+	select {
+	case premature := <-waitCh:
+		require.Failf(t, "room wait woke on non-matching post", "stdout=%s stderr=%s", premature.stdout, premature.stderr)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Matching post on review channel mentioning @verifier wakes the waiter.
+	_, err = service.PostRoomMessage(orchestrator.CallerIdentity{Kind: "operator", OperatorID: "test"}, orchestrator.PostRoomMessageInput{
+		ThreadID:       createdThread.ID,
+		IdempotencyKey: "room-cli-post-4",
+		Channel:        "review",
+		Kind:           "question",
+		Topic:          "ship-check",
+		Body:           "@verifier ready to merge?",
+	})
+	require.NoError(t, err)
+
+	select {
+	case outcome := <-waitCh:
+		require.Equal(t, 0, outcome.code, outcome.stderr)
+		var wokeResult orchestrator.WaitRoomResult
+		require.NoError(t, json.Unmarshal([]byte(outcome.stdout), &wokeResult))
+		assert.False(t, wokeResult.TimedOut)
+		require.Len(t, wokeResult.Messages, 1)
+		assert.Equal(t, int64(4), wokeResult.Messages[0].Sequence)
+		assert.Equal(t, "review", wokeResult.Messages[0].Channel)
+		assert.Equal(t, int64(4), wokeResult.ThroughSequence)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timed out waiting for room wait to wake")
+	}
+
+	// 7. `room wait` context cancellation exits cleanly with code 130.
+	cancelWaitCtx, cancelWait := context.WithCancel(t.Context())
+	cancelWaitDone := make(chan int, 1)
+	go func() {
+		waitCode, _, _ := runCLI(cancelWaitCtx, "room", "wait", createdThread.ID, "--timeout", "10s")
+		cancelWaitDone <- waitCode
+	}()
+	time.Sleep(60 * time.Millisecond)
+	cancelWait()
+	select {
+	case cancelCode := <-cancelWaitDone:
+		assert.Equal(t, 130, cancelCode)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timed out waiting for canceled room wait")
+	}
+
+	// 8. `room tail --json` streams room messages and thread events as JSONL until canceled, exiting 0.
+	tailCtx, cancelTail := context.WithCancel(t.Context())
+	defer cancelTail()
+	var tailStdout, tailStderr synchronizedBuffer
+	tailDone := make(chan int, 1)
+	go func() {
+		tailDone <- cli.Run(
+			tailCtx,
+			[]string{"room", "tail", createdThread.ID, "--after", "4", "--channel", "*", "--json"},
+			nil,
+			&tailStdout,
+			&tailStderr,
+			lookupEnvironment,
+		)
+	}()
+
+	time.Sleep(80 * time.Millisecond)
+	_, err = service.PostRoomMessage(orchestrator.CallerIdentity{Kind: "operator", OperatorID: "test"}, orchestrator.PostRoomMessageInput{
+		ThreadID:       createdThread.ID,
+		IdempotencyKey: "room-cli-tail-5",
+		Channel:        "qa",
+		Kind:           "finding",
+		Body:           "Tail stream check without leaking " + bearerToken,
+	})
+	require.NoError(t, err)
+
+	submitted, err := service.SubmitTasks(orchestrator.CallerIdentity{Kind: "operator", OperatorID: "test"}, orchestrator.SubmitTasksInput{
+		ThreadID:       createdThread.ID,
+		IdempotencyKey: "room-cli-tail-submit-1",
+		Tasks: []orchestrator.SubmittedTaskSpec{
+			{
+				ClientTaskID: "tail-task",
+				Title:        "Tail event task",
+				Instructions: "No-op task for tail event coverage",
+				Requirements: protocol.ExecutionRequirements{HarnessIDs: []string{"claude-cli"}},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, submitted.Tasks, 1)
+
+	require.Eventually(t, func() bool {
+		lines := strings.Split(strings.TrimSpace(tailStdout.String()), "\n")
+		return len(lines) >= 2 && strings.Contains(tailStdout.String(), `"type":"room_message"`) && strings.Contains(tailStdout.String(), `"type":"thread_event"`)
+	}, 5*time.Second, 25*time.Millisecond, "tail stdout: %s\ntail stderr: %s", tailStdout.String(), tailStderr.String())
+
+	cancelTail()
+	select {
+	case tailCode := <-tailDone:
+		assert.Equal(t, 0, tailCode, tailStderr.String())
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timed out waiting for room tail to stop")
+	}
+
+	rawLines := strings.Split(strings.TrimSpace(tailStdout.String()), "\n")
+	require.GreaterOrEqual(t, len(rawLines), 2)
+	seenRoomMessage := false
+	seenThreadEvent := false
+	for _, line := range rawLines {
+		var envelope struct {
+			Type    string                   `json:"type"`
+			Message *protocol.RoomMessage    `json:"message"`
+			Event   *protocol.TaskEventEntry `json:"event"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(line), &envelope), "line=%s", line)
+		assert.NotContains(t, line, bearerToken)
+		if envelope.Type == "room_message" && envelope.Message != nil && envelope.Message.Sequence == 5 {
+			seenRoomMessage = true
+			assert.Equal(t, "qa", envelope.Message.Channel)
+		}
+		if envelope.Type == "thread_event" && envelope.Event != nil && envelope.Event.TaskID == submitted.Tasks[0].ID {
+			seenThreadEvent = true
+		}
+	}
+	assert.True(t, seenRoomMessage, "expected room_message in tail stream")
+	assert.True(t, seenThreadEvent, "expected thread_event in tail stream")
+}
