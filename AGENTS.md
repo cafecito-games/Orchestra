@@ -2,13 +2,14 @@
 
 ## Project Structure & Module Organization
 
-`cmd/orchestra/main.go` is the executable entry point. Most code lives in `internal/`: `orchestrator/` implements the control plane, `slave/` and `harness/` run workers and agent processes, `mcpserver/` and `mcpbridge/` expose MCP, and `store/` owns persistence. Supporting packages cover protocol types, ACP integration, setup, workspace safety, and readiness. Unit tests sit beside their packages as `*_test.go`; multi-process coverage is in `internal/systemtest/`. Generated binaries belong in `bin/` or `dist/`.
+`cmd/orchestra/main.go` is the executable entry point. Most code lives in `internal/`: `orchestrator/` implements the control plane, `slave/` and `harness/` run workers and agent processes, `mcpserver/` and `mcpbridge/` expose MCP, `webui/` serves the embedded operator console, and `store/` owns persistence. Supporting packages cover protocol types, ACP integration, setup, workspace safety, and readiness. The React/TypeScript operator console source lives in `web/`, and its compiled static assets are committed under `internal/webui/static/` (`go:embed`). Unit tests sit beside their packages as `*_test.go`; multi-process coverage is in `internal/systemtest/`. Generated binaries belong in `bin/` or `dist/`.
 
 ## Build, Test, and Development Commands
 
-The project requires Go 1.26+, golangci-lint (v2), and optionally [Task](https://taskfile.dev/).
+The project requires Go 1.26+, golangci-lint (v2), Node.js/npm (when modifying `web/`), and optionally [Task](https://taskfile.dev/).
 
 - `task build`: compile the local, CGo-free binary to `bin/orchestra`.
+- `task web:build`: install frontend dependencies and compile `web/` into `internal/webui/static/` (required whenever `web/` changes).
 - `task run:master -- --help`: run the master from source and pass CLI flags after `--`.
 - `task unit:test`: run all package tests with the race detector.
 - `task system:test`: run build-tagged, real-process system tests (timeout: 10 minutes).
