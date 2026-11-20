@@ -502,6 +502,12 @@ func (service *Service) findReusableResident(
 	var candidates []candidate
 
 	retainedLease, hasRetainedLease := retainedWorkspaceLeaseForTask(state, task)
+	boundCoordinatorID := ""
+	if thread, hasThread := state.Threads[task.ThreadID]; hasThread &&
+		thread.Orchestrator != nil &&
+		thread.Orchestrator.Kind == "instance" {
+		boundCoordinatorID = thread.Orchestrator.InstanceID
+	}
 
 	for _, instance := range state.Instances {
 		if instance.ThreadID != task.ThreadID {
@@ -511,6 +517,9 @@ func (service *Service) findReusableResident(
 			continue
 		}
 		if task.PlacementInstanceID != "" && instance.ID != task.PlacementInstanceID {
+			continue
+		}
+		if task.PlacementInstanceID == "" && boundCoordinatorID != "" && instance.ID == boundCoordinatorID {
 			continue
 		}
 		allocation, hasAlloc := state.ActiveAllocationForInstance(instance.ID)
@@ -782,6 +791,7 @@ func (service *Service) assignTaskToResident(
 	}
 	task.UpdatedAt = nowText
 	state.Tasks[task.ID] = *task
+	service.markCoordinatorRunDispatchedInState(state, task.ThreadID, instance.ID, task.ID, nowText)
 
 	instanceSnapshot := *instance
 	allocationSnapshot := *allocation

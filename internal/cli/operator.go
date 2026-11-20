@@ -786,6 +786,21 @@ func runThreadDetail(
 	if detail.Attachment != nil {
 		fmt.Fprintf(standardOutput, "Attached Orchestrator: client=%s session=%s\n", detail.Attachment.ClientID, detail.Attachment.SessionID)
 	}
+	if detail.Thread.Orchestrator != nil && detail.Thread.Orchestrator.Kind == "instance" && detail.Thread.Orchestrator.InstanceID != "" {
+		wakeState := "idle"
+		if detail.Thread.Orchestrator.PendingWakeTaskID != "" {
+			wakeState = fmt.Sprintf("pending(task=%s, seq=%d)", detail.Thread.Orchestrator.PendingWakeTaskID, detail.Thread.Orchestrator.PendingWakeEventSequence)
+		} else if detail.Thread.Orchestrator.PendingWakeEventSequence > detail.Thread.Orchestrator.LastHandledEventSequence {
+			wakeState = fmt.Sprintf("coalescing(seq=%d)", detail.Thread.Orchestrator.PendingWakeEventSequence)
+		}
+		fmt.Fprintf(
+			standardOutput,
+			"Coordinator Instance: %s (lastHandledEvent=%d, wake=%s)\n",
+			detail.Thread.Orchestrator.InstanceID,
+			detail.Thread.Orchestrator.LastHandledEventSequence,
+			wakeState,
+		)
+	}
 	fmt.Fprintf(standardOutput, "Event Journal: head=%d floor=%d\n", detail.EventStream.Head, detail.EventStream.Floor)
 
 	if len(detail.Tasks) > 0 {

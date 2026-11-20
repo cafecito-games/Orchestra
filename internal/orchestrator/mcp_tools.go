@@ -79,9 +79,10 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 			Name:        "create_thread",
 			Description: "Create a durable orchestration thread for coordinating tasks, resident agent instances, messages, approvals, and artifacts.",
 			InputSchema: objectSchema(map[string]any{
-				"title":   map[string]any{"type": "string"},
-				"summary": map[string]any{"type": "string"},
-				"attach":  map[string]any{"type": "boolean"},
+				"title":                 map[string]any{"type": "string"},
+				"summary":               map[string]any{"type": "string"},
+				"attach":                map[string]any{"type": "boolean"},
+				"coordinatorInstanceId": map[string]any{"type": "string"},
 			}, []string{"title"}),
 		},
 		{
@@ -222,12 +223,13 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 		},
 		{
 			Name:        "update_thread",
-			Description: "Update a thread's title, summary, or status (open or resolved).",
+			Description: "Update a thread's title, summary, status (open or resolved), or bound autonomous coordinatorInstanceId (null or empty string unbinds).",
 			InputSchema: objectSchema(map[string]any{
-				"threadId": map[string]any{"type": "string"},
-				"title":    map[string]any{"type": "string"},
-				"summary":  map[string]any{"type": "string"},
-				"status":   map[string]any{"type": "string"},
+				"threadId":              map[string]any{"type": "string"},
+				"title":                 map[string]any{"type": "string"},
+				"summary":               map[string]any{"type": "string"},
+				"status":                map[string]any{"type": "string"},
+				"coordinatorInstanceId": map[string]any{"type": []string{"string", "null"}},
 			}, []string{"threadId"}),
 		},
 		{
@@ -263,6 +265,7 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 				"requirements":       map[string]any{"type": "object"},
 				"idleTimeoutSeconds": map[string]any{"type": "integer"},
 				"initialTask":        map[string]any{"type": "object"},
+				"coordinator":        map[string]any{"type": "boolean"},
 			}, []string{"threadId", "idempotencyKey"}),
 		},
 		{

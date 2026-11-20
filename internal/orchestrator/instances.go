@@ -28,6 +28,7 @@ type SpawnInstanceInput struct {
 	Requirements       *protocol.InstanceExecutionRequirements `json:"requirements,omitempty"`
 	IdleTimeoutSeconds *int                                    `json:"idleTimeoutSeconds,omitempty"`
 	InitialTask        *protocol.InstanceInitialTask           `json:"initialTask,omitempty"`
+	Coordinator        bool                                    `json:"coordinator,omitempty"`
 }
 
 type GetInstanceInput struct {
@@ -113,6 +114,14 @@ func (service *Service) SpawnInstance(
 	instanceCount := input.Count
 	if instanceCount == 0 {
 		instanceCount = 1
+	}
+	if input.Coordinator {
+		if instanceCount != 1 {
+			return protocol.InstanceLifecycleResult{}, invalidRequest("coordinator binding requires count=1")
+		}
+		if input.Delegation == nil || !input.Delegation.CanDelegate {
+			return protocol.InstanceLifecycleResult{}, forbiddenError("coordinator instance requires delegation.canDelegate=true")
+		}
 	}
 
 	fallbackPurposeName := ""
@@ -395,6 +404,14 @@ func (service *Service) SpawnInstance(
 		if len(createdTaskIDs) > 0 {
 			firstTaskID := createdTaskIDs[0]
 			primaryTaskID = &firstTaskID
+		}
+
+		if input.Coordinator && len(createdInstanceIDs) == 1 {
+			if bindErr := service.bindThreadCoordinatorInState(state, mutation, caller, &thread, createdInstanceIDs[0], nowText); bindErr != nil {
+				return bindErr
+			}
+			thread.UpdatedAt = nowText
+			state.Threads[threadID] = thread
 		}
 
 		var resultInstances []protocol.AgentInstance
@@ -918,6 +935,7 @@ func (service *Service) initiateInstanceReleaseInState(
 		state.Instances[instance.ID] = *instance
 		service.syncInstanceMailboxInState(state, instance.ID, nowText)
 	}
+	service.cleanupCoordinatorOnInstanceUnavailableInState(state, mutation, instance.ID, nowText)
 
 	for deliveryID, delivery := range state.InstanceDeliveries {
 		if delivery.InstanceID == instance.ID && delivery.Kind == "provision" {
@@ -960,6 +978,7 @@ func (service *Service) initiateInstanceReleaseInState(
 		state.Instances[instance.ID] = *instance
 		service.syncInstanceMailboxInState(state, instance.ID, nowText)
 		delete(state.ReleaseIntents, instance.ID)
+		service.cleanupCoordinatorOnInstanceUnavailableInState(state, mutation, instance.ID, service.nowUTC())
 		return
 	}
 
@@ -1037,6 +1056,7 @@ func (service *Service) handleInstanceReady(nodeID string, message protocol.Slav
 		}
 		service.syncInstanceMailboxInState(state, instance.ID, nowText)
 		service.enqueuePendingInstanceMailWakeInState(state, instance.ID, nowText)
+		service.enqueuePendingCoordinatorWakeInState(state, instance.ID, nowText)
 
 		instanceSnapshot := instance
 		allocationSnapshot := allocation
@@ -1072,6 +1092,7 @@ func (service *Service) handleInstanceFailed(nodeID string, message protocol.Sla
 			}
 		}
 		delete(state.ReleaseIntents, instance.ID)
+		service.cleanupCoordinatorOnInstanceUnavailableInState(state, mutation, instance.ID, service.nowUTC())
 
 		nowText := service.nowUTC()
 		allocation.Status = "failed"
@@ -1136,6 +1157,7 @@ func (service *Service) handleInstanceReleased(nodeID string, message protocol.S
 			}
 		}
 		delete(state.ReleaseIntents, instance.ID)
+		service.cleanupCoordinatorOnInstanceUnavailableInState(state, mutation, instance.ID, service.nowUTC())
 
 		for bindingID, binding := range state.SessionBindings {
 			if binding.InstanceID == instance.ID && !protocol.IsTerminalSessionBindingStatus(binding.Status) {
