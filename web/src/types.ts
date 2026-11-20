@@ -141,6 +141,7 @@ export interface Task {
   dependencies: TaskDependency[];
   assignment?: TaskAssignment;
   summary?: string;
+  blockerKind?: string;
   blockerReason?: string;
   lastReadRoomSequence?: number;
   requiredRoomSequence?: number;

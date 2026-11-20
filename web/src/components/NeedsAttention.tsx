@@ -1,10 +1,13 @@
 import { useState } from "react";
+import { AuthError, api, generateIdempotencyKey } from "../api";
 import { shortId, timeAgo } from "../format";
 import { navigate, navigateToThread, replaceThreadAnchor, scrollToAnchor } from "../hooks";
+import { toast } from "../toast";
 import type {
   ApprovalRequest,
   RoomMessage,
   Run,
+  Task,
   ThreadDetail,
   ThreadStallCondition,
   ThreadStallReport,
@@ -22,9 +25,11 @@ export interface AttentionItem {
   category:
     | "approval"
     | "stall"
+    | "task_blocked"
     | "unanswered_question"
     | "quota_exhausted"
     | "rate_limited"
+    | "task_failed"
     | "run_failed"
     | "decision"
     | "contract";
@@ -38,6 +43,8 @@ export interface AttentionItem {
   threadTitle?: string;
   anchor?: string;
   fallbackRoute?: string;
+  taskId?: string;
+  taskAction?: "unblock" | "reopen";
 }
 
 export interface ThreadAttentionBundle {
@@ -267,6 +274,51 @@ function buildApprovalAttentionItem(
   };
 }
 
+function buildTaskAttentionItem(
+  task: Task,
+  threadId: string,
+  threadTitle?: string,
+): AttentionItem | null {
+  if (task.status === "blocked") {
+    const kindLabel = task.blockerKind ? `blocked · ${humanizeCode(task.blockerKind)}` : "task blocked";
+    return {
+      id: `task-blocked-${task.id}`,
+      rank: 2,
+      category: "task_blocked",
+      badgeLabel: kindLabel,
+      tone: "warn",
+      title: truncateLine(task.title || task.id, 140),
+      detail: task.blockerReason ? truncateLine(task.blockerReason, 150) : "Task is parked in blocked state",
+      citations: [`task ${shortId(task.id)}`],
+      threadId,
+      threadTitle,
+      anchor: `task-${task.id}`,
+      taskId: task.id,
+      taskAction: "unblock",
+    };
+  }
+  if (task.status === "failed") {
+    return {
+      id: `task-failed-${task.id}`,
+      rank: 3,
+      category: "task_failed",
+      badgeLabel: "task failed",
+      tone: "err",
+      title: truncateLine(task.title || task.id, 140),
+      detail: task.summary
+        ? truncateLine(task.summary, 150)
+        : `Failed after ${task.attemptCount}/${task.maxAttempts} attempt(s)`,
+      citations: [`task ${shortId(task.id)}`],
+      threadId,
+      threadTitle,
+      anchor: `task-${task.id}`,
+      taskId: task.id,
+      taskAction: "reopen",
+    };
+  }
+  return null;
+}
+
 function buildRunAttentionItem(run: Run, threadTitle?: string): AttentionItem | null {
   const isQuotaExhausted = run.errorKind === "quota_exhausted";
   const isRateLimited = run.errorKind === "rate_limited";
@@ -394,6 +446,13 @@ export function synthesizeThreadAttention(
     }
   }
 
+  for (const task of detail.tasks) {
+    const taskItem = buildTaskAttentionItem(task, threadId, threadTitle);
+    if (taskItem) {
+      items.push(taskItem);
+    }
+  }
+
   for (const run of detail.runs) {
     const runItem = buildRunAttentionItem(run, threadTitle);
     if (runItem) {
@@ -461,12 +520,15 @@ export function NeedsAttentionSection({
   items,
   currentThreadId,
   initialVisibleCount = 6,
+  onReload,
 }: {
   items: AttentionItem[];
   currentThreadId?: string;
   initialVisibleCount?: number;
+  onReload?: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
 
   if (items.length === 0) {
     return null;
@@ -490,6 +552,34 @@ export function NeedsAttentionSection({
     }
   }
 
+  async function handleTaskRecovery(item: AttentionItem) {
+    if (!item.taskId || !item.taskAction || busyTaskId) {
+      return;
+    }
+    setBusyTaskId(item.taskId);
+    try {
+      const endpoint = `/api/tasks/${encodeURIComponent(item.taskId)}/${item.taskAction}`;
+      await api(endpoint, {
+        method: "POST",
+        body: { idempotencyKey: generateIdempotencyKey() },
+      });
+      toast(
+        item.taskAction === "unblock"
+          ? `Unblocked task ${shortId(item.taskId)}`
+          : `Reopened task ${shortId(item.taskId)}`,
+        "ok",
+      );
+      onReload?.();
+    } catch (error) {
+      if (error instanceof AuthError) {
+        return;
+      }
+      toast(error instanceof Error ? error.message : String(error), "err");
+    } finally {
+      setBusyTaskId(null);
+    }
+  }
+
   return (
     <div className="section">
       <SectionHead
@@ -510,39 +600,68 @@ export function NeedsAttentionSection({
       <Card className="attention-card">
         <div className="attention-list">
           {displayedItems.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className={`attention-item tone-${item.tone}`}
-              onClick={() => activateItem(item)}
-            >
-              <span className={`attention-icon ${item.tone}`}>
-                <AlertIcon />
-              </span>
-              <div className="attention-main">
-                <div className="attention-top">
-                  <span className={`badge ${item.tone}`}>{item.badgeLabel}</span>
-                  {!currentThreadId && item.threadTitle ? (
-                    <span className="attention-thread">{item.threadTitle}</span>
-                  ) : null}
-                  <div className="attention-citations">
-                    {item.citations.map((citation) => (
-                      <span key={citation} className="attention-cite">
-                        {citation}
-                      </span>
-                    ))}
+            <div key={item.id} className={`attention-item tone-${item.tone}`}>
+              <button
+                type="button"
+                className="attention-item-trigger"
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 10,
+                  flex: 1,
+                  minWidth: 0,
+                  background: "none",
+                  border: "none",
+                  padding: 0,
+                  color: "inherit",
+                  textAlign: "left",
+                  cursor: "pointer",
+                  font: "inherit",
+                }}
+                onClick={() => activateItem(item)}
+              >
+                <span className={`attention-icon ${item.tone}`}>
+                  <AlertIcon />
+                </span>
+                <div className="attention-main">
+                  <div className="attention-top">
+                    <span className={`badge ${item.tone}`}>{item.badgeLabel}</span>
+                    {!currentThreadId && item.threadTitle ? (
+                      <span className="attention-thread">{item.threadTitle}</span>
+                    ) : null}
+                    <div className="attention-citations">
+                      {item.citations.map((citation) => (
+                        <span key={citation} className="attention-cite">
+                          {citation}
+                        </span>
+                      ))}
+                    </div>
+                    {item.timestamp ? (
+                      <span className="attention-time">{timeAgo(item.timestamp)}</span>
+                    ) : null}
                   </div>
-                  {item.timestamp ? (
-                    <span className="attention-time">{timeAgo(item.timestamp)}</span>
-                  ) : null}
+                  <div className="attention-title">{item.title}</div>
+                  {item.detail ? <div className="attention-detail">{item.detail}</div> : null}
                 </div>
-                <div className="attention-title">{item.title}</div>
-                {item.detail ? <div className="attention-detail">{item.detail}</div> : null}
-              </div>
-              <span className="attention-arrow">
+              </button>
+              {item.taskId && item.taskAction ? (
+                <button
+                  type="button"
+                  className="btn sm"
+                  disabled={busyTaskId === item.taskId}
+                  onClick={() => void handleTaskRecovery(item)}
+                >
+                  {busyTaskId === item.taskId
+                    ? "Working…"
+                    : item.taskAction === "unblock"
+                      ? "Unblock"
+                      : "Reopen"}
+                </button>
+              ) : null}
+              <span className="attention-arrow" aria-hidden="true">
                 <ChevronRightIcon />
               </span>
-            </button>
+            </div>
           ))}
         </div>
       </Card>
