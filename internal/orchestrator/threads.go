@@ -518,6 +518,9 @@ func (service *Service) UpdateThread(caller CallerIdentity, input UpdateThreadIn
 		}
 		thread.UpdatedAt = nowText
 		state.Threads[threadID] = thread
+		if thread.Status == "resolved" {
+			cancelThreadSchedulesInState(state, threadID, nowText)
+		}
 		updated = thread
 		return nil
 	})

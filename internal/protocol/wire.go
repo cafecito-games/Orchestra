@@ -22,6 +22,9 @@ var HubToolNames = []string{
 	"read_mail",
 	"wait_for_mail",
 	"wait_for_activity",
+	"schedule_message",
+	"list_schedules",
+	"cancel_schedule",
 	"get_execution_inventory",
 	"list_workspace_leases",
 	"land_workspace_lease",
@@ -93,6 +96,9 @@ var OrchestratorToolNames = []string{
 	"read_mail",
 	"wait_for_mail",
 	"wait_for_activity",
+	"schedule_message",
+	"list_schedules",
+	"cancel_schedule",
 }
 
 // RelayToolNames are the communication and pull-mode coordination tools exposed by an Orchestra relay.
@@ -122,6 +128,9 @@ var RelayToolNames = []string{
 	"read_mail",
 	"wait_for_mail",
 	"wait_for_activity",
+	"schedule_message",
+	"list_schedules",
+	"cancel_schedule",
 }
 
 func IsHubToolName(name string) bool {

@@ -61,6 +61,7 @@ const (
 	collectionMailMessages        = "mail_messages"
 	collectionMailReceipts        = "mail_receipts"
 	collectionAccessGrants        = "access_grants"
+	collectionSchedules           = "schedules"
 )
 
 type Mutation struct {
@@ -864,6 +865,9 @@ func serializeCollections(state *State) (map[string]map[string]string, error) {
 	if result[collectionAccessGrants], err = serializeMap(state.AccessGrants); err != nil {
 		return nil, err
 	}
+	if result[collectionSchedules], err = serializeMap(state.Schedules); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -942,6 +946,8 @@ func decodeRecordIntoState(state *State, collection, recordID string, data []byt
 		return decodeInto(state.MailReceipts, recordID, data)
 	case collectionAccessGrants:
 		return decodeInto(state.AccessGrants, recordID, data)
+	case collectionSchedules:
+		return decodeInto(state.Schedules, recordID, data)
 	default:
 		return nil
 	}

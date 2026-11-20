@@ -74,6 +74,8 @@ func runRoom(
 		return runRoomTail(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "path":
 		return runRoomPath(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
+	case "schedule":
+		return runRoomSchedule(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	default:
 		fmt.Fprintf(standardError, "orchestra room: unknown subcommand %q\n\n", action)
 		printRoomUsage(standardError)
@@ -372,6 +374,14 @@ func runRoomRead(
 		writer := tabwriter.NewWriter(standardOutput, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(writer, "SEQ\tCHANNEL\tKIND\tAUTHOR\tMENTIONS\tTOPIC\tBODY\tCREATED")
 		for _, entry := range result.Messages {
+			bodyDisplay := compactLine(entry.Body, 64)
+			if len(entry.Blocks) > 0 {
+				var summaries []string
+				for _, block := range entry.Blocks {
+					summaries = append(summaries, protocol.FormatStructuredBlockSummary(block))
+				}
+				bodyDisplay = strings.TrimSpace(bodyDisplay + " " + strings.Join(summaries, " "))
+			}
 			fmt.Fprintf(
 				writer,
 				"%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
@@ -381,7 +391,7 @@ func runRoomRead(
 				formatRoomAuthor(entry.Author),
 				formatRoomMentions(entry.Mentions),
 				defaultIfEmpty(compactLine(entry.Topic, 28), "-"),
-				compactLine(entry.Body, 64),
+				bodyDisplay,
 				entry.CreatedAt,
 			)
 		}
@@ -732,6 +742,14 @@ func writeRoomWaitText(output io.Writer, threadID string, requestedChannel strin
 		writer := tabwriter.NewWriter(output, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(writer, "SEQ\tCHANNEL\tKIND\tAUTHOR\tMENTIONS\tTOPIC\tBODY\tCREATED")
 		for _, entry := range result.Messages {
+			bodyDisplay := compactLine(entry.Body, 64)
+			if len(entry.Blocks) > 0 {
+				var summaries []string
+				for _, block := range entry.Blocks {
+					summaries = append(summaries, protocol.FormatStructuredBlockSummary(block))
+				}
+				bodyDisplay = strings.TrimSpace(bodyDisplay + " " + strings.Join(summaries, " "))
+			}
 			fmt.Fprintf(
 				writer,
 				"%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
@@ -741,7 +759,7 @@ func writeRoomWaitText(output io.Writer, threadID string, requestedChannel strin
 				formatRoomAuthor(entry.Author),
 				formatRoomMentions(entry.Mentions),
 				defaultIfEmpty(compactLine(entry.Topic, 28), "-"),
-				compactLine(entry.Body, 64),
+				bodyDisplay,
 				entry.CreatedAt,
 			)
 		}

@@ -607,6 +607,7 @@ type RoomMessage struct {
 	Channel            string            `json:"channel,omitempty"`
 	Topic              string            `json:"topic,omitempty"`
 	Body               string            `json:"body"`
+	Blocks             []StructuredBlock `json:"blocks,omitempty"`
 	Labels             map[string]string `json:"labels,omitempty"`
 	Mentions           []string          `json:"mentions,omitempty"`
 	ReplyToSequence    *int64            `json:"replyToSequence,omitempty"`

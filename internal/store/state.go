@@ -56,6 +56,7 @@ type State struct {
 	MailMessages        map[string]protocol.MailMessage
 	MailReceipts        map[string]protocol.MailReceipt
 	AccessGrants        map[string]protocol.AccessGrantRecord
+	Schedules           map[string]protocol.ScheduledMessage
 	EventStreams        map[string]protocol.ThreadEventStream
 	ThreadEvents        map[string][]protocol.TaskEventEntry
 }
@@ -96,6 +97,7 @@ func NewState() *State {
 		MailMessages:        map[string]protocol.MailMessage{},
 		MailReceipts:        map[string]protocol.MailReceipt{},
 		AccessGrants:        map[string]protocol.AccessGrantRecord{},
+		Schedules:           map[string]protocol.ScheduledMessage{},
 		EventStreams:        map[string]protocol.ThreadEventStream{},
 		ThreadEvents:        map[string][]protocol.TaskEventEntry{},
 	}
@@ -216,6 +218,9 @@ func (state *State) ensureInitialized() {
 	}
 	if state.AccessGrants == nil {
 		state.AccessGrants = map[string]protocol.AccessGrantRecord{}
+	}
+	if state.Schedules == nil {
+		state.Schedules = map[string]protocol.ScheduledMessage{}
 	}
 	if state.EventStreams == nil {
 		state.EventStreams = map[string]protocol.ThreadEventStream{}

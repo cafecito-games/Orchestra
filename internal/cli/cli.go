@@ -73,6 +73,8 @@ func Run(
 		return runTask(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "token":
 		return runToken(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
+	case "schedules":
+		return runSchedules(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "room":
 		return runRoom(operationContext, remaining, standardOutput, standardError, lookupEnvironment)
 	case "mail":
@@ -115,6 +117,7 @@ Operator Commands:
   thread      Inspect a thread's task DAG, resident instances, runs, messages, and transcripts
   task        Run leased pull-mode tasks or manage lifecycle recovery (task run|unblock|reopen)
   token       Issue, list, or revoke narrowed scoped access grant tokens (token create|list|revoke)
+  schedules   List or cancel durable scheduled room and mail deliveries
   room        Read, post, nudge, or locate a thread's shared blackboard room
   mail        List <handle>@<host> agent mailboxes, send or read agent mail, and rename handles
   approvals   List worker permission requests

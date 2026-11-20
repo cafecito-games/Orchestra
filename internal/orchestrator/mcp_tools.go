@@ -148,6 +148,7 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 				"channel":                 map[string]any{"type": "string"},
 				"topic":                   map[string]any{"type": "string"},
 				"body":                    map[string]any{"type": "string"},
+				"blocks":                  map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 				"labels":                  map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
 				"expectedHeadSequence":    map[string]any{"type": "integer", "minimum": 0},
 				"expectedChannelSequence": map[string]any{"type": "integer", "minimum": 0},
@@ -400,6 +401,7 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 				"replyToId":      map[string]any{"type": "string"},
 				"subject":        map[string]any{"type": "string"},
 				"body":           map[string]any{"type": "string"},
+				"blocks":         map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
 				"artifactIds":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 				"wake":           map[string]any{"type": "boolean"},
 			}, []string{"idempotencyKey", "body"}),
@@ -442,6 +444,47 @@ func OrchestratorToolDefinitions() []MCPToolDefinition {
 				"timeoutMilliseconds": map[string]any{"type": "integer", "minimum": 0, "maximum": protocol.MaximumWaitMilliseconds},
 				"limit":               map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumEventsPerWait},
 			}, nil),
+		},
+		{
+			Name:        "schedule_message",
+			Description: "Schedule a durable one-shot or bounded recurring delivery into a thread room or Agent Mail inbox.",
+			InputSchema: objectSchema(map[string]any{
+				"idempotencyKey":      map[string]any{"type": "string"},
+				"targetKind":          map[string]any{"type": "string", "enum": protocol.ScheduleTargetKinds},
+				"threadId":            map[string]any{"type": "string"},
+				"channel":             map[string]any{"type": "string"},
+				"kind":                map[string]any{"type": "string", "enum": protocol.RoomMessageKinds},
+				"topic":               map[string]any{"type": "string"},
+				"labels":              map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
+				"mentions":            map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"to":                  map[string]any{"type": "string"},
+				"subject":             map[string]any{"type": "string"},
+				"body":                map[string]any{"type": "string"},
+				"blocks":              map[string]any{"type": "array", "items": map[string]any{"type": "object"}},
+				"wake":                map[string]any{"type": "boolean"},
+				"inSeconds":           map[string]any{"type": "integer", "minimum": 1},
+				"deliverAt":           map[string]any{"type": "string"},
+				"everySeconds":        map[string]any{"type": "integer", "minimum": protocol.MinimumRecurringIntervalSeconds},
+				"maxOccurrences":      map[string]any{"type": "integer", "minimum": 1, "maximum": protocol.MaximumRecurringOccurrences},
+				"untilAt":             map[string]any{"type": "string"},
+				"cancelOnThreadClose": map[string]any{"type": "boolean"},
+			}, []string{"idempotencyKey", "body"}),
+		},
+		{
+			Name:        "list_schedules",
+			Description: "List durable scheduled room and mail deliveries, optionally filtered by threadId, targetKind, or status.",
+			InputSchema: objectSchema(map[string]any{
+				"threadId":   map[string]any{"type": "string"},
+				"targetKind": map[string]any{"type": "string", "enum": protocol.ScheduleTargetKinds},
+				"status":     map[string]any{"type": "string", "enum": protocol.ScheduleStatuses},
+			}, nil),
+		},
+		{
+			Name:        "cancel_schedule",
+			Description: "Cancel an active scheduled message (restricted to the creator or an operator).",
+			InputSchema: objectSchema(map[string]any{
+				"scheduleId": map[string]any{"type": "string"},
+			}, []string{"scheduleId"}),
 		},
 	}
 }
@@ -1004,6 +1047,32 @@ func (service *Service) ExecuteOrchestratorTool(
 			return nil, decodeErr
 		}
 		responseValue, err = service.WaitForActivity(operationContext, caller, input)
+	case "schedule_message":
+		input, decodeErr := decodeToolArguments[ScheduleMessageInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		responseValue, err = service.ScheduleMessage(caller, input)
+	case "list_schedules":
+		input, decodeErr := decodeToolArguments[ListSchedulesInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		schedules, listErr := service.ListSchedules(caller, input)
+		if listErr != nil {
+			return nil, listErr
+		}
+		responseValue = map[string]any{"schedules": schedules}
+	case "cancel_schedule":
+		input, decodeErr := decodeToolArguments[CancelScheduleInput](rawArguments)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		cancelled, cancelErr := service.CancelSchedule(caller, input)
+		if cancelErr != nil {
+			return nil, cancelErr
+		}
+		responseValue = map[string]any{"schedule": cancelled}
 	default:
 		return nil, invalidRequest(fmt.Sprintf("unknown orchestrator tool %q", toolName))
 	}
