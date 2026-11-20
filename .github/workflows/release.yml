@@ -56,6 +56,12 @@ jobs:
           go-version: "1.26.x"
           cache: true
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
       - uses: go-task/setup-task@v2
         with:
           version: 3.x
@@ -74,6 +80,9 @@ jobs:
 
       - name: Run multi-process system tests
         run: task system:test
+
+      - name: Build console and verify clean tree
+        run: task web:check
 
   release:
     name: Publish Release

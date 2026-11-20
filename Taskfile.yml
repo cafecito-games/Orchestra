@@ -48,6 +48,26 @@ tasks:
       - npm ci
       - npm run build
 
+  web:check:
+    desc: Build the React console and verify internal/webui/static matches committed output
+    cmds:
+      - task: web:build
+      - |
+        dirty=0
+        if ! git diff --exit-code -- internal/webui/static; then
+          dirty=1
+        fi
+        status="$(git status --porcelain --untracked-files=all -- internal/webui/static)"
+        if [ -n "${status}" ]; then
+          echo "Uncommitted or untracked files in internal/webui/static:"
+          echo "${status}"
+          dirty=1
+        fi
+        if [ "${dirty}" -ne 0 ]; then
+          echo "Console build output in internal/webui/static is out of date. Run 'task web:build' and commit the changes." >&2
+          exit 1
+        fi
+
   build:all:
     desc: Cross-compile CGo-free orchestra release binaries across darwin and linux (amd64/arm64)
     cmds:
